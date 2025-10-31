@@ -1,12 +1,25 @@
 # Bridges Project
 
-This repository contains tools for trace reconstruction and analysis, specifically designed to reconstruct traces with data loss using ancestry data stored within span objects and Bloom filters for intelligent trace reconnection.
+This repository contains tools for trace reconstruction and analysis, specifically designed to reconstruct traces with data loss using ancestry data stored within span objects. It supports both Bloom filter and hash array ancestry modes for intelligent trace reconnection.
 
-## Jaeger Trace Loader
+## Tools
 
-The `jaeger_trace_loader.go` tool provides comprehensive functionality to load, analyze, simulate data loss, and reconstruct traces from a Jaeger backend deployed in Kubernetes. It includes advanced Bloom filter-based reconnection algorithms and detailed metadata tracking for trace size comparisons.
+### 1. Jaeger Trace Loader (`jaeger_trace_loader.go`)
 
-### Features
+The main tool for loading, analyzing, simulating data loss, and reconstructing traces. It supports loading traces from either:
+- Jaeger backend (REST API)
+- Local JSON files (folder input)
+
+It includes advanced reconnection algorithms using both Bloom filter and hash array ancestry modes, with detailed metadata tracking for trace size comparisons.
+
+### 2. Trace Tagger (`trace_tagger.go`)
+
+A utility tool for adding priority and ancestry tags to traces. It processes traces from JSON files and adds:
+- Priority tags (`prio`: "high" or "low")
+- Ancestry mode tags (`ancestry_mode`: "bloom" or "hash")
+- Ancestry data tags (`ancestry`: serialized Bloom filter or comma-separated span ID array)
+
+## Features
 
 #### Core Functionality
 - **Trace Loading**: Fetches traces from Jaeger backend via REST API
@@ -23,18 +36,24 @@ The `jaeger_trace_loader.go` tool provides comprehensive functionality to load, 
 - **Comprehensive Reporting**: Detailed analysis of missing span IDs and orphaned spans
 
 #### Data Loss Simulation
-- **Smart Span Removal**: Only removes non-root, non-leaf spans (middle nodes)
-- **Realistic Simulation**: Creates actual data loss scenarios by removing critical hierarchy nodes
-- **Configurable Loss Percentages**: Test different levels of data loss (10%, 20%, 30%, 50%)
+- **Priority-Based Removal**: Only removes low-priority spans, preserving high-priority spans
+- **Protection Rules**: Never removes root spans or leaf spans
+- **High-Priority Spans**: Root spans, leaf spans, and spans at configurable depth intervals are protected
+- **Configurable Loss Percentages**: Test different levels of data loss (default: 100% of low-priority spans)
+- **Randomized Simulation**: Each run produces different data loss patterns
 - **Automatic Detection**: Simulated traces are automatically analyzed for data loss
-- **Forced Data Loss**: Guarantees data loss by aggressively removing middle spans when needed
 
 #### Trace Reconnection
-- **Bloom Filter Analysis**: Extracts and deserializes Bloom filters from span baggage
-- **Ancestry Reconstruction**: Uses Bloom filters to find nearest existing ancestors
+- **Multiple Ancestry Modes**: Supports both Bloom filter and hash array ancestry data
+- **Ancestry Data Sources**: Reads from `ancestry`/`ancestry_mode` tags, with fallback to `__bag.*` baggage
+- **Hash Array Mode**: Uses comma-separated span ID arrays to reconstruct parent chains
+- **Bloom Filter Mode**: Uses probabilistic membership testing to find ancestors
+- **Synthetic Span Creation**: Creates missing intermediate spans with "unknown" service/operation
+- **Smart Parent Detection**: Handles cases where parents are already synthesized by other orphans
+- **Ancestry Chain Inference**: Derives missing parents from ancestry data when not in references
 - **Bridge Edge Creation**: Connects orphaned spans to their most likely ancestors
 - **Confidence Scoring**: Provides confidence metrics for each reconnection
-- **100% Reconnection Rate**: Successfully reconnects all orphaned spans in test scenarios
+- **100% Reconnection Rate**: Successfully reconnects all orphaned spans with valid ancestry data
 
 #### File-Based Storage
 - **Original Traces**: Stores complete original traces from Jaeger
@@ -51,10 +70,39 @@ The `jaeger_trace_loader.go` tool provides comprehensive functionality to load, 
 
 ### Usage
 
+#### Jaeger Trace Loader
+
 ```bash
 cd /users/dhuye/bridges
 go run jaeger_trace_loader.go
+
+# Or load from a folder of JSON files
+go run jaeger_trace_loader.go -input folder -folder data/tagged-hash-3
+
+# With custom Jaeger URL
+go run jaeger_trace_loader.go -input jaeger -jaeger-url http://localhost:16686
 ```
+
+**Command-line flags:**
+- `-input`: Source type - "jaeger" (default) or "folder"
+- `-folder`: Path to folder containing JSON trace files (required if `input=folder`)
+- `-jaeger-url`: Jaeger API URL (default: "http://jaeger-ctr:16686")
+
+#### Trace Tagger
+
+```bash
+cd /users/dhuye/bridges
+go run trace_tagger.go -input data/uber -mode hash -depth 3
+
+# With custom output directory
+go run trace_tagger.go -input data/uber -output data/tagged-bloom-5 -mode bloom -depth 5
+```
+
+**Command-line flags:**
+- `-input`: Input directory containing trace JSON files (default: ".")
+- `-output`: Output directory (default: "data/tagged-{mode}-{depth}")
+- `-depth`: Depth interval for high-priority spans (default: 3)
+- `-mode`: Ancestry mode - "hash" (default) or "bloom"
 
 ### Configuration
 
@@ -80,10 +128,15 @@ bridges/
 │   ├── lossy/
 │   │   ├── traces.json      # Traces after data loss simulation
 │   │   └── metadata.json    # Size and data loss metrics
-│   └── reconstructed/
-│       ├── traces.json      # Traces after Bloom filter reconnection
-│       └── metadata.json    # Reconnection and size recovery metrics
-└── jaeger_trace_loader.go   # Main application
+│   ├── reconstructed/
+│   │   ├── traces.json      # Traces after reconnection
+│   │   └── metadata.json    # Reconnection and size recovery metrics
+│   ├── tagged-hash-3/       # Tagged traces (hash mode, depth 3)
+│   │   └── *.json           # Processed traces with ancestry tags
+│   └── tagged-bloom-5/      # Tagged traces (bloom mode, depth 5)
+│       └── *.json           # Processed traces with ancestry tags
+├── jaeger_trace_loader.go   # Main trace loader and reconstruction tool
+└── trace_tagger.go          # Trace tagging utility
 ```
 
 ### Data Loss Detection Algorithm
@@ -96,20 +149,47 @@ bridges/
 
 ### Data Loss Simulation Algorithm
 
-1. **Span Classification**: Identifies root spans (no parents) and leaf spans (no children)
-2. **Eligible Span Selection**: Only selects middle nodes (spans with both parents and children)
-3. **Smart Removal**: Randomly removes selected middle nodes to create realistic data loss
-4. **Forced Data Loss**: If no data loss detected, aggressively removes middle spans to guarantee loss
-5. **Automatic Analysis**: Processes simulated traces to detect and measure data loss
+1. **Priority Classification**: Identifies high-priority spans (roots, leaves, depth intervals) and low-priority spans
+2. **Protected Spans**: Root spans and leaf spans are never removed
+3. **Low-Priority Removal**: Randomly selects and removes low-priority spans based on loss percentage
+4. **Randomized Simulation**: Uses random seed to ensure different loss patterns each run
+5. **Process Filtering**: Only includes processes referenced by remaining spans
+6. **Automatic Analysis**: Processes simulated traces to detect and measure data loss
 
 ### Trace Reconnection Algorithm
 
-1. **Bloom Filter Extraction**: Deserializes Bloom filters from span baggage attributes
-2. **Orphan Identification**: Finds spans with missing parent references
-3. **Ancestry Analysis**: For each orphan, queries Bloom filters to find contained span IDs
-4. **Nearest Ancestor Selection**: Chooses the deepest (most specific) ancestor from available spans
-5. **Bridge Creation**: Creates new CHILD_OF references with confidence metadata
-6. **Validation**: Verifies reconnected traces have no remaining data loss
+#### General Flow
+
+1. **Ancestry Data Extraction**: Attempts to get ancestry data from `ancestry`/`ancestry_mode` tags
+2. **Descendant Fallback**: If orphan lacks ancestry data, searches for nearest downstream descendant with ancestry
+3. **Baggage Fallback**: If no descendant found, falls back to `__bag.hash_array` or `__bag.bloom_filter`
+4. **Orphan Identification**: Finds spans with missing parent references
+5. **Mode Detection**: Determines ancestry mode (bloom or hash) from tags or trace-wide mode
+
+#### Bloom Filter Mode
+
+1. **Deserialization**: Deserializes Bloom filter from ancestry data
+2. **Membership Testing**: Tests all existing span IDs against the Bloom filter
+3. **Nearest Ancestor Selection**: Chooses the deepest ancestor that tests positive
+4. **Confidence Calculation**: Computes confidence based on Bloom filter false positive rate
+
+#### Hash Array Mode
+
+1. **Array Parsing**: Parses comma-separated span ID ancestry chain (root → ... → current)
+2. **Orphan Location**: Finds orphan's position in its own ancestry array
+3. **Anchor Finding**: Locates deepest existing ancestor (anchor) in the ancestry chain
+4. **Parent Inference**: Derives missing parent from ancestry chain (immediately before orphan)
+5. **Synthetic Span Creation**: Creates missing intermediate spans between anchor and parent
+6. **Parent Handling**: Handles cases where parent was already synthesized by previous orphan
+7. **Reference Update**: Updates orphan's CHILD_OF reference to point to reconnected parent
+
+#### Synthetic Span Creation
+
+- **Service**: "unknown_service:reconstructed"
+- **Operation**: "unknown"
+- **Tags**: `bridge.synthetic=true`
+- **Timing**: `startTime = child.startTime - 1µs`, `duration = 1µs`
+- **Process**: Uses dedicated `p_unknown` process ID
 
 ### Metadata Tracking
 
@@ -121,44 +201,36 @@ bridges/
 
 #### Reconstructed Trace Metadata
 - **Reconnection Results**: Bridge edges, confidence scores, success rates
+- **Synthetic Span Count**: Number of synthetic spans created per bridge and total
 - **Size Recovery**: Original vs reconstructed trace sizes
 - **Bridge Details**: Original parent IDs, confidence metrics, reconnection tags
-- **Recovery Analysis**: Effectiveness of Bloom filter-based reconnection
+- **Recovery Analysis**: Effectiveness of ancestry-based reconnection
 
 ### Example Output
 
 ```
 === PROCESSING TRACES ===
-DEBUG - Trace a8111947fcd2cbf997baa2901d39bf68: Analyzing 23 spans
-DEBUG - *** DATA LOSS DETECTED *** Span b4701e8b7c95d04c references missing parent 42ef5117deeebead (CHILD_OF)
-Data loss result: hasLoss=true, missing=[42ef5117deeebead ee9971ac1740dfef a6dc3ac22515fdf3], orphans=[b4701e8b7c95d04c 4cb34bcb2df68f91 760fc00e29045b3e], severity=low
+Loaded 2 trace(s) from 0a0a4e85a349a110.json
+  Trace 1: ID=0a0a4e85a349a110, Spans=117
 
 === TRACE RECONNECTION FLOW ===
 --- Step 1: Simulate Data Loss ---
-FORCED SIMULATION - Removed 3 middle spans (30.0% of middle spans) from trace a8111947fcd2cbf997baa2901d39bf68
-Simulated trace: a8111947fcd2cbf997baa2901d39bf68 (20 spans)
+Data loss result: hasLoss=true, missing=30 spans, orphans=41 spans, severity=high
 
---- Step 2: Detect Data Loss ---
-Data loss detected: true
-Missing span IDs: [42ef5117deeebead ee9971ac1740dfef a6dc3ac22515fdf3]
-Orphaned spans: [b4701e8b7c95d04c 4cb34bcb2df68f91 760fc00e29045b3e]
+--- Step 2: Reconnect Trace ---
+RECONNECTION - Found 59 orphaned spans in trace 0a0a4e85a349a110
+RECONNECTION - Orphan 9735ac845d1f1e63: using own ancestry data (mode=hash)
+RECONNECTION - Orphan 9735ac845d1f1e63: hash parts=[dc8ae8ee95af6184 ... 9735ac845d1f1e63]
+RECONNECTION - Orphan 9735ac845d1f1e63: anchorIdx=8 anchorSpan=43e222bb14975419
+RECONNECTION - Orphan 9735ac845d1f1e63: synthesizing 2 missing ancestors
+RECONNECTION - Orphan 9735ac845d1f1e63: original missing parent was f4a6dd5607335ed2; reattaching under f4a6dd5607335ed2
+...
+RECONNECTION - Successfully reconnected 59/59 orphaned spans (100.0%), created 53 synthetic spans
+✅ Reconnected: rate=100.0%, bridges=59, synthetic=53
 
---- Step 3: Reconnect Trace Using Bloom Filters ---
-RECONNECTION - Found 3 orphaned spans in trace a8111947fcd2cbf997baa2901d39bf68
-RECONNECTION - Successfully reconnected 3/3 orphaned spans (100.0%)
-✅ Reconnection successful!
-Bridge edges created: 3
-  Bridge 1: 7cf967b1 -> b4701e8b (original parent: 42ef5117, confidence: 0.70)
-  Bridge 2: 64a8734a -> 4cb34bcb (original parent: ee9971ac, confidence: 0.70)
-  Bridge 3: 64a8734a -> 760fc00e (original parent: a6dc3ac2, confidence: 0.70)
-
---- Step 4: Verify Reconnected Trace ---
-Reconnected trace data loss: false
-✅ All spans successfully reconnected!
-
---- Step 5: Save Traces to Files ---
-💾 Saved 1 lossy traces to data/lossy
-💾 Saved 1 reconstructed traces to data/reconstructed
+--- Step 3: Save Traces to Files ---
+💾 Saved 2 lossy traces to data/lossy
+💾 Saved 2 reconstructed traces to data/reconstructed
 ```
 
 ### Metadata Example
@@ -185,21 +257,23 @@ Reconnected trace data loss: false
 #### Reconstructed Trace Metadata
 ```json
 {
-  "trace_id": "a8111947fcd2cbf997baa2901d39bf68",
-  "original_spans": 20,
-  "reconstructed_spans": 20,
-  "original_size_bytes": 15283,
-  "reconstructed_size_bytes": 15850,
-  "size_recovery_percent": 103.71,
+  "trace_id": "0a0a4e85a349a110",
+  "original_spans": 117,
+  "reconstructed_spans": 170,
+  "original_size_bytes": 87543,
+  "reconstructed_size_bytes": 92015,
+  "size_recovery_percent": 105.10,
   "reconnection_result": {
-    "reconnectionRate": 100,
+    "reconnectionRate": 100.0,
+    "totalSyntheticSpans": 53,
     "success": true,
     "bridgeEdges": [
       {
-        "fromSpanID": "7cf967b1d3aeabe8",
-        "toSpanID": "b4701e8b7c95d04c",
-        "originalParent": "42ef5117deeebead",
-        "confidence": 0.7
+        "fromSpanID": "f4a6dd5607335ed2",
+        "toSpanID": "9735ac845d1f1e63",
+        "originalParent": "f4a6dd5607335ed2",
+        "confidence": 0.7,
+        "syntheticSpansCreated": 2
       }
     ]
   }
@@ -221,17 +295,42 @@ The loader expects Jaeger to be deployed with the following service configuratio
 
 This matches the configuration generated by the blueprint-docc-mod project in `examples/sockshop/build/k8s/`.
 
+### Trace Tagger Priority Rules
+
+The trace tagger assigns priority based on:
+- **High Priority**: Root spans (no parent), leaf spans (no children), and spans at depth intervals (depth % d == 0)
+- **Low Priority**: All other middle spans
+- **Ancestry Data**: Only high-priority spans receive ancestry data tags
+
+#### Ancestry Data Formats
+
+**Hash Mode:**
+- `ancestry_mode`: "hash"
+- `ancestry`: Comma-separated span IDs from root to current span
+- Example: `"dc8ae8ee95af6184,92745ae3dcba25bb,9f01a79ddbc76107"`
+
+**Bloom Filter Mode:**
+- `ancestry_mode`: "bloom"
+- `ancestry`: Base64-encoded serialized Bloom filter
+- Parameters: Capacity=10, Hash functions=7
+- Serialization: GobEncode + Base64
+
 ### API Reference
 
-#### Core Methods
+#### Jaeger Trace Loader Methods
 - `LoadTraces(service, limit)` - Load traces from a specific service
+- `LoadTracesFromFolder(folder)` - Load traces from JSON files in a folder
 - `GetServices()` - Discover available services
 - `DetectDataLoss(trace)` - Analyze trace for data loss
-- `SimulateDataLoss(trace, percentage)` - Create data loss simulation
-- `ForceDataLoss(trace, percentage)` - Guarantee data loss by aggressive span removal
-- `ReconnectTrace(trace)` - Reconnect orphaned spans using Bloom filters
+- `SimulateDataLossWithProtection(trace, percentage)` - Create data loss simulation (priority-based)
+- `ReconnectTrace(trace)` - Reconnect orphaned spans using ancestry data (bloom or hash)
 - `SaveLossyTraces(traces, metadata)` - Save lossy traces and metadata
 - `SaveReconstructedTraces(traces, results)` - Save reconnected traces and results
+
+#### Trace Tagger Methods
+- `ProcessTrace(trace)` - Process a single trace, adding priority and ancestry tags
+- `buildHashArrayAncestry(path)` - Create comma-separated span ID ancestry string
+- `buildBloomFilterAncestry(path)` - Create serialized Bloom filter ancestry
 
 #### Data Structures
 - `JaegerTrace` - Complete trace with spans and metadata
@@ -243,9 +342,28 @@ This matches the configuration generated by the blueprint-docc-mod project in `e
 - `StorageMetadata` - Aggregated statistics across all traces
 - `TraceStorage` - File-based storage management
 
-#### Bloom Filter Integration
+#### Ancestry Data Integration
+
+**Bloom Filter Mode:**
 - **Serialization**: Uses `GobEncode`/`GobDecode` for efficient storage
-- **Base64 Encoding**: Safe transmission in span baggage attributes
+- **Base64 Encoding**: Safe transmission in span tags
 - **Capacity**: 10 elements with configurable false positive rate
-- **Hash Functions**: Multiple hash functions for better distribution
+- **Hash Functions**: 7 hash functions for better distribution
 - **Containment Queries**: Fast membership testing for ancestry analysis
+- **False Positive Rate**: ~1% with default parameters
+
+**Hash Array Mode:**
+- **Format**: Comma-separated span IDs from root to current span
+- **Ordering**: Root span ID first, current span ID last
+- **Storage**: Stored as string in `ancestry` tag
+- **Reconstruction**: Direct span ID lookup for exact parent chain reconstruction
+- **Synthetic Spans**: Creates missing intermediate spans with unknown service/operation
+
+**Tag Structure:**
+- `ancestry_mode`: "bloom" or "hash"
+- `ancestry`: Serialized data (Base64 for bloom, comma-separated IDs for hash)
+- `prio`: "high" or "low"
+- `bridge.reconnected`: Boolean tag on reconnected spans
+- `bridge.original_parent`: Original missing parent span ID
+- `bridge.confidence`: Confidence score (0-1)
+- `bridge.synthetic`: Boolean tag on synthetic spans

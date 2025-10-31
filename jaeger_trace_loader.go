@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bits-and-blooms/bloom"
@@ -91,20 +92,22 @@ type ProcessedTrace struct {
 
 // BridgeEdge represents a reconnected edge in the trace
 type BridgeEdge struct {
-	FromSpanID     string  `json:"fromSpanID"`
-	ToSpanID       string  `json:"toSpanID"`
-	OriginalParent string  `json:"originalParent"` // The missing parent that was being referenced
-	Depth          int     `json:"depth"`          // Depth of the reconnected span
-	Confidence     float64 `json:"confidence"`     // Confidence in the reconnection (0-1)
+	FromSpanID          string  `json:"fromSpanID"`
+	ToSpanID            string  `json:"toSpanID"`
+	OriginalParent      string  `json:"originalParent"` // The missing parent that was being referenced
+	Depth               int     `json:"depth"`          // Depth of the reconnected span
+	Confidence          float64 `json:"confidence"`     // Confidence in the reconnection (0-1)
+	SyntheticSpansCreated int   `json:"syntheticSpansCreated"` // Number of synthetic spans created for this edge
 }
 
 // ReconnectionResult represents the result of trace reconnection
 type ReconnectionResult struct {
-	OriginalTrace    *JaegerTrace   `json:"originalTrace"`
-	ReconnectedTrace *JaegerTrace   `json:"reconnectedTrace"`
-	BridgeEdges      []BridgeEdge   `json:"bridgeEdges"`
-	ReconnectionRate float64        `json:"reconnectionRate"` // Percentage of orphaned spans reconnected
-	Success          bool           `json:"success"`
+	OriginalTrace        *JaegerTrace   `json:"originalTrace"`
+	ReconnectedTrace     *JaegerTrace   `json:"reconnectedTrace"`
+	BridgeEdges          []BridgeEdge   `json:"bridgeEdges"`
+	ReconnectionRate     float64        `json:"reconnectionRate"` // Percentage of orphaned spans reconnected
+	Success              bool           `json:"success"`
+	TotalSyntheticSpans  int            `json:"totalSyntheticSpans"` // Total synthetic spans created during reconnection
 }
 
 // TraceStorage handles file-based storage of traces
@@ -162,7 +165,7 @@ type JaegerTraceLoader struct {
 	httpClient   *http.Client
 	bloomFilter  *bloom.BloomFilter
 	traceCache   map[string]*JaegerTrace
-	processedTraces map[string]*ProcessedTrace
+    processedTraces map[string]*ProcessedTrace
 }
 
 // NewJaegerTraceLoader creates a new trace loader
@@ -171,12 +174,12 @@ func NewJaegerTraceLoader(jaegerURL string) *JaegerTraceLoader {
 	// Estimate 10000 traces with 0.01 false positive rate
 	filter := bloom.NewWithEstimates(10000, 0.01)
 	
-	return &JaegerTraceLoader{
+    return &JaegerTraceLoader{
 		jaegerURL:        jaegerURL,
 		httpClient:       &http.Client{Timeout: 30 * time.Second},
 		bloomFilter:      filter,
 		traceCache:       make(map[string]*JaegerTrace),
-		processedTraces:  make(map[string]*ProcessedTrace),
+        processedTraces:  make(map[string]*ProcessedTrace),
 	}
 }
 
@@ -476,7 +479,7 @@ func (loader *JaegerTraceLoader) ProcessTraces(traces []*JaegerTrace) []*Process
 	var processedTraces []*ProcessedTrace
 	
 	for _, trace := range traces {
-		processed := loader.ProcessTrace(trace)
+        processed := loader.ProcessTrace(trace)
 		processedTraces = append(processedTraces, processed)
 	}
 	
@@ -559,7 +562,114 @@ func removeDuplicates(slice []string) []string {
 	return result
 }
 
+// getAncestryFromTags returns ancestry_mode and ancestry payload from span tags (no fallback)
+func getAncestryFromTags(span JaegerSpan) (string, string) {
+    var mode, payload string
+    for _, t := range span.Tags {
+        if t.Key == "ancestry_mode" {
+            if s, ok := t.Value.(string); ok {
+                mode = s
+            }
+        } else if t.Key == "ancestry" {
+            if s, ok := t.Value.(string); ok {
+                payload = s
+            }
+        }
+    }
+    return mode, payload
+}
+
+// getAncestryFromLeafBaggage returns ancestry from legacy __bag.* keys for leaves
+func getAncestryFromLeafBaggage(span JaegerSpan) (string, string) {
+    var mode, payload string
+    // Prefer hash array when available
+    for _, t := range span.Tags {
+        if t.Key == "__bag.hash_array" {
+            if s, ok := t.Value.(string); ok && s != "" {
+                return "hash", s
+            }
+        }
+    }
+    for _, t := range span.Tags {
+        if t.Key == "__bag.bloom_filter" {
+            if s, ok := t.Value.(string); ok && s != "" {
+                return "bloom", s
+            }
+        }
+    }
+    return mode, payload
+}
+
+// getAncestryFlexible tries normal tags; if absent and span is a leaf, falls back to __bag.*
+func getAncestryFlexible(span JaegerSpan, children map[string][]string) (string, string) {
+    mode, payload := getAncestryFromTags(span)
+    if payload != "" {
+        return mode, payload
+    }
+    // Leaf fallback allowed
+    if len(children[span.SpanID]) == 0 {
+        return getAncestryFromLeafBaggage(span)
+    }
+    return "", ""
+}
+
+// findNearestDescendantWithAncestry does BFS to locate the closest descendant having ancestry tags
+func findNearestDescendantWithAncestry(startID string, children map[string][]string, byID map[string]JaegerSpan) *JaegerSpan {
+    visited := make(map[string]bool)
+    q := []string{startID}
+    visited[startID] = true
+    // Do not consider the start node itself; we want a descendant
+    for len(q) > 0 {
+        cur := q[0]
+        q = q[1:]
+        for _, child := range children[cur] {
+            if visited[child] {
+                continue
+            }
+            visited[child] = true
+            if s, ok := byID[child]; ok {
+                if _, payload := getAncestryFlexible(s, children); payload != "" {
+                    // nearest found
+                    scopy := s
+                    return &scopy
+                }
+            }
+            q = append(q, child)
+        }
+    }
+    return nil
+}
+
+// (removed ancestry tagging helpers)
+
+// isHighPrioritySpan returns true if span has prio=="high" or __bag.prio==1
+func isHighPrioritySpan(span JaegerSpan) bool {
+    for _, t := range span.Tags {
+        if t.Key == "prio" {
+            if s, ok := t.Value.(string); ok && s == "high" {
+                return true
+            }
+        } else if t.Key == "__bag.prio" {
+            // Jaeger JSON stores numbers as float64 when decoded into interface{}
+            switch v := t.Value.(type) {
+            case int:
+                if v == 1 { return true }
+            case int64:
+                if v == 1 { return true }
+            case float64:
+                if int(v) == 1 { return true }
+            }
+        }
+    }
+    return false
+}
+
+func isLowPrioritySpan(span JaegerSpan) bool { return !isHighPrioritySpan(span) }
+
 func main() {
+	// Seed random number generator for different data loss simulation each run
+	rand.Seed(time.Now().UnixNano())
+	
 	// Jaeger URL - adjust the IP and port based on your Kubernetes setup
 	// Port 16686 is the Jaeger UI port, but we need the API port
 	// Based on the service config, we should use the service name and port
@@ -652,91 +762,81 @@ func main() {
 		fmt.Printf("  %s: %v\n", key, value)
 	}
 	
-	// Test complete trace reconnection flow
-	fmt.Printf("\nDEBUG: processedTraces count: %d\n", len(processedTraces))
-	if len(processedTraces) > 0 {
-		firstTrace := processedTraces[0]
-		fmt.Printf("DEBUG: firstTrace spans: %d\n", len(firstTrace.Trace.Spans))
+	// Test complete trace reconnection flow on all traces
+	fmt.Printf("\n=== TRACE RECONNECTION FLOW ===\n")
+	fmt.Printf("Processing %d traces for data loss simulation and reconnection\n", len(processedTraces))
+	
+	// Collect all traces for batch saving
+	var allLossyTraces []*JaegerTrace
+	var allLossyMetadata []*DataLossInfo
+	var allReconstructedTraces []*JaegerTrace
+	var allReconnectionResults []*ReconnectionResult
+	
+	for idx, processedTrace := range processedTraces {
+		if processedTrace == nil || processedTrace.Trace == nil || len(processedTrace.Trace.Spans) <= 1 {
+			continue // Skip traces with 1 or fewer spans
+		}
 		
-		// Print the full original trace JSON for comparison
-		fmt.Println("\n=== ORIGINAL TRACE DATA ===")
-		originalJSON, _ := json.MarshalIndent(firstTrace.Trace, "", "  ")
-		fmt.Println(string(originalJSON))
-		fmt.Println("=== END ORIGINAL TRACE DATA ===\n")
+		trace := processedTrace.Trace
+		fmt.Printf("\n--- Trace %d/%d: %s (%d spans) ---\n", idx+1, len(processedTraces), trace.TraceID, len(trace.Spans))
 		
-		if len(firstTrace.Trace.Spans) > 1 {
-			fmt.Printf("\n=== TRACE RECONNECTION FLOW ===\n")
-			fmt.Printf("Testing trace reconnection on: %s (%d spans)\n", firstTrace.Trace.TraceID, len(firstTrace.Trace.Spans))
+		// Step 1: Simulate data loss
+		fmt.Printf("  Step 1: Simulating data loss...\n")
+		simulatedTrace := loader.ForceDataLoss(trace, 1.0) // Force 100% data loss
+		fmt.Printf("  Simulated trace: %s (%d spans)\n", simulatedTrace.TraceID, len(simulatedTrace.Spans))
+		
+		// Step 2: Detect data loss
+		dataLossInfo := loader.DetectDataLoss(simulatedTrace)
+		if !dataLossInfo.HasDataLoss {
+			fmt.Printf("  ⚠️  No data loss detected - skipping reconnection\n")
+			continue
+		}
+		
+		fmt.Printf("  Data loss detected: missing=%d spans, orphans=%d spans\n", 
+			len(dataLossInfo.MissingSpanIDs), len(dataLossInfo.OrphanSpans))
+		
+		// Step 3: Reconnect trace
+		fmt.Printf("  Step 2: Reconnecting trace...\n")
+		reconnectionResult := loader.ReconnectTrace(simulatedTrace)
+		
+		if reconnectionResult.Success {
+			fmt.Printf("  ✅ Reconnected: rate=%.1f%%, bridges=%d, synthetic=%d\n", 
+				reconnectionResult.ReconnectionRate, len(reconnectionResult.BridgeEdges), 
+				reconnectionResult.TotalSyntheticSpans)
 			
-			// Step 1: Simulate data loss with protection
-			fmt.Printf("\n--- Step 1: Simulate Data Loss ---\n")
-			simulatedTrace := loader.ForceDataLoss(firstTrace.Trace, 0.3) // Force 30% data loss
-			fmt.Printf("Simulated trace: %s (%d spans)\n", simulatedTrace.TraceID, len(simulatedTrace.Spans))
-			
-			// Step 2: Detect data loss in simulated trace
-			fmt.Printf("\n--- Step 2: Detect Data Loss ---\n")
-			dataLossInfo := loader.DetectDataLoss(simulatedTrace)
-			fmt.Printf("Data loss detected: %v\n", dataLossInfo.HasDataLoss)
-			if dataLossInfo.HasDataLoss {
-				fmt.Printf("Missing span IDs: %v\n", dataLossInfo.MissingSpanIDs)
-				fmt.Printf("Orphaned spans: %v\n", dataLossInfo.OrphanSpans)
-				fmt.Printf("Loss severity: %s\n", dataLossInfo.LossSeverity)
-			}
-			
-			// Step 3: Attempt trace reconnection using bloom filters
-			if dataLossInfo.HasDataLoss {
-				fmt.Printf("\n--- Step 3: Reconnect Trace Using Bloom Filters ---\n")
-				reconnectionResult := loader.ReconnectTrace(simulatedTrace)
-				
-				if reconnectionResult.Success {
-					fmt.Printf("✅ Reconnection successful!\n")
-					fmt.Printf("Reconnection rate: %.1f%%\n", reconnectionResult.ReconnectionRate)
-					fmt.Printf("Bridge edges created: %d\n", len(reconnectionResult.BridgeEdges))
-					
-					// Show bridge edges
-					for i, edge := range reconnectionResult.BridgeEdges {
-						if i >= 5 { // Limit output
-							fmt.Printf("  ... and %d more bridge edges\n", len(reconnectionResult.BridgeEdges)-5)
-							break
-						}
-						fmt.Printf("  Bridge %d: %s -> %s (original parent: %s, confidence: %.2f)\n", 
-							i+1, edge.FromSpanID[:8], edge.ToSpanID[:8], edge.OriginalParent[:8], edge.Confidence)
-					}
-					
-					// Verify reconnected trace
-					fmt.Printf("\n--- Step 4: Verify Reconnected Trace ---\n")
-					reconnectedDataLoss := loader.DetectDataLoss(reconnectionResult.ReconnectedTrace)
-					fmt.Printf("Reconnected trace data loss: %v\n", reconnectedDataLoss.HasDataLoss)
-					if reconnectedDataLoss.HasDataLoss {
-						fmt.Printf("Remaining orphaned spans: %d\n", len(reconnectedDataLoss.OrphanSpans))
-					} else {
-						fmt.Printf("✅ All spans successfully reconnected!\n")
-					}
-					
-					// Save traces to files
-					fmt.Printf("\n--- Step 5: Save Traces to Files ---\n")
-					
-					// Save lossy trace
-					lossyTraces := []*JaegerTrace{simulatedTrace}
-					lossyMetadata := []*DataLossInfo{dataLossInfo}
-					if err := storage.SaveLossyTraces(lossyTraces, lossyMetadata); err != nil {
-						fmt.Printf("Error saving lossy traces: %v\n", err)
-					}
-					
-					// Save reconstructed trace
-					reconstructedTraces := []*JaegerTrace{reconnectionResult.ReconnectedTrace}
-					reconnectionResults := []*ReconnectionResult{reconnectionResult}
-					if err := storage.SaveReconstructedTraces(reconstructedTraces, reconnectionResults); err != nil {
-						fmt.Printf("Error saving reconstructed traces: %v\n", err)
-					}
-					
-				} else {
-					fmt.Printf("❌ Reconnection failed - no bridge edges could be created\n")
-				}
+			// Add to batch collections
+			allLossyTraces = append(allLossyTraces, simulatedTrace)
+			allLossyMetadata = append(allLossyMetadata, dataLossInfo)
+			allReconstructedTraces = append(allReconstructedTraces, reconnectionResult.ReconnectedTrace)
+			allReconnectionResults = append(allReconnectionResults, reconnectionResult)
+		} else {
+			fmt.Printf("  ❌ Reconnection failed\n")
+			// Still save lossy trace even if reconnection failed
+			allLossyTraces = append(allLossyTraces, simulatedTrace)
+			allLossyMetadata = append(allLossyMetadata, dataLossInfo)
+		}
+	}
+	
+	// Step 4: Save all traces to files
+	if len(allLossyTraces) > 0 {
+		fmt.Printf("\n--- Saving Results ---\n")
+		fmt.Printf("Saving %d lossy traces...\n", len(allLossyTraces))
+		if err := storage.SaveLossyTraces(allLossyTraces, allLossyMetadata); err != nil {
+			fmt.Printf("Error saving lossy traces: %v\n", err)
+		} else {
+			fmt.Printf("✅ Saved lossy traces\n")
+		}
+		
+		if len(allReconstructedTraces) > 0 {
+			fmt.Printf("Saving %d reconstructed traces...\n", len(allReconstructedTraces))
+			if err := storage.SaveReconstructedTraces(allReconstructedTraces, allReconnectionResults); err != nil {
+				fmt.Printf("Error saving reconstructed traces: %v\n", err)
 			} else {
-				fmt.Printf("No data loss detected - skipping reconnection\n")
+				fmt.Printf("✅ Saved reconstructed traces\n")
 			}
 		}
+	} else {
+		fmt.Printf("\n⚠️  No traces with data loss to save\n")
 	}
 }
 
@@ -800,25 +900,9 @@ func (loader *JaegerTraceLoader) SimulateDataLossWithProtection(trace *JaegerTra
 	// Initialize eligible spans list
 	var eligibleSpans []string
 	
-	// If we have too many leaf spans, be more aggressive and allow removing some middle spans
-	// by reducing the leaf span protection
-	if len(leafSpans) > len(spanIDMap)/2 {
-		fmt.Printf("  SIMULATION - Too many leaf spans (%d), reducing leaf protection\n", len(leafSpans))
-		// Allow removing up to 50% of leaf spans to force some middle span removal
-		maxLeafRemoval := int(float64(len(leafSpans)) * 0.5)
-		if maxLeafRemoval > 0 {
-			// Randomly select some leaf spans to make eligible for removal
-			for i := 0; i < maxLeafRemoval && i < len(leafSpans); i++ {
-				idx := rand.Intn(len(leafSpans))
-				// Remove from leaf spans and add to eligible
-				leafSpanID := leafSpans[idx]
-				leafSpans = append(leafSpans[:idx], leafSpans[idx+1:]...)
-				eligibleSpans = append(eligibleSpans, leafSpanID)
-			}
-		}
-	}
+    // No relaxation: leaf spans are always protected and never eligible for removal
 	
-	// Identify eligible spans for removal (non-root, non-leaf)
+    // Identify eligible spans for removal (non-root, non-leaf, low-priority only)
 	for spanID := range spanIDMap {
 		isRoot := false
 		isLeaf := false
@@ -837,8 +921,14 @@ func (loader *JaegerTraceLoader) SimulateDataLossWithProtection(trace *JaegerTra
 			}
 		}
 		
-		if !isRoot && !isLeaf {
-			eligibleSpans = append(eligibleSpans, spanID)
+        if !isRoot && !isLeaf {
+            // only low-priority spans are eligible
+            for _, sp := range trace.Spans {
+                if sp.SpanID == spanID && isLowPrioritySpan(sp) {
+                    eligibleSpans = append(eligibleSpans, spanID)
+                    break
+                }
+            }
 		}
 	}
 	
@@ -882,11 +972,13 @@ func (loader *JaegerTraceLoader) ForceDataLoss(trace *JaegerTrace, lossPercentag
 		Warnings:  trace.Warnings,
 	}
 	
-	// Build parent-child relationships
+    // Build parent-child relationships and span index
 	parentChildMap := make(map[string][]string) // parent -> children
 	var rootSpans []string
+    byID := make(map[string]JaegerSpan)
 	
 	for _, span := range trace.Spans {
+        byID[span.SpanID] = span
 		// Check if this is a root span (no CHILD_OF references)
 		isRoot := true
 		for _, ref := range span.References {
@@ -900,13 +992,17 @@ func (loader *JaegerTraceLoader) ForceDataLoss(trace *JaegerTrace, lossPercentag
 		}
 	}
 	
-	// Find spans that have children (middle spans) - these will create orphans when removed
-	var middleSpans []string
-	for spanID, children := range parentChildMap {
-		if len(children) > 0 {
-			middleSpans = append(middleSpans, spanID)
-		}
-	}
+    // Find spans that have children (middle spans) and are low priority only, excluding roots
+    var middleSpans []string
+    rootSet := make(map[string]bool)
+    for _, r := range rootSpans { rootSet[r] = true }
+    for spanID, children := range parentChildMap {
+        if len(children) > 0 && !rootSet[spanID] {
+            if sp, ok := byID[spanID]; ok && isLowPrioritySpan(sp) {
+                middleSpans = append(middleSpans, spanID)
+            }
+        }
+    }
 	
 	// Calculate number of middle spans to remove
 	numToRemove := int(float64(len(middleSpans)) * lossPercentage)
@@ -917,7 +1013,7 @@ func (loader *JaegerTraceLoader) ForceDataLoss(trace *JaegerTrace, lossPercentag
 		numToRemove = 1 // Remove at least one middle span
 	}
 	
-	// Randomly select middle spans to remove
+    // Randomly select low-priority middle spans to remove
 	removedSpans := make(map[string]bool)
 	for i := 0; i < numToRemove; i++ {
 		idx := rand.Intn(len(middleSpans))
@@ -933,7 +1029,7 @@ func (loader *JaegerTraceLoader) ForceDataLoss(trace *JaegerTrace, lossPercentag
 		}
 	}
 	
-	// Populate processes map with only the process IDs used by remaining spans
+    // Populate processes map with only the process IDs used by remaining spans
 	usedProcessIDs := make(map[string]bool)
 	for _, span := range simulatedTrace.Spans {
 		usedProcessIDs[span.ProcessID] = true
@@ -946,12 +1042,12 @@ func (loader *JaegerTraceLoader) ForceDataLoss(trace *JaegerTrace, lossPercentag
 		}
 	}
 	
-	fmt.Printf("  FORCED SIMULATION - Removed %d middle spans (%.1f%% of middle spans) from trace %s\n", 
-		numToRemove, lossPercentage*100, trace.TraceID)
-	fmt.Printf("  FORCED SIMULATION - Root spans: %d, Middle spans: %d\n", 
-		len(rootSpans), len(parentChildMap))
+	fmt.Printf("  FORCED SIMULATION - Removed %d middle spans (%.1f%% of %d eligible middle spans) from trace %s\n", 
+		numToRemove, lossPercentage*100, len(middleSpans), trace.TraceID)
+	fmt.Printf("  FORCED SIMULATION - Root spans: %d, Eligible middle spans (low-priority, non-root, with children): %d\n", 
+		len(rootSpans), len(middleSpans))
 	
-	return simulatedTrace
+    return simulatedTrace
 }
 
 // ReconnectTrace attempts to reconnect orphaned spans using bloom filters
@@ -1046,110 +1142,224 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 	
 	fmt.Printf("  RECONNECTION - Found %d orphaned spans in trace %s\n", len(orphanedSpans), trace.TraceID)
 	
-	// Attempt to reconnect each orphaned span
-	reconnectedCount := 0
-	for _, orphanedSpan := range orphanedSpans {
-		// Extract bloom filter from orphaned span
-		var bloomFilterStr string
-		for _, tag := range orphanedSpan.Tags {
-			if tag.Key == "__bag.bloom_filter" {
-				bloomFilterStr = tag.Value.(string)
-				break
+	// Build children index and span lookup for descendant search
+	children := make(map[string][]string)
+	byID := make(map[string]JaegerSpan)
+	for _, s := range trace.Spans {
+		byID[s.SpanID] = s
+	}
+	for _, s := range trace.Spans {
+		for _, ref := range s.References {
+			if ref.RefType == "CHILD_OF" {
+				children[ref.SpanID] = append(children[ref.SpanID], s.SpanID)
 			}
 		}
-		
-		if bloomFilterStr == "" {
-			continue // No bloom filter available
-		}
-		
-		// Deserialize bloom filter
-		bf, err := deserializeBloomFilter(bloomFilterStr)
-		if err != nil {
-			continue // Failed to deserialize
-		}
-		
-		// Find the missing parent ID
-		var missingParentID string
-		for _, ref := range orphanedSpan.References {
-			if ref.RefType == "CHILD_OF" && !spanIDMap[ref.SpanID] {
-				missingParentID = ref.SpanID
-				break
+	}
+
+    // Attempt to reconnect each orphaned span
+    reconnectedCount := 0
+    for _, orphanedSpan := range orphanedSpans {
+        fmt.Printf("  RECONNECTION - Orphan %s: attempting ancestry extraction from __bag.*\n", orphanedSpan.SpanID)
+        // Simplified policy: always read ancestry from the orphan's __bag.* attributes
+        var mode, payload string
+        for _, t := range orphanedSpan.Tags {
+            if t.Key == "__bag.hash_array" {
+                if s, ok := t.Value.(string); ok && s != "" {
+                    mode, payload = "hash", s
+                    break
+                }
+            }
+        }
+        if payload == "" {
+            for _, t := range orphanedSpan.Tags {
+                if t.Key == "__bag.bloom_filter" {
+                    if s, ok := t.Value.(string); ok && s != "" {
+                        mode, payload = "bloom", s
+                        break
+                    }
+                }
+            }
+        }
+        if payload == "" {
+            fmt.Printf("    RECONNECTION - Orphan %s: no __bag.* ancestry found, skipping\n", orphanedSpan.SpanID)
+            continue // no ancestry available
+        }
+        fmt.Printf("    RECONNECTION - Orphan %s: using mode=%s\n", orphanedSpan.SpanID, mode)
+		if mode == "bloom" {
+            bf, err := deserializeBloomFilter(payload)
+			if err != nil {
+                fmt.Printf("    RECONNECTION - Orphan %s: failed to deserialize bloom filter: %v\n", orphanedSpan.SpanID, err)
+				continue
 			}
-		}
-		
-		if missingParentID == "" {
-			continue // No missing parent found
-		}
-		
-		// Find the lowest (deepest) existing span that is contained in the bloom filter
-		var bestAncestor string
-		var bestDepth = -1
-		var bestConfidence float64
-		
-		for existingSpanID := range spanIDMap {
-			if bf.Test([]byte(existingSpanID)) {
-				depth := spanDepthMap[existingSpanID]
-				if depth > bestDepth {
-					bestDepth = depth
-					bestAncestor = existingSpanID
-					// Calculate confidence based on bloom filter containment
-					bestConfidence = loader.calculateReconnectionConfidence(bf, existingSpanID, orphanedSpan.SpanID)
-				}
-			}
-		}
-		
-		if bestAncestor != "" {
-			// Create bridge edge
-			bridgeEdge := BridgeEdge{
-				FromSpanID:     bestAncestor,
-				ToSpanID:       orphanedSpan.SpanID,
-				OriginalParent: missingParentID,
-				Depth:          spanDepthMap[orphanedSpan.SpanID],
-				Confidence:     bestConfidence,
-			}
-			result.BridgeEdges = append(result.BridgeEdges, bridgeEdge)
-			
-			// Update the orphaned span's references to point to the best ancestor
-			for i := range reconnectedTrace.Spans {
-				if reconnectedTrace.Spans[i].SpanID == orphanedSpan.SpanID {
-					// Update the reference
-					for j := range reconnectedTrace.Spans[i].References {
-						if reconnectedTrace.Spans[i].References[j].RefType == "CHILD_OF" && 
-						   reconnectedTrace.Spans[i].References[j].SpanID == missingParentID {
-							reconnectedTrace.Spans[i].References[j].SpanID = bestAncestor
-						}
-					}
-					
-					// Add a special tag indicating this is a bridge connection
-					reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{
-						Key:   "bridge.reconnected",
-						Value: true,
-						Type:  "bool",
-					})
-					reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{
-						Key:   "bridge.original_parent",
-						Value: missingParentID,
-						Type:  "string",
-					})
-					reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{
-						Key:   "bridge.confidence",
-						Value: bestConfidence,
-						Type:  "float64",
-					})
+
+			// Find the missing parent ID
+			var missingParentID string
+			for _, ref := range orphanedSpan.References {
+				if ref.RefType == "CHILD_OF" && !spanIDMap[ref.SpanID] {
+					missingParentID = ref.SpanID
 					break
 				}
 			}
-			
+            if missingParentID == "" {
+                fmt.Printf("    RECONNECTION - Orphan %s: could not determine missing parent ID from references\n", orphanedSpan.SpanID)
+                continue
+            }
+			var bestAncestor string
+			var bestDepth = -1
+			var bestConfidence float64
+			for existingSpanID := range spanIDMap {
+				if bf.Test([]byte(existingSpanID)) {
+					depth := spanDepthMap[existingSpanID]
+					if depth > bestDepth {
+						bestDepth = depth
+						bestAncestor = existingSpanID
+						bestConfidence = loader.calculateReconnectionConfidence(bf, existingSpanID, orphanedSpan.SpanID)
+					}
+				}
+			}
+			if bestAncestor != "" {
+				fmt.Printf("    RECONNECTION - Orphan %s: selected ancestor %s (depth=%d, conf=%.3f)\n", orphanedSpan.SpanID, bestAncestor, bestDepth, bestConfidence)
+				bridgeEdge := BridgeEdge{FromSpanID: bestAncestor, ToSpanID: orphanedSpan.SpanID, OriginalParent: missingParentID, Depth: spanDepthMap[orphanedSpan.SpanID], Confidence: bestConfidence, SyntheticSpansCreated: 0}
+				result.BridgeEdges = append(result.BridgeEdges, bridgeEdge)
+				for i := range reconnectedTrace.Spans {
+					if reconnectedTrace.Spans[i].SpanID == orphanedSpan.SpanID {
+						for j := range reconnectedTrace.Spans[i].References {
+							if reconnectedTrace.Spans[i].References[j].RefType == "CHILD_OF" && reconnectedTrace.Spans[i].References[j].SpanID == missingParentID {
+								reconnectedTrace.Spans[i].References[j].SpanID = bestAncestor
+							}
+						}
+						reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.reconnected", Value: true, Type: "bool"})
+						reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.original_parent", Value: missingParentID, Type: "string"})
+						reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.confidence", Value: bestConfidence, Type: "float64"})
+						break
+					}
+				}
+                reconnectedCount++
+            } else {
+                fmt.Printf("    RECONNECTION - Orphan %s: no candidate ancestor from bloom filter test\n", orphanedSpan.SpanID)
+            }
+			continue
+		}
+
+        if mode == "hash" {
+			// Parse ancestry array
+            parts := strings.Split(payload, ",")
+            fmt.Printf("    RECONNECTION - Orphan %s: hash parts=%v\n", orphanedSpan.SpanID, parts)
+            // Do not require len>=2; proceed and validate below
+			// Locate orphan in ancestry chain
+			idx := -1
+			for i := len(parts) - 1; i >= 0; i-- {
+				if parts[i] == orphanedSpan.SpanID {
+					idx = i
+					break
+				}
+			}
+            if idx <= 0 { // not found or no parent
+                if idx == -1 {
+                    fmt.Printf("    RECONNECTION - Orphan %s: not found in its own hash_array; skipping\n", orphanedSpan.SpanID)
+                } else {
+                    fmt.Printf("    RECONNECTION - Orphan %s: found at idx=0 (no parent); skipping\n", orphanedSpan.SpanID)
+                }
+                continue
+            }
+			parentChain := parts[:idx] // up to but not including orphan
+			// Find deepest existing ancestor in chain
+			anchorIdx := -1
+			for i := len(parentChain) - 1; i >= 0; i-- {
+				if spanIDMap[parentChain[i]] {
+					anchorIdx = i
+					break
+				}
+			}
+            fmt.Printf("    RECONNECTION - Orphan %s: anchorIdx=%d anchorSpan=%s\n", orphanedSpan.SpanID, anchorIdx, func() string { if anchorIdx>=0 { return parentChain[anchorIdx] } ; return "" }())
+            // Determine original missing parent before adding synthetic spans
+            originalSpanSet := make(map[string]bool, len(spanIDMap))
+            for k, v := range spanIDMap { originalSpanSet[k] = v }
+            originalParent := ""
+            for _, ref := range orphanedSpan.References {
+                if ref.RefType == "CHILD_OF" && !originalSpanSet[ref.SpanID] {
+                    originalParent = ref.SpanID
+                    break
+                }
+            }
+            if originalParent == "" {
+                fmt.Printf("    RECONNECTION - Orphan %s: could not determine original missing parent prior to synthesis; skipping\n", orphanedSpan.SpanID)
+                continue
+            }
+			// Ensure unknown process exists
+			unknownPID := "p_unknown"
+			if _, ok := reconnectedTrace.Processes[unknownPID]; !ok {
+				reconnectedTrace.Processes[unknownPID] = Process{ServiceName: "unknown_service:reconstructed", Tags: nil}
+			}
+			// Create missing spans between anchor and orphan's parent
+			var lastParentID string
+			if anchorIdx >= 0 {
+				lastParentID = parentChain[anchorIdx]
+			} else {
+				// If none exists, attach under root if available in trace, else skip
+				// Prefer the first element as the root from ancestry
+				if spanIDMap[parentChain[0]] {
+					lastParentID = parentChain[0]
+					anchorIdx = 0
+				} else {
+					continue
+				}
+			}
+			missing := parentChain[anchorIdx+1:]
+			syntheticCount := len(missing)
+            fmt.Printf("    RECONNECTION - Orphan %s: synthesizing %d missing ancestors between %s and orphan\n", orphanedSpan.SpanID, syntheticCount, lastParentID)
+			// Create synthetic spans in order
+			for _, synthID := range missing {
+				synth := JaegerSpan{
+					TraceID:       trace.TraceID,
+					SpanID:        synthID,
+					ProcessID:     unknownPID,
+					OperationName: "unknown",
+					StartTime:     orphanedSpan.StartTime - 1000, // 1µs before child end (A strategy)
+					Duration:      1000,
+					Tags:          []Tag{{Key: "bridge.synthetic", Value: true, Type: "bool"}},
+					References:    []Reference{{RefType: "CHILD_OF", TraceID: trace.TraceID, SpanID: lastParentID}},
+					Flags:         0,
+				}
+				reconnectedTrace.Spans = append(reconnectedTrace.Spans, synth)
+				spanIDMap[synthID] = true
+				byID[synthID] = synth
+				lastParentID = synthID
+			}
+			// Update orphan to point to lastParentID (parent)
+            fmt.Printf("    RECONNECTION - Orphan %s: original missing parent was %s; reattaching under %s\n", orphanedSpan.SpanID, originalParent, lastParentID)
+			for i := range reconnectedTrace.Spans {
+				if reconnectedTrace.Spans[i].SpanID == orphanedSpan.SpanID {
+					for j := range reconnectedTrace.Spans[i].References {
+						if reconnectedTrace.Spans[i].References[j].RefType == "CHILD_OF" && reconnectedTrace.Spans[i].References[j].SpanID == originalParent {
+							reconnectedTrace.Spans[i].References[j].SpanID = lastParentID
+						}
+					}
+					reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.reconnected", Value: true, Type: "bool"})
+					reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.original_parent", Value: originalParent, Type: "string"})
+					reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.confidence", Value: 0.7, Type: "float64"})
+					break
+				}
+			}
+			result.BridgeEdges = append(result.BridgeEdges, BridgeEdge{FromSpanID: lastParentID, ToSpanID: orphanedSpan.SpanID, OriginalParent: originalParent, Depth: spanDepthMap[orphanedSpan.SpanID], Confidence: 0.7, SyntheticSpansCreated: syntheticCount})
 			reconnectedCount++
+			continue
 		}
 	}
 	
-	result.ReconnectedTrace = reconnectedTrace
+	// Calculate total synthetic spans created across all bridge edges
+	totalSynthetic := 0
+	for _, edge := range result.BridgeEdges {
+		totalSynthetic += edge.SyntheticSpansCreated
+	}
+	
+    result.ReconnectedTrace = reconnectedTrace
 	result.ReconnectionRate = float64(reconnectedCount) / float64(len(orphanedSpans)) * 100
 	result.Success = reconnectedCount > 0
+	result.TotalSyntheticSpans = totalSynthetic
 	
-	fmt.Printf("  RECONNECTION - Successfully reconnected %d/%d orphaned spans (%.1f%%)\n", 
-		reconnectedCount, len(orphanedSpans), result.ReconnectionRate)
+	fmt.Printf("  RECONNECTION - Successfully reconnected %d/%d orphaned spans (%.1f%%), created %d synthetic spans\n", 
+		reconnectedCount, len(orphanedSpans), result.ReconnectionRate, totalSynthetic)
 	
 	return result
 }
@@ -1422,8 +1632,8 @@ func (ts *TraceStorage) loadTraces(filePath string) ([]*JaegerTrace, error) {
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&response); err != nil {
 		// Fallback: try direct array format
-		file.Seek(0, 0)
 		var traces []*JaegerTrace
+		file.Seek(0, 0)
 		decoder = json.NewDecoder(file)
 		if err2 := decoder.Decode(&traces); err2 != nil {
 			return nil, fmt.Errorf("failed to unmarshal traces (tried both formats): %w, %w", err, err2)
@@ -1433,3 +1643,4 @@ func (ts *TraceStorage) loadTraces(filePath string) ([]*JaegerTrace, error) {
 	
 	return response.Data, nil
 }
+

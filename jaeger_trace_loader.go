@@ -613,7 +613,7 @@ func getAncestryFlexible(span JaegerSpan, children map[string][]string) (string,
     return "", ""
 }
 
-// findNearestDescendantWithAncestry does BFS to locate the closest descendant having ancestry tags
+// findNearestDescendantWithAncestry does BFS to locate the closest descendant having ancestry tags (ancestry/ancestry_mode only, no __bag.*)
 func findNearestDescendantWithAncestry(startID string, children map[string][]string, byID map[string]JaegerSpan) *JaegerSpan {
     visited := make(map[string]bool)
     q := []string{startID}
@@ -628,7 +628,9 @@ func findNearestDescendantWithAncestry(startID string, children map[string][]str
             }
             visited[child] = true
             if s, ok := byID[child]; ok {
-                if _, payload := getAncestryFlexible(s, children); payload != "" {
+                // Only check ancestry/ancestry_mode tags, no __bag.* fallback
+                _, payload := getAncestryFromTags(s)
+                if payload != "" {
                     // nearest found
                     scopy := s
                     return &scopy
@@ -638,6 +640,41 @@ func findNearestDescendantWithAncestry(startID string, children map[string][]str
         }
     }
     return nil
+}
+
+// getTraceAncestryMode determines the ancestry_mode used in the trace by checking any span with ancestry_mode tag
+func getTraceAncestryMode(trace *JaegerTrace) string {
+    for _, span := range trace.Spans {
+        for _, tag := range span.Tags {
+            if tag.Key == "ancestry_mode" {
+                if mode, ok := tag.Value.(string); ok && mode != "" {
+                    return mode
+                }
+            }
+        }
+    }
+    return "" // No ancestry_mode found in trace
+}
+
+// getBaggageAncestryByMode gets ancestry from __bag.* attributes based on the specified mode
+func getBaggageAncestryByMode(span JaegerSpan, mode string) string {
+    var bagKey string
+    if mode == "hash" {
+        bagKey = "__bag.hash_array"
+    } else if mode == "bloom" {
+        bagKey = "__bag.bloom_filter"
+    } else {
+        return "" // Unknown mode
+    }
+    
+    for _, tag := range span.Tags {
+        if tag.Key == bagKey {
+            if payload, ok := tag.Value.(string); ok && payload != "" {
+                return payload
+            }
+        }
+    }
+    return ""
 }
 
 // (removed ancestry tagging helpers)
@@ -1156,35 +1193,51 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 		}
 	}
 
+    // Determine trace's ancestry_mode for fallback
+    traceMode := getTraceAncestryMode(trace)
+    
     // Attempt to reconnect each orphaned span
     reconnectedCount := 0
     for _, orphanedSpan := range orphanedSpans {
-        fmt.Printf("  RECONNECTION - Orphan %s: attempting ancestry extraction from __bag.*\n", orphanedSpan.SpanID)
-        // Simplified policy: always read ancestry from the orphan's __bag.* attributes
-        var mode, payload string
-        for _, t := range orphanedSpan.Tags {
-            if t.Key == "__bag.hash_array" {
-                if s, ok := t.Value.(string); ok && s != "" {
-                    mode, payload = "hash", s
-                    break
-                }
-            }
-        }
+        fmt.Printf("  RECONNECTION - Orphan %s: attempting ancestry extraction from ancestry/ancestry_mode tags\n", orphanedSpan.SpanID)
+        
+        // Try to get ancestry from the orphan's own tags
+        mode, payload := getAncestryFromTags(orphanedSpan)
+        donorSpan := orphanedSpan
+        
+        // If orphan doesn't have ancestry data, find nearest descendant
         if payload == "" {
-            for _, t := range orphanedSpan.Tags {
-                if t.Key == "__bag.bloom_filter" {
-                    if s, ok := t.Value.(string); ok && s != "" {
-                        mode, payload = "bloom", s
-                        break
+            fmt.Printf("    RECONNECTION - Orphan %s: no ancestry data found, searching for nearest descendant...\n", orphanedSpan.SpanID)
+            descendant := findNearestDescendantWithAncestry(orphanedSpan.SpanID, children, byID)
+            if descendant == nil {
+                // Fallback: use __bag.* attributes on orphan based on trace's ancestry_mode
+                if traceMode != "" {
+                    fmt.Printf("    RECONNECTION - Orphan %s: no descendant found, falling back to __bag.* (trace mode=%s)\n", orphanedSpan.SpanID, traceMode)
+                    payload = getBaggageAncestryByMode(orphanedSpan, traceMode)
+                    if payload != "" {
+                        mode = traceMode
+                        fmt.Printf("    RECONNECTION - Orphan %s: using __bag.* fallback (mode=%s)\n", orphanedSpan.SpanID, mode)
+                    } else {
+                        fmt.Printf("    RECONNECTION - Orphan %s: no __bag.* fallback available, skipping\n", orphanedSpan.SpanID)
+                        continue
                     }
+                } else {
+                    fmt.Printf("    RECONNECTION - Orphan %s: no descendant with ancestry data found and no trace mode for fallback, skipping\n", orphanedSpan.SpanID)
+                    continue
                 }
+            } else {
+                mode, payload = getAncestryFromTags(*descendant)
+                donorSpan = *descendant
+                fmt.Printf("    RECONNECTION - Orphan %s: using ancestry from descendant %s (mode=%s)\n", orphanedSpan.SpanID, descendant.SpanID, mode)
             }
+        } else {
+            fmt.Printf("    RECONNECTION - Orphan %s: using own ancestry data (mode=%s)\n", orphanedSpan.SpanID, mode)
         }
-        if payload == "" {
-            fmt.Printf("    RECONNECTION - Orphan %s: no __bag.* ancestry found, skipping\n", orphanedSpan.SpanID)
-            continue // no ancestry available
+        
+        if payload == "" || mode == "" {
+            fmt.Printf("    RECONNECTION - Orphan %s: ancestry data incomplete (mode=%s, payload empty=%v), skipping\n", orphanedSpan.SpanID, mode, payload == "")
+            continue
         }
-        fmt.Printf("    RECONNECTION - Orphan %s: using mode=%s\n", orphanedSpan.SpanID, mode)
 		if mode == "bloom" {
             bf, err := deserializeBloomFilter(payload)
 			if err != nil {
@@ -1256,7 +1309,7 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 			}
             if idx <= 0 { // not found or no parent
                 if idx == -1 {
-                    fmt.Printf("    RECONNECTION - Orphan %s: not found in its own hash_array; skipping\n", orphanedSpan.SpanID)
+                    fmt.Printf("    RECONNECTION - Orphan %s: not found in ancestry array (donor=%s); skipping\n", orphanedSpan.SpanID, donorSpan.SpanID)
                 } else {
                     fmt.Printf("    RECONNECTION - Orphan %s: found at idx=0 (no parent); skipping\n", orphanedSpan.SpanID)
                 }

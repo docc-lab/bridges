@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
@@ -707,12 +708,27 @@ func main() {
 	// Seed random number generator for different data loss simulation each run
 	rand.Seed(time.Now().UnixNano())
 	
-	// Jaeger URL - adjust the IP and port based on your Kubernetes setup
-	// Port 16686 is the Jaeger UI port, but we need the API port
-	// Based on the service config, we should use the service name and port
-	jaegerURL := "http://jaeger-ctr:16686"
+	// Parse command line flags
+	var (
+		inputSource = flag.String("input", "jaeger", "Input source: 'jaeger' or 'folder' (default: jaeger)")
+		inputFolder = flag.String("folder", "", "Folder path when input=folder (required if input=folder)")
+		jaegerURL   = flag.String("jaeger-url", "http://jaeger-ctr:16686", "Jaeger URL (used when input=jaeger)")
+	)
+	flag.Parse()
 	
-	loader := NewJaegerTraceLoader(jaegerURL)
+	// Validate input source
+	if *inputSource != "jaeger" && *inputSource != "folder" {
+		fmt.Fprintf(os.Stderr, "Error: input must be 'jaeger' or 'folder'\n")
+		os.Exit(1)
+	}
+	
+	// Validate folder path if using folder input
+	if *inputSource == "folder" && *inputFolder == "" {
+		fmt.Fprintf(os.Stderr, "Error: folder path required when input=folder\n")
+		os.Exit(1)
+	}
+	
+	loader := NewJaegerTraceLoader(*jaegerURL)
 	ctx := context.Background()
 	
 	// Initialize trace storage
@@ -722,40 +738,86 @@ func main() {
 		return
 	}
 	
-	// Get available services
-	fmt.Println("Fetching available services...")
-	services, err := loader.GetServices(ctx)
-	if err != nil {
-		fmt.Printf("Error fetching services: %v\n", err)
-		return
+	// Load traces based on input source
+	var allTraces []*JaegerTrace
+	var totalTraces int
+	
+	if *inputSource == "jaeger" {
+		// Load from Jaeger (original implementation)
+		fmt.Println("Fetching available services from Jaeger...")
+		services, err := loader.GetServices(ctx)
+		if err != nil {
+			fmt.Printf("Error fetching services: %v\n", err)
+			return
+		}
+		
+		fmt.Printf("Available services: %v\n", services)
+		
+		// Load and process traces for each service
+		for _, service := range services {
+			fmt.Printf("\nLoading traces for service: %s\n", service)
+			traces, err := loader.LoadTraces(ctx, service, 10) // Limit to 10 traces per service
+			if err != nil {
+				fmt.Printf("Error loading traces for %s: %v\n", service, err)
+				continue
+			}
+			
+			serviceTraces := len(traces)
+			totalTraces += serviceTraces
+			allTraces = append(allTraces, traces...)
+			fmt.Printf("Loaded %d traces for service %s\n", serviceTraces, service)
+			
+			// Print trace details
+			for i, trace := range traces {
+				if i >= 3 { // Limit output to first 3 traces
+					break
+				}
+				fmt.Printf("  Trace %d: ID=%s, Spans=%d\n", i+1, trace.TraceID, len(trace.Spans))
+			}
+		}
+	} else {
+		// Load from folder
+		fmt.Printf("Loading traces from folder: %s\n", *inputFolder)
+		files, err := filepath.Glob(filepath.Join(*inputFolder, "*.json"))
+		if err != nil {
+			fmt.Printf("Error finding JSON files: %v\n", err)
+			return
+		}
+		
+		if len(files) == 0 {
+			fmt.Printf("No JSON files found in %s\n", *inputFolder)
+			return
+		}
+		
+		fmt.Printf("Found %d JSON file(s)\n", len(files))
+		
+		for _, filePath := range files {
+			fileName := filepath.Base(filePath)
+			fmt.Printf("\nLoading file: %s\n", fileName)
+			
+			traces, err := loadTracesFromFile(filePath)
+			if err != nil {
+				fmt.Printf("Error loading %s: %v\n", fileName, err)
+				continue
+			}
+			
+			totalTraces += len(traces)
+			allTraces = append(allTraces, traces...)
+			fmt.Printf("Loaded %d trace(s) from %s\n", len(traces), fileName)
+			
+			// Print trace details
+			for i, trace := range traces {
+				if i >= 3 { // Limit output to first 3 traces
+					break
+				}
+				fmt.Printf("  Trace %d: ID=%s, Spans=%d\n", i+1, trace.TraceID, len(trace.Spans))
+			}
+		}
 	}
 	
-	fmt.Printf("Available services: %v\n", services)
-	
-	// Load and process traces for each service
-	totalTraces := 0
-	var allTraces []*JaegerTrace
-	
-	for _, service := range services {
-		fmt.Printf("\nLoading traces for service: %s\n", service)
-		traces, err := loader.LoadTraces(ctx, service, 10) // Limit to 10 traces per service
-		if err != nil {
-			fmt.Printf("Error loading traces for %s: %v\n", service, err)
-			continue
-		}
-		
-		serviceTraces := len(traces)
-		totalTraces += serviceTraces
-		allTraces = append(allTraces, traces...)
-		fmt.Printf("Loaded %d traces for service %s\n", serviceTraces, service)
-		
-		// Print trace details
-		for i, trace := range traces {
-			if i >= 3 { // Limit output to first 3 traces
-				break
-			}
-			fmt.Printf("  Trace %d: ID=%s, Spans=%d\n", i+1, trace.TraceID, len(trace.Spans))
-		}
+	if len(allTraces) == 0 {
+		fmt.Printf("\nNo traces loaded. Exiting.\n")
+		return
 	}
 	
 	// Process all traces for data loss and baggage extraction
@@ -1335,8 +1397,23 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
                     break
                 }
             }
+            // If originalParent not found in references, derive it from ancestry chain
+            // (This can happen when a previous orphan already synthesized the missing parent)
+            if originalParent == "" && idx > 0 {
+                // The parent should be the span immediately before the orphan in the ancestry chain
+                candidateParent := parts[idx-1]
+                if !originalSpanSet[candidateParent] {
+                    originalParent = candidateParent
+                    fmt.Printf("    RECONNECTION - Orphan %s: inferred missing parent %s from ancestry chain (not in references)\n", orphanedSpan.SpanID, originalParent)
+                } else {
+                    // Parent already exists - might have been synthesized by a previous orphan
+                    // In this case, we can still reconnect if we have a valid anchor
+                    fmt.Printf("    RECONNECTION - Orphan %s: parent %s already exists (likely synthesized), using ancestry chain for reconnection\n", orphanedSpan.SpanID, candidateParent)
+                    originalParent = candidateParent // Use it for tracking, even though it exists
+                }
+            }
             if originalParent == "" {
-                fmt.Printf("    RECONNECTION - Orphan %s: could not determine original missing parent prior to synthesis; skipping\n", orphanedSpan.SpanID)
+                fmt.Printf("    RECONNECTION - Orphan %s: could not determine original missing parent; skipping\n", orphanedSpan.SpanID)
                 continue
             }
 			// Ensure unknown process exists
@@ -1358,9 +1435,41 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 					continue
 				}
 			}
-			missing := parentChain[anchorIdx+1:]
+			
+			// Check if originalParent already exists (was synthesized by a previous orphan)
+			parentAlreadyExists := spanIDMap[originalParent]
+			
+			// Determine which spans need to be synthesized
+			// parentChain is parts[:idx], so originalParent should be at parentChain[idx-1] (which is parts[idx-1])
+			parentIdxInChain := idx - 1
+			var missing []string
+			
+			if parentAlreadyExists && parentIdxInChain >= anchorIdx {
+				// Parent already exists and is between anchor and orphan
+				// Only synthesize spans between anchor and parent (not including parent)
+				if parentIdxInChain > anchorIdx {
+					missing = parentChain[anchorIdx+1:parentIdxInChain]
+					lastParentID = originalParent // Use existing parent
+				} else {
+					// Parent is the anchor, no synthesis needed
+					missing = []string{}
+					lastParentID = originalParent
+				}
+			} else {
+				// Parent doesn't exist yet, synthesize all missing spans including parent
+				missing = parentChain[anchorIdx+1:]
+				// Ensure originalParent is in missing if it's not already there
+				if len(missing) == 0 || missing[len(missing)-1] != originalParent {
+					missing = append(missing, originalParent)
+				}
+			}
+			
 			syntheticCount := len(missing)
-            fmt.Printf("    RECONNECTION - Orphan %s: synthesizing %d missing ancestors between %s and orphan\n", orphanedSpan.SpanID, syntheticCount, lastParentID)
+            if syntheticCount > 0 {
+                fmt.Printf("    RECONNECTION - Orphan %s: synthesizing %d missing ancestors between %s and orphan\n", orphanedSpan.SpanID, syntheticCount, lastParentID)
+            } else if parentAlreadyExists {
+                fmt.Printf("    RECONNECTION - Orphan %s: parent %s already exists, updating reference directly\n", orphanedSpan.SpanID, originalParent)
+            }
 			// Create synthetic spans in order
 			for _, synthID := range missing {
 				synth := JaegerSpan{
@@ -1672,6 +1781,11 @@ func (ts *TraceStorage) LoadReconstructedTraces() ([]*JaegerTrace, error) {
 
 // loadTraces loads traces from a JSON file
 func (ts *TraceStorage) loadTraces(filePath string) ([]*JaegerTrace, error) {
+	return loadTracesFromFile(filePath)
+}
+
+// loadTracesFromFile loads traces from a JSON file (standalone function for use outside TraceStorage)
+func loadTracesFromFile(filePath string) ([]*JaegerTrace, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err

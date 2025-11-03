@@ -103,7 +103,8 @@ type BridgeEdge struct {
 
 // ReconnectionResult represents the result of trace reconnection
 type ReconnectionResult struct {
-	OriginalTrace        *JaegerTrace   `json:"originalTrace"`
+	OriginalTrace        *JaegerTrace   `json:"originalTrace"`        // Lossy trace (after data loss simulation, before reconnection)
+	TaggedTrace          *JaegerTrace   `json:"taggedTrace,omitempty"` // Original tagged trace (before data loss simulation)
 	ReconnectedTrace     *JaegerTrace   `json:"reconnectedTrace"`
 	BridgeEdges          []BridgeEdge   `json:"bridgeEdges"`
 	ReconnectionRate     float64        `json:"reconnectionRate"` // Percentage of orphaned spans reconnected
@@ -133,6 +134,10 @@ type TraceMetadata struct {
 	ReconstructedSizeBytes int64 `json:"reconstructed_size_bytes,omitempty"`
 	SizeReductionPercent float64 `json:"size_reduction_percent,omitempty"`
 	SizeRecoveryPercent  float64 `json:"size_recovery_percent,omitempty"`
+	// Ancestry metrics
+	CheckpointDistance          int     `json:"checkpoint_distance,omitempty"`
+	AncestryDataSizeBytes       int64   `json:"ancestry_data_size_bytes,omitempty"`
+	AncestryDataSizeBytesPerSpan float64 `json:"ancestry_data_size_bytes_per_span,omitempty"`
 }
 
 // StorageMetadata represents metadata for all traces
@@ -149,6 +154,10 @@ type StorageMetadata struct {
 	TotalReconstructedSizeBytes int64 `json:"total_reconstructed_size_bytes,omitempty"`
 	AverageSizeReductionPercent float64 `json:"average_size_reduction_percent,omitempty"`
 	AverageSizeRecoveryPercent  float64 `json:"average_size_recovery_percent,omitempty"`
+	// Ancestry summary metrics
+	CheckpointDistance          int     `json:"checkpoint_distance,omitempty"`
+	TotalAncestryDataSizeBytes  int64   `json:"total_ancestry_data_size_bytes,omitempty"`
+	AverageAncestryDataSizeBytesPerSpan float64 `json:"average_ancestry_data_size_bytes_per_span,omitempty"`
 }
 
 // calculateTraceSize calculates the size of a trace in bytes when serialized to JSON
@@ -158,6 +167,73 @@ func calculateTraceSize(trace *JaegerTrace) (int64, error) {
 		return 0, err
 	}
 	return int64(len(data)), nil
+}
+
+// extractCheckpointDistance extracts the checkpoint distance from a directory name
+// Examples: "tagged-hash-3" -> 3, "tagged-hash-15" -> 15
+func extractCheckpointDistance(dirPath string) (int, error) {
+	dirName := filepath.Base(dirPath)
+	parts := strings.Split(dirName, "-")
+	if len(parts) == 0 {
+		return 0, fmt.Errorf("invalid directory name format: %s", dirName)
+	}
+	// Get the last part after the last hyphen
+	lastPart := parts[len(parts)-1]
+	var distance int
+	_, err := fmt.Sscanf(lastPart, "%d", &distance)
+	if err != nil {
+		return 0, fmt.Errorf("could not parse checkpoint distance from directory name %s: %w", dirName, err)
+	}
+	return distance, nil
+}
+
+// calculateAncestryDataSize calculates the actual binary data size of ancestry and ancestry_mode tags
+func calculateAncestryDataSize(trace *JaegerTrace) int64 {
+	var totalSize int64
+	for _, span := range trace.Spans {
+		var ancestryMode string
+		for _, tag := range span.Tags {
+			if tag.Key == "ancestry_mode" {
+				if str, ok := tag.Value.(string); ok {
+					ancestryMode = str
+					// ancestry_mode string itself (e.g., "hash" or "bloom") - count as string bytes
+					totalSize += int64(len(str))
+				}
+			}
+		}
+		
+		for _, tag := range span.Tags {
+			if tag.Key == "ancestry" {
+				if str, ok := tag.Value.(string); ok {
+					if ancestryMode == "hash" {
+						// For hash mode: count 8 bytes per span ID (64 bits each)
+						// Parse comma-separated hex span IDs
+						parts := strings.Split(str, ",")
+						for _, part := range parts {
+							part = strings.TrimSpace(part)
+							if len(part) == 16 { // Valid hex span ID is 16 hex chars = 8 bytes
+								totalSize += 8
+							}
+						}
+					} else if ancestryMode == "bloom" {
+						// For bloom mode: count the actual decoded binary size
+						// The string is base64-encoded, so decode it to get actual size
+						decoded, err := base64.StdEncoding.DecodeString(str)
+						if err == nil {
+							totalSize += int64(len(decoded))
+						} else {
+							// If decoding fails, fall back to string size (though this shouldn't happen)
+							totalSize += int64(len(str))
+						}
+					} else {
+						// Unknown mode, count as string
+						totalSize += int64(len(str))
+					}
+				}
+			}
+		}
+	}
+	return totalSize
 }
 
 // JaegerTraceLoader handles loading traces from Jaeger backend
@@ -731,8 +807,19 @@ func main() {
 	loader := NewJaegerTraceLoader(*jaegerURL)
 	ctx := context.Background()
 	
+	// Determine output base name based on input source
+	var outputBaseName string
+	if *inputSource == "folder" {
+		// Extract base name from folder path (e.g., "data/tagged-hash-3" -> "tagged-hash-3")
+		outputBaseName = filepath.Base(*inputFolder)
+	} else {
+		// Use "jaeger" for Jaeger input
+		outputBaseName = "jaeger"
+	}
+	
 	// Initialize trace storage
-	storage := NewTraceStorage("./data")
+	dataDir := "./data"
+	storage := NewTraceStorage(dataDir, outputBaseName)
 	if err := storage.Initialize(); err != nil {
 		fmt.Printf("Error initializing storage: %v\n", err)
 		return
@@ -741,6 +828,7 @@ func main() {
 	// Load traces based on input source
 	var allTraces []*JaegerTrace
 	var totalTraces int
+	var checkpointDistance int = 0 // Default to 0 if not from folder
 	
 	if *inputSource == "jaeger" {
 		// Load from Jaeger (original implementation)
@@ -778,6 +866,17 @@ func main() {
 	} else {
 		// Load from folder
 		fmt.Printf("Loading traces from folder: %s\n", *inputFolder)
+		
+		// Extract checkpoint distance from folder name
+		var err error
+		checkpointDistance, err = extractCheckpointDistance(*inputFolder)
+		if err != nil {
+			fmt.Printf("Warning: could not extract checkpoint distance: %v (defaulting to 0)\n", err)
+			checkpointDistance = 0
+		} else {
+			fmt.Printf("Extracted checkpoint distance: %d\n", checkpointDistance)
+		}
+		
 		files, err := filepath.Glob(filepath.Join(*inputFolder, "*.json"))
 		if err != nil {
 			fmt.Printf("Error finding JSON files: %v\n", err)
@@ -898,6 +997,20 @@ func main() {
 		fmt.Printf("  Step 2: Reconnecting trace...\n")
 		reconnectionResult := loader.ReconnectTrace(simulatedTrace)
 		
+		// Store the original tagged trace (before data loss simulation) in the reconnection result
+		// This ensures original_spans refers to the trace BEFORE data loss, not after
+		originalTaggedTrace := &JaegerTrace{
+			TraceID:   trace.TraceID,
+			Spans:     make([]JaegerSpan, len(trace.Spans)),
+			Processes: make(map[string]Process),
+			Warnings:  trace.Warnings,
+		}
+		copy(originalTaggedTrace.Spans, trace.Spans)
+		for k, v := range trace.Processes {
+			originalTaggedTrace.Processes[k] = v
+		}
+		reconnectionResult.TaggedTrace = originalTaggedTrace
+		
 		if reconnectionResult.Success {
 			fmt.Printf("  ✅ Reconnected: rate=%.1f%%, bridges=%d, synthetic=%d\n", 
 				reconnectionResult.ReconnectionRate, len(reconnectionResult.BridgeEdges), 
@@ -920,7 +1033,7 @@ func main() {
 	if len(allLossyTraces) > 0 {
 		fmt.Printf("\n--- Saving Results ---\n")
 		fmt.Printf("Saving %d lossy traces...\n", len(allLossyTraces))
-		if err := storage.SaveLossyTraces(allLossyTraces, allLossyMetadata); err != nil {
+		if err := storage.SaveLossyTraces(allLossyTraces, allLossyMetadata, checkpointDistance); err != nil {
 			fmt.Printf("Error saving lossy traces: %v\n", err)
 		} else {
 			fmt.Printf("✅ Saved lossy traces\n")
@@ -928,7 +1041,7 @@ func main() {
 		
 		if len(allReconstructedTraces) > 0 {
 			fmt.Printf("Saving %d reconstructed traces...\n", len(allReconstructedTraces))
-			if err := storage.SaveReconstructedTraces(allReconstructedTraces, allReconnectionResults); err != nil {
+			if err := storage.SaveReconstructedTraces(allReconstructedTraces, allReconnectionResults, checkpointDistance); err != nil {
 				fmt.Printf("Error saving reconstructed traces: %v\n", err)
 			} else {
 				fmt.Printf("✅ Saved reconstructed traces\n")
@@ -1556,11 +1669,13 @@ func (loader *JaegerTraceLoader) calculateReconnectionConfidence(bf *bloom.Bloom
 }
 
 // NewTraceStorage creates a new trace storage instance
-func NewTraceStorage(dataDir string) *TraceStorage {
+// outputBaseName: base name for output directories (e.g., "tagged-hash-3" or "jaeger")
+// dataDir: parent directory where output directories will be created
+func NewTraceStorage(dataDir, outputBaseName string) *TraceStorage {
 	return &TraceStorage{
 		dataDir:          dataDir,
-		lossyDir:         filepath.Join(dataDir, "lossy"),
-		reconstructedDir: filepath.Join(dataDir, "reconstructed"),
+		lossyDir:         filepath.Join(dataDir, outputBaseName+"-lossy"),
+		reconstructedDir: filepath.Join(dataDir, outputBaseName+"-reconstructed"),
 	}
 }
 
@@ -1600,7 +1715,7 @@ func (ts *TraceStorage) clearDirectory(dir string) error {
 }
 
 // SaveLossyTraces saves lossy traces and their metadata
-func (ts *TraceStorage) SaveLossyTraces(traces []*JaegerTrace, metadata []*DataLossInfo) error {
+func (ts *TraceStorage) SaveLossyTraces(traces []*JaegerTrace, metadata []*DataLossInfo, checkpointDistance int) error {
 	// Save traces in Jaeger format
 	tracesFile := filepath.Join(ts.lossyDir, "traces.json")
 	if err := ts.saveTraces(traces, tracesFile); err != nil {
@@ -1609,7 +1724,7 @@ func (ts *TraceStorage) SaveLossyTraces(traces []*JaegerTrace, metadata []*DataL
 	
 	// Save metadata
 	metadataFile := filepath.Join(ts.lossyDir, "metadata.json")
-	if err := ts.saveLossyMetadata(traces, metadata, metadataFile); err != nil {
+	if err := ts.saveLossyMetadata(traces, metadata, metadataFile, checkpointDistance); err != nil {
 		return fmt.Errorf("failed to save lossy metadata: %w", err)
 	}
 	
@@ -1618,7 +1733,7 @@ func (ts *TraceStorage) SaveLossyTraces(traces []*JaegerTrace, metadata []*DataL
 }
 
 // SaveReconstructedTraces saves reconstructed traces and their metadata
-func (ts *TraceStorage) SaveReconstructedTraces(traces []*JaegerTrace, results []*ReconnectionResult) error {
+func (ts *TraceStorage) SaveReconstructedTraces(traces []*JaegerTrace, results []*ReconnectionResult, checkpointDistance int) error {
 	// Save traces in Jaeger format
 	tracesFile := filepath.Join(ts.reconstructedDir, "traces.json")
 	if err := ts.saveTraces(traces, tracesFile); err != nil {
@@ -1627,7 +1742,7 @@ func (ts *TraceStorage) SaveReconstructedTraces(traces []*JaegerTrace, results [
 	
 	// Save metadata
 	metadataFile := filepath.Join(ts.reconstructedDir, "metadata.json")
-	if err := ts.saveReconstructedMetadata(traces, results, metadataFile); err != nil {
+	if err := ts.saveReconstructedMetadata(traces, results, metadataFile, checkpointDistance); err != nil {
 		return fmt.Errorf("failed to save reconstructed metadata: %w", err)
 	}
 	
@@ -1656,25 +1771,37 @@ func (ts *TraceStorage) saveTraces(traces []*JaegerTrace, filePath string) error
 }
 
 // saveLossyMetadata saves metadata for lossy traces
-func (ts *TraceStorage) saveLossyMetadata(traces []*JaegerTrace, metadata []*DataLossInfo, filePath string) error {
+func (ts *TraceStorage) saveLossyMetadata(traces []*JaegerTrace, metadata []*DataLossInfo, filePath string, checkpointDistance int) error {
 	storageMetadata := &StorageMetadata{
 		CreatedAt:   time.Now(),
 		TotalTraces: len(traces),
 		Traces:      make([]TraceMetadata, len(traces)),
+		CheckpointDistance: checkpointDistance,
 	}
 	
-	var totalOriginalSize, totalLossySize int64
+	var totalOriginalSize, totalLossySize, totalAncestryDataSize int64
+	var totalSpans int
 	
 	for i, trace := range traces {
 		// Calculate sizes
 		lossySize, _ := calculateTraceSize(trace)
 		originalSize := lossySize // For lossy traces, we don't have the original size
 		
+		// Calculate ancestry data size
+		ancestryDataSize := calculateAncestryDataSize(trace)
+		ancestryDataSizePerSpan := float64(0)
+		if len(trace.Spans) > 0 {
+			ancestryDataSizePerSpan = float64(ancestryDataSize) / float64(len(trace.Spans))
+		}
+		
 		tm := TraceMetadata{
 			TraceID:       trace.TraceID,
 			OriginalSpans: len(trace.Spans),
 			LossySpans:    len(trace.Spans),
 			LossySizeBytes: lossySize,
+			CheckpointDistance: checkpointDistance,
+			AncestryDataSizeBytes: ancestryDataSize,
+			AncestryDataSizeBytesPerSpan: ancestryDataSizePerSpan,
 		}
 		
 		if i < len(metadata) && metadata[i] != nil {
@@ -1688,14 +1815,20 @@ func (ts *TraceStorage) saveLossyMetadata(traces []*JaegerTrace, metadata []*Dat
 		
 		totalOriginalSize += originalSize
 		totalLossySize += lossySize
+		totalAncestryDataSize += ancestryDataSize
+		totalSpans += len(trace.Spans)
 		storageMetadata.Traces[i] = tm
 	}
 	
 	// Calculate summary statistics
 	storageMetadata.TotalOriginalSizeBytes = totalOriginalSize
 	storageMetadata.TotalLossySizeBytes = totalLossySize
+	storageMetadata.TotalAncestryDataSizeBytes = totalAncestryDataSize
 	if totalOriginalSize > 0 {
 		storageMetadata.AverageSizeReductionPercent = float64(totalOriginalSize - totalLossySize) / float64(totalOriginalSize) * 100
+	}
+	if totalSpans > 0 {
+		storageMetadata.AverageAncestryDataSizeBytesPerSpan = float64(totalAncestryDataSize) / float64(totalSpans)
 	}
 	
 	file, err := os.Create(filePath)
@@ -1710,31 +1843,67 @@ func (ts *TraceStorage) saveLossyMetadata(traces []*JaegerTrace, metadata []*Dat
 }
 
 // saveReconstructedMetadata saves metadata for reconstructed traces
-func (ts *TraceStorage) saveReconstructedMetadata(traces []*JaegerTrace, results []*ReconnectionResult, filePath string) error {
+func (ts *TraceStorage) saveReconstructedMetadata(traces []*JaegerTrace, results []*ReconnectionResult, filePath string, checkpointDistance int) error {
 	storageMetadata := &StorageMetadata{
 		CreatedAt:   time.Now(),
 		TotalTraces: len(traces),
 		Traces:      make([]TraceMetadata, len(traces)),
+		CheckpointDistance: checkpointDistance,
 	}
 	
-	var totalOriginalSize, totalReconstructedSize int64
+	var totalOriginalSize, totalReconstructedSize, totalAncestryDataSize int64
+	var totalSpans int
 	
 	for i, trace := range traces {
 		// Calculate sizes
 		reconstructedSize, _ := calculateTraceSize(trace)
 		originalSize := reconstructedSize // Default to reconstructed size
 		
+		// Calculate ancestry data size from original tagged trace if available, otherwise use reconstructed
+		var ancestryDataSize int64
+		var numSpansForAncestry int
+		var traceForAncestry *JaegerTrace
+		if i < len(results) && results[i] != nil {
+			if results[i].TaggedTrace != nil {
+				traceForAncestry = results[i].TaggedTrace
+			} else if results[i].OriginalTrace != nil {
+				traceForAncestry = results[i].OriginalTrace
+			}
+		}
+		if traceForAncestry != nil {
+			ancestryDataSize = calculateAncestryDataSize(traceForAncestry)
+			numSpansForAncestry = len(traceForAncestry.Spans)
+		} else {
+			ancestryDataSize = calculateAncestryDataSize(trace)
+			numSpansForAncestry = len(trace.Spans)
+		}
+		ancestryDataSizePerSpan := float64(0)
+		if numSpansForAncestry > 0 {
+			ancestryDataSizePerSpan = float64(ancestryDataSize) / float64(numSpansForAncestry)
+		}
+		
 		tm := TraceMetadata{
 			TraceID:            trace.TraceID,
 			ReconstructedSpans: len(trace.Spans),
 			ReconstructedSizeBytes: reconstructedSize,
+			CheckpointDistance: checkpointDistance,
+			AncestryDataSizeBytes: ancestryDataSize,
+			AncestryDataSizeBytesPerSpan: ancestryDataSizePerSpan,
 		}
 		
 		if i < len(results) && results[i] != nil {
 			tm.ReconnectionResult = results[i]
-			if results[i].OriginalTrace != nil {
-				tm.OriginalSpans = len(results[i].OriginalTrace.Spans)
-				originalSize, _ = calculateTraceSize(results[i].OriginalTrace)
+			// Use TaggedTrace (before data loss) for original_spans if available, otherwise fall back to OriginalTrace (lossy)
+			var originalTraceForMetadata *JaegerTrace
+			if results[i].TaggedTrace != nil {
+				originalTraceForMetadata = results[i].TaggedTrace
+			} else if results[i].OriginalTrace != nil {
+				originalTraceForMetadata = results[i].OriginalTrace
+			}
+			
+			if originalTraceForMetadata != nil {
+				tm.OriginalSpans = len(originalTraceForMetadata.Spans)
+				originalSize, _ = calculateTraceSize(originalTraceForMetadata)
 				tm.OriginalSizeBytes = originalSize
 				
 				// Calculate recovery percentage
@@ -1746,14 +1915,20 @@ func (ts *TraceStorage) saveReconstructedMetadata(traces []*JaegerTrace, results
 		
 		totalOriginalSize += originalSize
 		totalReconstructedSize += reconstructedSize
+		totalAncestryDataSize += ancestryDataSize
+		totalSpans += numSpansForAncestry
 		storageMetadata.Traces[i] = tm
 	}
 	
 	// Calculate summary statistics
 	storageMetadata.TotalOriginalSizeBytes = totalOriginalSize
 	storageMetadata.TotalReconstructedSizeBytes = totalReconstructedSize
+	storageMetadata.TotalAncestryDataSizeBytes = totalAncestryDataSize
 	if totalOriginalSize > 0 {
 		storageMetadata.AverageSizeRecoveryPercent = float64(totalReconstructedSize) / float64(totalOriginalSize) * 100
+	}
+	if totalSpans > 0 {
+		storageMetadata.AverageAncestryDataSizeBytesPerSpan = float64(totalAncestryDataSize) / float64(totalSpans)
 	}
 	
 	file, err := os.Create(filePath)

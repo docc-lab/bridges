@@ -103,7 +103,7 @@ type Event struct {
 // TraceProcessor processes traces to add priority and ancestry tags
 type TraceProcessor struct {
 	PriorityDepth   int    // Depth interval for high priority spans
-	AncestryMode    string // "hash" or "bloom"
+	AncestryMode    string // "hash", "bloom", or "hybrid"
 }
 
 // getTraceID gets trace ID from span (handles different field names)
@@ -351,6 +351,115 @@ func (tp *TraceProcessor) processSpanGroup(spans []*OTelSpan) error {
 		return buildPathFromAncestor(parentID, ancestorID)
 	}
 
+	// For hybrid mode: detect fan-outs and track hash assignments
+	// Track hash assignments by checkpoint interval for proper reset
+	// Format: checkpointID -> highPrioritySpanID -> []"spanID:depth" pairs
+	hashAssignmentsByCheckpoint := make(map[string]map[string][]string)
+	if tp.AncestryMode == "hybrid" {
+		// Helper function to get start time for a span
+		getStartTime := func(spanID string) int64 {
+			span, exists := spanMap[spanID]
+			if !exists {
+				return 0
+			}
+			// Try OTel format first
+			if span.StartTimeUnixNano > 0 {
+				return int64(span.StartTimeUnixNano)
+			}
+			// Fall back to Jaeger format
+			return span.StartTime
+		}
+		
+		// Helper to find first high-priority descendant (or self if already high-priority)
+		var findFirstHighPriorityDescendant func(spanID string) string
+		findFirstHighPriorityDescendant = func(spanID string) string {
+			if priorityMap[spanID] {
+				return spanID
+			}
+			// Check all children, return first high-priority descendant found
+			childIDs := children[spanID]
+			for _, childID := range childIDs {
+				if result := findFirstHighPriorityDescendant(childID); result != "" {
+					return result
+				}
+			}
+			return ""
+		}
+		
+		// Helper to find the checkpoint for a span (its last high-priority ancestor, or itself if high-priority)
+		var findCheckpoint func(spanID string) string
+		findCheckpoint = func(spanID string) string {
+			if priorityMap[spanID] {
+				// Find last high-priority ancestor (or root)
+				ancestor := findLastHighPriorityAncestor(spanID, true)
+				if ancestor == "" {
+					return spanID // This span is the checkpoint
+				}
+				return ancestor
+			}
+			parentID := parentMap[spanID]
+			if parentID == "" {
+				return spanID // Root
+			}
+			return findCheckpoint(parentID)
+		}
+		
+		// Detect fan-outs and assign hash to 2nd child
+		for parentID, childIDs := range children {
+			if len(childIDs) > 1 {
+				// Fan-out detected: sort children by start time
+				type childWithTime struct {
+					spanID string
+					time   int64
+				}
+				childrenWithTime := make([]childWithTime, 0, len(childIDs))
+				for _, childID := range childIDs {
+					childrenWithTime = append(childrenWithTime, childWithTime{
+						spanID: childID,
+						time:   getStartTime(childID),
+					})
+				}
+				
+				// Sort by start time
+				for i := 0; i < len(childrenWithTime)-1; i++ {
+					for j := i + 1; j < len(childrenWithTime); j++ {
+						if childrenWithTime[i].time > childrenWithTime[j].time {
+							childrenWithTime[i], childrenWithTime[j] = childrenWithTime[j], childrenWithTime[i]
+						}
+					}
+				}
+				
+				// Select 2nd child (index 1)
+				if len(childrenWithTime) >= 2 {
+					selectedChildID := childrenWithTime[1].spanID
+					// Find first high-priority descendant
+					highPrioritySpanID := findFirstHighPriorityDescendant(selectedChildID)
+					if highPrioritySpanID != "" {
+						// Find which checkpoint this assignment belongs to
+						checkpointID := findCheckpoint(highPrioritySpanID)
+						if checkpointID == "" {
+							checkpointID = highPrioritySpanID // Fallback
+						}
+						
+						// Initialize map for this checkpoint if needed
+						if hashAssignmentsByCheckpoint[checkpointID] == nil {
+							hashAssignmentsByCheckpoint[checkpointID] = make(map[string][]string)
+						}
+						
+						// Get parent depth from depthMap
+						parentDepth := depthMap[parentID]
+						
+						// Add parent spanID with depth to hash array for this high-priority span in this checkpoint interval
+						// Format: "spanID:depth"
+						hashEntry := fmt.Sprintf("%s:%d", parentID, parentDepth)
+						hashAssignmentsByCheckpoint[checkpointID][highPrioritySpanID] = append(
+							hashAssignmentsByCheckpoint[checkpointID][highPrioritySpanID], hashEntry)
+					}
+				}
+			}
+		}
+	}
+
 	// Process each span to set ancestry tags (only for high priority)
 	for spanID, span := range spanMap {
 		if priorityMap[spanID] {
@@ -360,13 +469,39 @@ func (tp *TraceProcessor) processSpanGroup(spans []*OTelSpan) error {
 			path := buildResetPath(spanID)
 			var ancestryData string
 			
-			if tp.AncestryMode == "bloom" {
+			if tp.AncestryMode == "bloom" || tp.AncestryMode == "hybrid" {
+				// Hybrid mode uses bloom filter for ancestry
 				ancestryData = tp.buildBloomFilterAncestry(path)
+				tp.setTag(span, "ancestry", ancestryData)
 			} else if tp.AncestryMode == "hash" {
 				ancestryData = tp.buildHashArrayAncestry(path)
+				tp.setTag(span, "ancestry", ancestryData)
 			}
 			
-			tp.setTag(span, "ancestry", ancestryData)
+			// For hybrid mode: handle hash arrays
+			if tp.AncestryMode == "hybrid" {
+				// Find last checkpoint (high-priority ancestor)
+				lastCheckpoint := findLastHighPriorityAncestor(spanID, true)
+				if lastCheckpoint == "" {
+					lastCheckpoint = spanID // Current span is checkpoint (root)
+				}
+				
+				// Get hash assignments for this span from the current checkpoint interval
+				// Hash resets at each checkpoint, so we only get assignments from this checkpoint
+				var hashParents []string
+				if checkpointAssignments, exists := hashAssignmentsByCheckpoint[lastCheckpoint]; exists {
+					hashParents = checkpointAssignments[spanID]
+				}
+				
+				if len(hashParents) > 0 {
+					// Create hash array: comma-separated "spanID:depth" pairs
+					// Example: "B:1,D:2"
+					hashArray := strings.Join(hashParents, ",")
+					tp.setTag(span, "hash", hashArray)
+				}
+				// Note: Hash automatically resets at each checkpoint because we only include
+				// assignments from the current checkpoint interval (keyed by lastCheckpoint)
+			}
 		}
 	}
 
@@ -581,13 +716,13 @@ func main() {
 		inputDir     = flag.String("input", ".", "Input directory containing trace JSON files")
 		outputDir    = flag.String("output", "", "Output directory for processed traces (default: tagged-{mode}-{depth})")
 		priorityDepth = flag.Int("depth", 3, "Depth interval for high priority spans (default: 3)")
-		ancestryMode = flag.String("mode", "hash", "Ancestry mode: 'hash' or 'bloom' (default: hash)")
+		ancestryMode = flag.String("mode", "hash", "Ancestry mode: 'hash', 'bloom', or 'hybrid' (default: hash)")
 	)
 	flag.Parse()
 
 	// Validate ancestry mode
-	if *ancestryMode != "hash" && *ancestryMode != "bloom" {
-		fmt.Fprintf(os.Stderr, "Error: ancestry mode must be 'hash' or 'bloom'\n")
+	if *ancestryMode != "hash" && *ancestryMode != "bloom" && *ancestryMode != "hybrid" {
+		fmt.Fprintf(os.Stderr, "Error: ancestry mode must be 'hash', 'bloom', or 'hybrid'\n")
 		os.Exit(1)
 	}
 

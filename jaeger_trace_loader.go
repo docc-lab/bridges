@@ -665,6 +665,32 @@ func getAncestryFromTags(span JaegerSpan) (string, string) {
     return mode, payload
 }
 
+// getHashFromTags returns the hash array from span tags (for hybrid mode)
+func getHashFromTags(span JaegerSpan) string {
+    for _, t := range span.Tags {
+        if t.Key == "hash" {
+            if s, ok := t.Value.(string); ok {
+                return s
+            }
+        }
+    }
+    return ""
+}
+
+// parseHashEntry parses a hash entry in format "spanID:depth" and returns spanID and depth
+func parseHashEntry(entry string) (spanID string, depth int, err error) {
+    parts := strings.Split(entry, ":")
+    if len(parts) != 2 {
+        return "", 0, fmt.Errorf("invalid hash entry format: %s (expected spanID:depth)", entry)
+    }
+    spanID = strings.TrimSpace(parts[0])
+    _, err = fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &depth)
+    if err != nil {
+        return "", 0, fmt.Errorf("invalid depth in hash entry %s: %w", entry, err)
+    }
+    return spanID, depth, nil
+}
+
 // getAncestryFromLeafBaggage returns ancestry from legacy __bag.* keys for leaves
 func getAncestryFromLeafBaggage(span JaegerSpan) (string, string) {
     var mode, payload string
@@ -1322,6 +1348,7 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 	}
 	
 	// Calculate depths using BFS from root spans
+	// Treat CHILD_OF and FOLLOWS_FROM as equal for traversal
 	queue := make([]string, 0)
 	for _, rootID := range rootSpans {
 		spanDepthMap[rootID] = 0
@@ -1333,14 +1360,140 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 		queue = queue[1:]
 		currentDepth := spanDepthMap[currentID]
 		
-		// Find children of current span
+		// Find children of current span (both CHILD_OF and FOLLOWS_FROM)
 		for _, span := range trace.Spans {
 			for _, ref := range span.References {
-				if ref.RefType == "CHILD_OF" && ref.SpanID == currentID {
+				if (ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM") && ref.SpanID == currentID {
 					spanDepthMap[span.SpanID] = currentDepth + 1
 					queue = append(queue, span.SpanID)
 				}
 			}
+		}
+	}
+	
+	// Build children index and span lookup for depth inference
+	children := make(map[string][]string)
+	byID := make(map[string]JaegerSpan)
+	for _, s := range trace.Spans {
+		byID[s.SpanID] = s
+	}
+	for _, s := range trace.Spans {
+		for _, ref := range s.References {
+			if ref.RefType == "CHILD_OF" {
+				children[ref.SpanID] = append(children[ref.SpanID], s.SpanID)
+			}
+		}
+	}
+	
+	// For orphans with missing parents, calculate depth from high-priority descendant's depth tag
+	// Do multiple passes to handle dependencies (orphans with descendants that are also orphans)
+	maxPasses := 3
+	for pass := 0; pass < maxPasses; pass++ {
+		updated := false
+		for _, span := range trace.Spans {
+			if _, hasDepth := spanDepthMap[span.SpanID]; !hasDepth {
+			// Orphan without calculated depth - use depth tag from nearest high-priority descendant
+			// Find nearest descendant with ancestry tags (high-priority span)
+			descendant := findNearestDescendantWithAncestry(span.SpanID, children, byID)
+			if descendant != nil {
+				fmt.Printf("  DEBUG - Orphan %s: found descendant %s with ancestry tags\n", span.SpanID, descendant.SpanID)
+				// Get depth tag from the high-priority descendant
+				var descendantDepthTag int = -1
+				for _, tag := range descendant.Tags {
+					if tag.Key == "depth" {
+						if str, ok := tag.Value.(string); ok {
+							fmt.Sscanf(str, "%d", &descendantDepthTag)
+							fmt.Printf("  DEBUG - Orphan %s: descendant %s has depth tag = %d\n", span.SpanID, descendant.SpanID, descendantDepthTag)
+							break
+						}
+					}
+				}
+				
+				if descendantDepthTag >= 0 {
+					// The descendant's depth tag tells us its reset depth from its checkpoint (which is the orphan)
+					// If descendant has depth_tag = N, that means there are N levels from the orphan (checkpoint) to the descendant
+					// So: descendantAbsoluteDepth = orphanDepth + N
+					// Therefore: orphanDepth = descendantAbsoluteDepth - N
+					//
+					// But we don't know descendantAbsoluteDepth yet (it's also an orphan).
+					// However, we can check if the descendant's depth has been calculated already.
+					// If it has, we can use it directly. Otherwise, we'll need to estimate.
+					
+					descendantAbsoluteDepth := -1
+					if depth, exists := spanDepthMap[descendant.SpanID]; exists {
+						descendantAbsoluteDepth = depth
+					}
+					
+					if descendantAbsoluteDepth >= 0 {
+						// We know the descendant's absolute depth, so we can calculate orphan depth directly
+						orphanDepth := descendantAbsoluteDepth - descendantDepthTag
+						if orphanDepth < 0 {
+							orphanDepth = 1 // At least depth 1
+						}
+						spanDepthMap[span.SpanID] = orphanDepth
+						updated = true
+						fmt.Printf("  DEBUG - Orphan %s: inferred depth %d from descendant %s (descendant absolute depth=%d, descendant reset depth tag=%d)\n", 
+							span.SpanID, orphanDepth, descendant.SpanID, descendantAbsoluteDepth, descendantDepthTag)
+						continue
+					} else {
+						// Descendant's depth not calculated yet - use orphan's ancestry to find checkpoint and estimate
+						checkpointDepth := -1
+						
+						// Get orphan's ancestry data (bloom filter) to find checkpoint
+						mode, payload := getAncestryFromTags(span)
+						if mode == "hybrid" || mode == "bloom" {
+							bf, err := deserializeBloomFilter(payload)
+							if err == nil {
+								// Find deepest checkpoint in the orphan's bloom filter
+								for existingSpanID := range spanIDMap {
+									if bf.Test([]byte(existingSpanID)) {
+										if currentSpan, exists := byID[existingSpanID]; exists {
+											if isHighPrioritySpan(currentSpan) {
+												if depth, exists := spanDepthMap[existingSpanID]; exists {
+													if depth > checkpointDepth {
+														checkpointDepth = depth
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+						
+						if checkpointDepth >= 0 {
+							// Estimate: the descendant's depth_tag tells us how many levels from orphan to descendant
+							// If descendant has depth_tag = N, and we know orphan is somewhere after checkpoint,
+							// we can estimate: orphanDepth = checkpointDepth + (some estimate based on depth_tag)
+							// For now, use: orphanDepth = checkpointDepth + descendantDepthTag
+							// This assumes the orphan is at the level where descendantDepthTag levels lead to the descendant
+							orphanDepth := checkpointDepth + descendantDepthTag
+							if orphanDepth < checkpointDepth + 1 {
+								orphanDepth = checkpointDepth + 1
+							}
+							spanDepthMap[span.SpanID] = orphanDepth
+							updated = true
+							fmt.Printf("  DEBUG - Orphan %s: estimated depth %d from checkpoint %d and descendant depth tag %d (descendant depth not yet calculated)\n", 
+								span.SpanID, orphanDepth, checkpointDepth, descendantDepthTag)
+							continue
+						}
+					}
+				} else {
+					fmt.Printf("  DEBUG - Orphan %s: descendant %s has no depth tag\n", span.SpanID, descendant.SpanID)
+				}
+			} else {
+				fmt.Printf("  DEBUG - Orphan %s: no descendant with ancestry tags found (children: %v)\n", span.SpanID, children[span.SpanID])
+			}
+			
+			// Fallback: can't infer, default to 1 (assume it's a direct child of root)
+			spanDepthMap[span.SpanID] = 1
+			updated = true
+			fmt.Printf("  DEBUG - Orphan %s: could not infer depth, defaulting to 1\n", span.SpanID)
+			}
+		}
+		// If no updates in this pass, we're done
+		if !updated {
+			break
 		}
 	}
 	
@@ -1365,15 +1518,10 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 	
 	fmt.Printf("  RECONNECTION - Found %d orphaned spans in trace %s\n", len(orphanedSpans), trace.TraceID)
 	
-	// Build children index and span lookup for descendant search
-	children := make(map[string][]string)
-	byID := make(map[string]JaegerSpan)
-	for _, s := range trace.Spans {
-		byID[s.SpanID] = s
-	}
+	// Build children index for descendant search (already built above, but ensure it includes all reference types)
 	for _, s := range trace.Spans {
 		for _, ref := range s.References {
-			if ref.RefType == "CHILD_OF" {
+			if ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM" {
 				children[ref.SpanID] = append(children[ref.SpanID], s.SpanID)
 			}
 		}
@@ -1381,6 +1529,23 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 
     // Determine trace's ancestry_mode for fallback
     traceMode := getTraceAncestryMode(trace)
+    
+    // For hybrid mode: track synthetic nodes by (ancestorID, depth) and store orphan info for merging
+    type syntheticNodeInfo struct {
+        spanID      string
+        ancestorID  string
+        depth       int
+        isFromHash  bool // true if this node was created from a hash entry
+    }
+    syntheticNodesByKey := make(map[string]*syntheticNodeInfo) // key: "ancestorID:depth" -> node info
+    type orphanInfo struct {
+        span        JaegerSpan
+        bloomFilter *bloom.BloomFilter
+        hashArray   string
+        ancestorID  string
+        orphanDepth int
+    }
+    hybridOrphans := make([]orphanInfo, 0)
     
     // Attempt to reconnect each orphaned span
     reconnectedCount := 0
@@ -1488,6 +1653,275 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
             }
 			continue
 		}
+
+        if mode == "hybrid" {
+            // Hybrid mode reconstruction algorithm:
+            // 1. Find nearest collected ancestor using bloom filter
+            // 2. Find nearest high-priority descendant to get depth tag
+            // 3. Find nearest high-priority ancestor (checkpoint)
+            // 4. Calculate missing nodes using depth tag
+            // 5. Create synthetic nodes (will be labeled with hash entries in second pass)
+            
+            bf, err := deserializeBloomFilter(payload)
+            if err != nil {
+                fmt.Printf("    RECONNECTION - Orphan %s: failed to deserialize bloom filter: %v\n", orphanedSpan.SpanID, err)
+                continue
+            }
+
+            // Step 1: Find nearest collected ancestor using bloom filter
+            var bestAncestor string
+            var bestDepth = -1
+            for existingSpanID := range spanIDMap {
+                if bf.Test([]byte(existingSpanID)) {
+                    depth := spanDepthMap[existingSpanID]
+                    if depth > bestDepth {
+                        bestDepth = depth
+                        bestAncestor = existingSpanID
+                    }
+                }
+            }
+            
+            if bestAncestor == "" {
+                fmt.Printf("    RECONNECTION - Orphan %s: no candidate ancestor from bloom filter test\n", orphanedSpan.SpanID)
+                continue
+            }
+            
+            // Step 2: Find nearest high-priority descendant to get depth tag
+            // If orphan is itself high-priority, use its own depth tag
+            var orphanDepthTag int = -1
+            for _, tag := range orphanedSpan.Tags {
+                if tag.Key == "depth" {
+                    if str, ok := tag.Value.(string); ok {
+                        fmt.Sscanf(str, "%d", &orphanDepthTag)
+                        break
+                    }
+                }
+            }
+            
+            descendant := findNearestDescendantWithAncestry(orphanedSpan.SpanID, children, byID)
+            var descendantDepthTag int = -1
+            var descendantHashArray string = ""
+            if descendant != nil {
+                // Get depth tag and hash array from descendant
+                for _, tag := range descendant.Tags {
+                    if tag.Key == "depth" {
+                        if str, ok := tag.Value.(string); ok {
+                            fmt.Sscanf(str, "%d", &descendantDepthTag)
+                        }
+                    } else if tag.Key == "hash" {
+                        if str, ok := tag.Value.(string); ok {
+                            descendantHashArray = str
+                        }
+                    }
+                }
+            }
+            
+            // Use orphan's own depth tag if available, otherwise use descendant's
+            if orphanDepthTag >= 0 {
+                descendantDepthTag = orphanDepthTag
+                fmt.Printf("    RECONNECTION - Orphan %s: using own depth tag=%d\n", orphanedSpan.SpanID, orphanDepthTag)
+            }
+            
+            // If orphan has its own hash array, use it; otherwise borrow from descendant
+            orphanHashArray := getHashFromTags(orphanedSpan)
+            if orphanHashArray == "" && descendantHashArray != "" {
+                orphanHashArray = descendantHashArray
+                fmt.Printf("    RECONNECTION - Orphan %s: borrowing hash array from descendant\n", orphanedSpan.SpanID)
+            }
+            
+            // Step 3: Find nearest high-priority ancestor (checkpoint) by traversing up from bestAncestor
+            checkpointDepth := -1
+            checkpointID := ""
+            currentSpanID := bestAncestor
+            visited := make(map[string]bool)
+            
+            for currentSpanID != "" && !visited[currentSpanID] {
+                visited[currentSpanID] = true
+                if currentSpan, exists := byID[currentSpanID]; exists {
+                    // Check if this span is a checkpoint (high priority)
+                    if isHighPrioritySpan(currentSpan) {
+                        checkpointDepth = spanDepthMap[currentSpanID]
+                        checkpointID = currentSpanID
+                        break
+                    }
+                    // Move to parent
+                    currentSpanID = ""
+                    for _, ref := range currentSpan.References {
+                        if ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM" {
+                            if spanIDMap[ref.SpanID] {
+                                currentSpanID = ref.SpanID
+                                break
+                            }
+                        }
+                    }
+                } else {
+                    break
+                }
+            }
+            
+            // If no checkpoint found, use bestAncestor as checkpoint
+            if checkpointDepth == -1 {
+                checkpointDepth = bestDepth
+                checkpointID = bestAncestor
+            }
+            
+            // Step 4: Calculate number of missing nodes using depth tag
+            // Count: (checkpoint to bestAncestor) + (descendant to orphan)
+            // The discrepancy from depth tag tells us how many unknown nodes to add
+            nodesFromCheckpointToAncestor := bestDepth - checkpointDepth
+            nodesFromDescendantToOrphan := 0
+            if descendantDepthTag >= 0 {
+                // The descendant's depth tag tells us its reset depth from checkpoint
+                // If descendant is at depth tag = N, and orphan is ancestor of descendant,
+                // we need to estimate nodes from descendant to orphan
+                // For now, use: nodesFromDescendantToOrphan = 0 (orphan is direct ancestor of descendant)
+                // Actually, we can't know this exactly without more info
+                nodesFromDescendantToOrphan = 0
+            }
+            
+            // Total nodes from checkpoint to orphan (via collected ancestor)
+            totalNodesFromCheckpoint := nodesFromCheckpointToAncestor + nodesFromDescendantToOrphan
+            expectedNodesFromDepthTag := descendantDepthTag
+            if expectedNodesFromDepthTag < 0 {
+                expectedNodesFromDepthTag = 0
+            }
+            
+            // The discrepancy is the number of unknown nodes to add
+            missingNodes := expectedNodesFromDepthTag - totalNodesFromCheckpoint
+            if missingNodes < 0 {
+                missingNodes = 0
+            }
+            
+            fmt.Printf("    RECONNECTION - Orphan %s: checkpoint=%s (depth=%d), ancestor=%s (depth=%d), descendant depth tag=%d, missing nodes=%d\n", 
+                orphanedSpan.SpanID, checkpointID, checkpointDepth, bestAncestor, bestDepth, descendantDepthTag, missingNodes)
+            
+            // Store orphan info for second pass (hash labeling and merging)
+            hybridOrphans = append(hybridOrphans, orphanInfo{
+                span:        orphanedSpan,
+                bloomFilter: bf,
+                hashArray:   orphanHashArray,
+                ancestorID:  bestAncestor,
+                orphanDepth: spanDepthMap[orphanedSpan.SpanID],
+            })
+            
+            // Create synthetic nodes for missing depths (starting from checkpoint)
+            // These will be labeled with hash entries in second pass
+            lastParentID := bestAncestor
+            syntheticCount := 0
+            
+            // Calculate orphan depth: checkpointDepth + descendantDepthTag
+            // The descendantDepthTag tells us how many levels from checkpoint to orphan
+            orphanDepth := checkpointDepth + descendantDepthTag
+            if orphanDepth <= bestDepth {
+                // Fallback: use spanDepthMap if available
+                if depth, exists := spanDepthMap[orphanedSpan.SpanID]; exists && depth > bestDepth {
+                    orphanDepth = depth
+                } else {
+                    orphanDepth = bestDepth + missingNodes + 1
+                }
+            }
+            
+            fmt.Printf("    RECONNECTION - Orphan %s: creating synthetic nodes from depth %d to %d (orphan depth=%d)\n", 
+                orphanedSpan.SpanID, bestDepth + 1, orphanDepth - 1, orphanDepth)
+            
+            for d := bestDepth + 1; d < orphanDepth; d++ {
+                // Create placeholder ID (will be labeled with hash in second pass)
+                synthID := fmt.Sprintf("synth_%s_%d", orphanedSpan.SpanID, d)
+                
+                // Check if synthetic node already exists at this (ancestor, depth)
+                // Only reuse if the existing node's spanID is in this orphan's bloom filter
+                nodeKey := fmt.Sprintf("%s:%d", bestAncestor, d)
+                if existingNode, exists := syntheticNodesByKey[nodeKey]; exists {
+                    // Check if existing node's spanID is in this orphan's bloom filter
+                    // If yes, reuse it; if no, create a new one (will be merged later if needed)
+                    if bf.Test([]byte(existingNode.spanID)) {
+                        lastParentID = existingNode.spanID
+                        fmt.Printf("    RECONNECTION - Orphan %s: using existing synthetic node %s at depth %d (in bloom filter)\n", 
+                            orphanedSpan.SpanID, existingNode.spanID, d)
+                        continue
+                    } else {
+                        // Existing node is not in bloom filter, create new one with different key
+                        nodeKey = fmt.Sprintf("%s:%d:%s", bestAncestor, d, orphanedSpan.SpanID)
+                        fmt.Printf("    RECONNECTION - Orphan %s: existing node %s at depth %d not in bloom filter, creating new node\n", 
+                            orphanedSpan.SpanID, existingNode.spanID, d)
+                    }
+                }
+                
+                // Create new synthetic node
+                unknownPID := "p_unknown"
+                if _, ok := reconnectedTrace.Processes[unknownPID]; !ok {
+                    reconnectedTrace.Processes[unknownPID] = Process{ServiceName: "unknown_service:reconstructed", Tags: nil}
+                }
+                
+                synth := JaegerSpan{
+                    TraceID:       trace.TraceID,
+                    SpanID:        synthID,
+                    ProcessID:     unknownPID,
+                    OperationName: "unknown",
+                    StartTime:     orphanedSpan.StartTime - 1000,
+                    Duration:      1000,
+                    Tags:          []Tag{{Key: "bridge.synthetic", Value: true, Type: "bool"}},
+                    References:    []Reference{{RefType: "CHILD_OF", TraceID: trace.TraceID, SpanID: lastParentID}},
+                    Flags:         0,
+                }
+                reconnectedTrace.Spans = append(reconnectedTrace.Spans, synth)
+                spanIDMap[synthID] = true
+                byID[synthID] = synth
+                spanDepthMap[synthID] = d
+                syntheticCount++
+                
+                // Track synthetic node
+                syntheticNodesByKey[nodeKey] = &syntheticNodeInfo{
+                    spanID:     synthID,
+                    ancestorID: bestAncestor,
+                    depth:      d,
+                    isFromHash: false, // Will be set in second pass
+                }
+                
+                fmt.Printf("    RECONNECTION - Orphan %s: created synthetic node %s at depth %d\n", 
+                    orphanedSpan.SpanID, synthID, d)
+                
+                lastParentID = synthID
+            }
+            
+            // Connect orphan to last parent
+            missingParentID := ""
+            for _, ref := range orphanedSpan.References {
+                if (ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM") && !spanIDMap[ref.SpanID] {
+                    missingParentID = ref.SpanID
+                    break
+                }
+            }
+            
+            for i := range reconnectedTrace.Spans {
+                if reconnectedTrace.Spans[i].SpanID == orphanedSpan.SpanID {
+                    for j := range reconnectedTrace.Spans[i].References {
+                        if (reconnectedTrace.Spans[i].References[j].RefType == "CHILD_OF" || reconnectedTrace.Spans[i].References[j].RefType == "FOLLOWS_FROM") && 
+                           (missingParentID == "" || reconnectedTrace.Spans[i].References[j].SpanID == missingParentID) {
+                            reconnectedTrace.Spans[i].References[j].SpanID = lastParentID
+                        }
+                    }
+                    reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.reconnected", Value: true, Type: "bool"})
+                    if missingParentID != "" {
+                        reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.original_parent", Value: missingParentID, Type: "string"})
+                    }
+                    reconnectedTrace.Spans[i].Tags = append(reconnectedTrace.Spans[i].Tags, Tag{Key: "bridge.confidence", Value: 0.8, Type: "float64"})
+                    break
+                }
+            }
+            
+            bridgeEdge := BridgeEdge{
+                FromSpanID:          lastParentID,
+                ToSpanID:            orphanedSpan.SpanID,
+                OriginalParent:      missingParentID,
+                Depth:               orphanDepth,
+                Confidence:          0.8,
+                SyntheticSpansCreated: syntheticCount,
+            }
+            result.BridgeEdges = append(result.BridgeEdges, bridgeEdge)
+            reconnectedCount++
+            continue
+        }
 
         if mode == "hash" {
 			// Parse ancestry array
@@ -1643,6 +2077,637 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 			reconnectedCount++
 			continue
 		}
+	}
+	
+	// Second pass for hybrid mode: Label nodes with hash entries, then merge using BFS
+	if len(hybridOrphans) > 0 {
+		fmt.Printf("\n  RECONNECTION - Second pass: Labeling synthetic nodes with hash arrays\n")
+		
+		// Step 1: Annotate all nodes with hashed spanID from hash arrays
+		// Hash depth is interpreted relative to nearest high-priority ancestor (checkpoint)
+		for _, orphanInfo := range hybridOrphans {
+			if orphanInfo.hashArray == "" {
+				continue // No hash array, skip labeling
+			}
+			
+			// Find nearest high-priority ancestor (checkpoint) for this orphan
+			checkpointDepth := -1
+			currentSpanID := orphanInfo.ancestorID
+			visited := make(map[string]bool)
+			
+			for currentSpanID != "" && !visited[currentSpanID] {
+				visited[currentSpanID] = true
+				if currentSpan, exists := byID[currentSpanID]; exists {
+					if isHighPrioritySpan(currentSpan) {
+						checkpointDepth = spanDepthMap[currentSpanID]
+						break
+					}
+					// Move to parent
+					currentSpanID = ""
+					for _, ref := range currentSpan.References {
+						if ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM" {
+							if spanIDMap[ref.SpanID] {
+								currentSpanID = ref.SpanID
+								break
+							}
+						}
+					}
+				} else {
+					break
+				}
+			}
+			
+			if checkpointDepth == -1 {
+				checkpointDepth = spanDepthMap[orphanInfo.ancestorID]
+			}
+			
+			// Parse hash entries
+			hashParts := strings.Split(orphanInfo.hashArray, ",")
+			for _, part := range hashParts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				
+				hashSpanID, hashDepth, err := parseHashEntry(part)
+				if err != nil {
+					fmt.Printf("    RECONNECTION - Label: failed to parse hash entry %s: %v\n", part, err)
+					continue
+				}
+				
+				// Hash depth is relative to checkpoint, so absolute depth = checkpointDepth + hashDepth
+				absoluteDepth := checkpointDepth + hashDepth
+				
+				// Find synthetic node at this (ancestor, absolute depth)
+				nodeKey := fmt.Sprintf("%s:%d", orphanInfo.ancestorID, absoluteDepth)
+				syntheticNode, exists := syntheticNodesByKey[nodeKey]
+				
+				if !exists {
+					// Try to find by depth only (might be from different ancestor path)
+					for key, node := range syntheticNodesByKey {
+						if node.depth == absoluteDepth {
+							syntheticNode = node
+							nodeKey = key
+							exists = true
+							break
+						}
+					}
+				}
+				
+				if !exists {
+					fmt.Printf("    RECONNECTION - Label: no synthetic node found at depth %d (checkpoint=%d + hash=%d) for orphan %s\n", 
+						absoluteDepth, checkpointDepth, hashDepth, orphanInfo.span.SpanID)
+					continue
+				}
+				
+				// Label the synthetic node with hash spanID
+				if syntheticNode.spanID != hashSpanID {
+					fmt.Printf("    RECONNECTION - Label: labeling synthetic node %s at depth %d with hash spanID %s\n", 
+						syntheticNode.spanID, absoluteDepth, hashSpanID)
+					
+					// Update the synthetic node tracking
+					oldSpanID := syntheticNode.spanID
+					syntheticNode.spanID = hashSpanID
+					syntheticNode.isFromHash = true
+					
+					// Update the span in reconnectedTrace
+					for i := range reconnectedTrace.Spans {
+						if reconnectedTrace.Spans[i].SpanID == oldSpanID {
+							reconnectedTrace.Spans[i].SpanID = hashSpanID
+							// Update maps
+							delete(spanIDMap, oldSpanID)
+							spanIDMap[hashSpanID] = true
+							byID[hashSpanID] = reconnectedTrace.Spans[i]
+							delete(byID, oldSpanID)
+							spanDepthMap[hashSpanID] = absoluteDepth
+							break
+						}
+					}
+					
+					// Update all references
+					for i := range reconnectedTrace.Spans {
+						for j := range reconnectedTrace.Spans[i].References {
+							if reconnectedTrace.Spans[i].References[j].SpanID == oldSpanID {
+								reconnectedTrace.Spans[i].References[j].SpanID = hashSpanID
+							}
+						}
+					}
+					
+					// Update bridge edges
+					for i := range result.BridgeEdges {
+						if result.BridgeEdges[i].FromSpanID == oldSpanID {
+							result.BridgeEdges[i].FromSpanID = hashSpanID
+						}
+						if result.BridgeEdges[i].ToSpanID == oldSpanID {
+							result.BridgeEdges[i].ToSpanID = hashSpanID
+						}
+					}
+				}
+			}
+		}
+		
+		// Step 2: BFS merge traversal - look for labeled synthetic nodes and merge with siblings
+		fmt.Printf("\n  RECONNECTION - Third pass: BFS merge traversal\n")
+		
+		// Build parent-child map for BFS
+		parentToChildren := make(map[string][]string)
+		childToParent := make(map[string]string)
+		for _, span := range reconnectedTrace.Spans {
+			for _, ref := range span.References {
+				if ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM" {
+					parentToChildren[ref.SpanID] = append(parentToChildren[ref.SpanID], span.SpanID)
+					childToParent[span.SpanID] = ref.SpanID
+				}
+			}
+		}
+		
+		fmt.Printf("  RECONNECTION - BFS: Built parent-child map with %d parents\n", len(parentToChildren))
+		
+		// Find root spans for BFS
+		visited := make(map[string]bool)
+		var roots []string
+		for _, span := range reconnectedTrace.Spans {
+			isRoot := true
+			for _, ref := range span.References {
+				if ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM" {
+					isRoot = false
+					break
+				}
+			}
+			if isRoot {
+				roots = append(roots, span.SpanID)
+			}
+		}
+		
+		fmt.Printf("  RECONNECTION - BFS: Found %d root(s): %v\n", len(roots), roots)
+		
+		// BFS traversal
+		queue := make([]string, 0)
+		for _, root := range roots {
+			queue = append(queue, root)
+			visited[root] = true
+		}
+		
+		processedCount := 0
+		for len(queue) > 0 {
+			currentID := queue[0]
+			queue = queue[1:]
+			processedCount++
+			
+			// Check if current node is a labeled synthetic node (from hash)
+			currentSpan := byID[currentID]
+			if currentSpan.SpanID == "" {
+				fmt.Printf("  RECONNECTION - BFS: Skipping %s (not in byID)\n", currentID)
+				continue
+			}
+			
+			currentDepth := spanDepthMap[currentID]
+			isLabeledSynthetic := false
+			for _, tag := range currentSpan.Tags {
+				if tag.Key == "bridge.synthetic" {
+					isLabeledSynthetic = true
+					break
+				}
+			}
+			
+			fmt.Printf("  RECONNECTION - BFS: Processing %s (depth=%d, synthetic=%v, isLabeled=%v, isPlaceholder=%v)\n", 
+				currentID, currentDepth, isLabeledSynthetic, isLabeledSynthetic && !strings.HasPrefix(currentID, "synth_"), strings.HasPrefix(currentID, "synth_"))
+			
+			// Check if this is a synthetic node (labeled or placeholder)
+			if isLabeledSynthetic {
+				isPlaceholder := strings.HasPrefix(currentID, "synth_")
+				if !isPlaceholder {
+					fmt.Printf("  RECONNECTION - BFS: %s is a labeled synthetic node, looking for siblings\n", currentID)
+					// This is a labeled synthetic node - look for siblings to merge
+					parentID := childToParent[currentID]
+					if parentID != "" {
+						fmt.Printf("  RECONNECTION - BFS: %s has parent %s, checking siblings\n", currentID, parentID)
+						// Get siblings (children of parent) - need to get fresh list in case parentToChildren was updated
+						siblings := make([]string, 0)
+						for _, childID := range parentToChildren[parentID] {
+							siblings = append(siblings, childID)
+						}
+						fmt.Printf("  RECONNECTION - BFS: Found %d siblings of %s: %v\n", len(siblings), currentID, siblings)
+					
+					for _, siblingID := range siblings {
+						if siblingID == currentID {
+							continue // Skip self
+						}
+						
+						// Check if siblingID was already merged (deleted from byID)
+						actualSiblingID := siblingID
+						if _, exists := byID[siblingID]; !exists {
+							// Sibling was merged - check if it was merged into currentID
+							if spanDepthMap[currentID] == spanDepthMap[siblingID] {
+								// Same depth, might have been merged
+								fmt.Printf("  RECONNECTION - BFS: Sibling %s was already merged, checking if it's now %s\n", siblingID, currentID)
+								// Check if any references point from siblingID to currentID (meaning they were merged)
+								merged := false
+								for _, span := range reconnectedTrace.Spans {
+									for _, ref := range span.References {
+										if ref.SpanID == currentID {
+											// Check if this span was originally connected to siblingID
+											// by looking at the span's current parent
+											if span.SpanID != currentID && span.SpanID != siblingID {
+												merged = true
+												break
+											}
+										}
+									}
+									if merged {
+										break
+									}
+								}
+								if merged {
+									fmt.Printf("  RECONNECTION - BFS: Sibling %s was already merged into %s, skipping\n", siblingID, currentID)
+									continue
+								}
+							}
+							// Sibling was deleted but not merged into currentID - skip it
+							fmt.Printf("  RECONNECTION - BFS: Skipping sibling %s (not in byID, may have been merged elsewhere)\n", siblingID)
+							continue
+						}
+						
+						siblingSpan := byID[actualSiblingID]
+						if siblingSpan.SpanID == "" {
+							fmt.Printf("  RECONNECTION - BFS: Skipping sibling %s (span has empty SpanID)\n", actualSiblingID)
+							continue
+						}
+						
+						siblingDepth := spanDepthMap[siblingID]
+						// Check if sibling is also a synthetic node at the same depth
+						isSiblingSynthetic := false
+						for _, tag := range siblingSpan.Tags {
+							if tag.Key == "bridge.synthetic" {
+								isSiblingSynthetic = true
+								break
+							}
+						}
+						
+						fmt.Printf("  RECONNECTION - BFS: Checking sibling %s (depth=%d, synthetic=%v)\n", 
+							siblingID, siblingDepth, isSiblingSynthetic)
+						
+						if isSiblingSynthetic && siblingDepth == currentDepth {
+							fmt.Printf("  RECONNECTION - BFS: Sibling %s is synthetic at same depth %d, checking bloom filters\n", 
+								siblingID, siblingDepth)
+							// Found a sibling synthetic node at same depth - check if it should be merged
+							// Find orphan info that corresponds to this sibling
+							siblingOrphanInfo := orphanInfo{}
+							foundSiblingOrphan := false
+							for _, oi := range hybridOrphans {
+								// Check if this sibling's path leads back to an orphan
+								if oi.span.SpanID == siblingID || childToParent[siblingID] == "" {
+									// Try to find the orphan that created this sibling
+									// by checking if sibling is descendant of orphan's path
+									foundSiblingOrphan = true
+									siblingOrphanInfo = oi
+									break
+								}
+							}
+							
+							// Actually, we need to find which orphan created this sibling
+							// The siblingID is a placeholder like "synth_X_Y", so we can extract the orphan ID
+							if !foundSiblingOrphan {
+								// Try to find orphan by matching the sibling's placeholder ID pattern
+								for _, oi := range hybridOrphans {
+									if strings.Contains(siblingID, oi.span.SpanID) {
+										siblingOrphanInfo = oi
+										foundSiblingOrphan = true
+										fmt.Printf("  RECONNECTION - BFS: Found orphan %s that created sibling %s\n", 
+											oi.span.SpanID, siblingID)
+										break
+									}
+								}
+							}
+							
+							if foundSiblingOrphan && siblingOrphanInfo.bloomFilter != nil {
+								fmt.Printf("  RECONNECTION - BFS: Checking if labeled node %s is in sibling orphan %s bloom filter\n", 
+									currentID, siblingOrphanInfo.span.SpanID)
+								if siblingOrphanInfo.bloomFilter.Test([]byte(currentID)) {
+									// Current labeled node is in sibling's bloom filter - merge
+									fmt.Printf("  RECONNECTION - Merge: labeled node %s found in sibling orphan %s bloom filter, merging\n", 
+										currentID, siblingOrphanInfo.span.SpanID)
+									
+									// Merge: replace sibling with current labeled node
+									oldSiblingID := siblingID
+									newSiblingID := currentID
+									
+									fmt.Printf("  RECONNECTION - Merge: Replacing %s with %s\n", oldSiblingID, newSiblingID)
+									
+									// Find and remove the old sibling span from reconnectedTrace
+									foundSiblingSpan := false
+									spanToRemoveIdx := -1
+									for i := range reconnectedTrace.Spans {
+										if reconnectedTrace.Spans[i].SpanID == oldSiblingID {
+											foundSiblingSpan = true
+											spanToRemoveIdx = i
+											break
+										}
+									}
+									
+									if foundSiblingSpan {
+										// Remove the old span from reconnectedTrace.Spans
+										reconnectedTrace.Spans = append(reconnectedTrace.Spans[:spanToRemoveIdx], reconnectedTrace.Spans[spanToRemoveIdx+1:]...)
+										fmt.Printf("  RECONNECTION - Merge: Removed redundant span %s from reconnectedTrace\n", oldSiblingID)
+										
+										// Update maps
+										delete(spanIDMap, oldSiblingID)
+										delete(byID, oldSiblingID)
+										// Note: newSiblingID should already exist in maps since it's the labeled node
+										if !spanIDMap[newSiblingID] {
+											spanIDMap[newSiblingID] = true
+										}
+										if _, exists := byID[newSiblingID]; !exists {
+											// Find the newSiblingID span and add to byID
+											for _, span := range reconnectedTrace.Spans {
+												if span.SpanID == newSiblingID {
+													byID[newSiblingID] = span
+													break
+												}
+											}
+										}
+										// Update depth map if needed
+										if oldDepth, exists := spanDepthMap[oldSiblingID]; exists {
+											if _, exists := spanDepthMap[newSiblingID]; !exists {
+												spanDepthMap[newSiblingID] = oldDepth
+											}
+										}
+										fmt.Printf("  RECONNECTION - Merge: Updated maps (removed %s, keeping %s)\n", oldSiblingID, newSiblingID)
+									} else {
+										fmt.Printf("  RECONNECTION - Merge: WARNING - Could not find sibling span %s in reconnectedTrace\n", oldSiblingID)
+									}
+									
+									// Update all references
+									refUpdateCount := 0
+									for i := range reconnectedTrace.Spans {
+										for j := range reconnectedTrace.Spans[i].References {
+											if reconnectedTrace.Spans[i].References[j].SpanID == oldSiblingID {
+												reconnectedTrace.Spans[i].References[j].SpanID = newSiblingID
+												refUpdateCount++
+											}
+										}
+									}
+									fmt.Printf("  RECONNECTION - Merge: Updated %d references from %s -> %s\n", refUpdateCount, oldSiblingID, newSiblingID)
+									
+									// Update bridge edges
+									edgeUpdateCount := 0
+									for i := range result.BridgeEdges {
+										if result.BridgeEdges[i].FromSpanID == oldSiblingID {
+											result.BridgeEdges[i].FromSpanID = newSiblingID
+											edgeUpdateCount++
+										}
+										if result.BridgeEdges[i].ToSpanID == oldSiblingID {
+											result.BridgeEdges[i].ToSpanID = newSiblingID
+											edgeUpdateCount++
+										}
+									}
+									fmt.Printf("  RECONNECTION - Merge: Updated %d bridge edges from %s -> %s\n", edgeUpdateCount, oldSiblingID, newSiblingID)
+									
+									// Update parentToChildren map - move children from oldSiblingID to newSiblingID
+									if children, exists := parentToChildren[oldSiblingID]; exists {
+										// Add oldSiblingID's children to newSiblingID's children (merge the lists)
+										if existingChildren, exists := parentToChildren[newSiblingID]; exists {
+											// Merge children lists, avoiding duplicates
+											childSet := make(map[string]bool)
+											for _, c := range existingChildren {
+												childSet[c] = true
+											}
+											for _, c := range children {
+												if !childSet[c] {
+													parentToChildren[newSiblingID] = append(parentToChildren[newSiblingID], c)
+												}
+											}
+										} else {
+											parentToChildren[newSiblingID] = children
+										}
+										delete(parentToChildren, oldSiblingID)
+										fmt.Printf("  RECONNECTION - Merge: Updated parentToChildren map (moved %d children from %s to %s)\n", 
+											len(children), oldSiblingID, newSiblingID)
+									}
+									
+									// Update childToParent map for all children of oldSiblingID
+									childUpdateCount := 0
+									for childID, parentID := range childToParent {
+										if parentID == oldSiblingID {
+											childToParent[childID] = newSiblingID
+											childUpdateCount++
+										}
+									}
+									fmt.Printf("  RECONNECTION - Merge: Updated %d children to point to new parent %s\n", childUpdateCount, newSiblingID)
+									
+									// Remove oldSiblingID from visited set if it was there (so we don't try to process it)
+									delete(visited, oldSiblingID)
+									break
+								} else {
+									fmt.Printf("  RECONNECTION - BFS: Labeled node %s NOT in sibling orphan %s bloom filter, no merge\n", 
+										currentID, siblingOrphanInfo.span.SpanID)
+								}
+							} else {
+								if !foundSiblingOrphan {
+									fmt.Printf("  RECONNECTION - BFS: Could not find orphan info for sibling %s\n", siblingID)
+								} else {
+									fmt.Printf("  RECONNECTION - BFS: Sibling orphan %s has no bloom filter\n", siblingOrphanInfo.span.SpanID)
+								}
+							}
+						} else {
+							fmt.Printf("  RECONNECTION - BFS: Sibling %s not synthetic or different depth (%d vs %d), skipping\n", 
+								siblingID, siblingDepth, currentDepth)
+						}
+					}
+				} else {
+					fmt.Printf("  RECONNECTION - BFS: %s has no parent, skipping sibling check\n", currentID)
+				}
+			} else if isLabeledSynthetic && strings.HasPrefix(currentID, "synth_") {
+				// This is a placeholder synthetic node - check if there's a labeled sibling we should merge into
+				fmt.Printf("  RECONNECTION - BFS: %s is a placeholder synthetic node, checking for labeled siblings\n", currentID)
+				parentID := childToParent[currentID]
+				if parentID != "" {
+					// Get all siblings (children of parent) - check both current siblings and any that might have been merged
+					siblings := parentToChildren[parentID]
+					fmt.Printf("  RECONNECTION - BFS: Placeholder %s has parent %s, found %d siblings: %v\n", 
+						currentID, parentID, len(siblings), siblings)
+					
+					// Also check all spans at the same depth from the same parent to find labeled nodes
+					labeledSiblingFound := ""
+					for _, span := range reconnectedTrace.Spans {
+						// Check if this span is a labeled synthetic node at the same depth
+						isLabeled := false
+						for _, tag := range span.Tags {
+							if tag.Key == "bridge.synthetic" {
+								isLabeled = true
+								break
+							}
+						}
+						if isLabeled && !strings.HasPrefix(span.SpanID, "synth_") {
+							// Check if this labeled node is at the same depth and has the same parent
+							if spanDepth, exists := spanDepthMap[span.SpanID]; exists && spanDepth == currentDepth {
+								// Check if it has the same parent
+								spanParent := ""
+								for _, ref := range span.References {
+									if ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM" {
+										spanParent = ref.SpanID
+										break
+									}
+								}
+								if spanParent == parentID {
+									labeledSiblingFound = span.SpanID
+									fmt.Printf("  RECONNECTION - BFS: Found labeled sibling %s at same depth %d with same parent %s\n", 
+										labeledSiblingFound, currentDepth, parentID)
+									break
+								}
+							}
+						}
+					}
+					
+					// Check both current siblings and the found labeled sibling
+					allSiblings := make(map[string]bool)
+					for _, s := range siblings {
+						allSiblings[s] = true
+					}
+					if labeledSiblingFound != "" {
+						allSiblings[labeledSiblingFound] = true
+					}
+					
+					for siblingID := range allSiblings {
+						if siblingID == currentID {
+							continue
+						}
+						
+						// Check if sibling exists in byID (might have been merged already)
+						siblingSpan, exists := byID[siblingID]
+						if !exists {
+							fmt.Printf("  RECONNECTION - BFS: Sibling %s not in byID, may have been merged, skipping\n", siblingID)
+							continue
+						}
+						
+						// Check if sibling is a labeled synthetic node at same depth
+						isSiblingLabeled := false
+						for _, tag := range siblingSpan.Tags {
+							if tag.Key == "bridge.synthetic" {
+								isSiblingLabeled = true
+								break
+							}
+						}
+						
+						fmt.Printf("  RECONNECTION - BFS: Checking sibling %s (labeled=%v, depth=%d)\n", 
+							siblingID, isSiblingLabeled && !strings.HasPrefix(siblingID, "synth_"), spanDepthMap[siblingID])
+						
+						if isSiblingLabeled && !strings.HasPrefix(siblingID, "synth_") && spanDepthMap[siblingID] == currentDepth {
+							// Found a labeled sibling - check if it's in our bloom filter
+							// Find our orphan info
+							for _, oi := range hybridOrphans {
+								if strings.Contains(currentID, oi.span.SpanID) {
+									fmt.Printf("  RECONNECTION - BFS: Checking if labeled sibling %s is in orphan %s bloom filter\n", 
+										siblingID, oi.span.SpanID)
+									if oi.bloomFilter != nil && oi.bloomFilter.Test([]byte(siblingID)) {
+										fmt.Printf("  RECONNECTION - Merge: Placeholder %s merging into labeled sibling %s (found in bloom filter)\n", 
+											currentID, siblingID)
+											// Merge this placeholder into the labeled sibling
+											oldSiblingID := currentID
+											newSiblingID := siblingID
+											
+											// Find and remove the old placeholder span from reconnectedTrace
+											spanToRemoveIdx := -1
+											for i := range reconnectedTrace.Spans {
+												if reconnectedTrace.Spans[i].SpanID == oldSiblingID {
+													spanToRemoveIdx = i
+													break
+												}
+											}
+											
+											if spanToRemoveIdx >= 0 {
+												// Remove the old span from reconnectedTrace.Spans
+												reconnectedTrace.Spans = append(reconnectedTrace.Spans[:spanToRemoveIdx], reconnectedTrace.Spans[spanToRemoveIdx+1:]...)
+												fmt.Printf("  RECONNECTION - Merge: Removed redundant placeholder span %s from reconnectedTrace\n", oldSiblingID)
+												
+												// Update maps
+												delete(spanIDMap, oldSiblingID)
+												delete(byID, oldSiblingID)
+												// Note: newSiblingID should already exist in maps since it's the labeled node
+												if !spanIDMap[newSiblingID] {
+													spanIDMap[newSiblingID] = true
+												}
+												if _, exists := byID[newSiblingID]; !exists {
+													// Find the newSiblingID span and add to byID
+													for _, span := range reconnectedTrace.Spans {
+														if span.SpanID == newSiblingID {
+															byID[newSiblingID] = span
+															break
+														}
+													}
+												}
+												// Update depth map if needed
+												if oldDepth, exists := spanDepthMap[oldSiblingID]; exists {
+													if _, exists := spanDepthMap[newSiblingID]; !exists {
+														spanDepthMap[newSiblingID] = oldDepth
+													}
+												}
+												fmt.Printf("  RECONNECTION - Merge: Updated maps (removed %s, keeping %s)\n", oldSiblingID, newSiblingID)
+											} else {
+												fmt.Printf("  RECONNECTION - Merge: WARNING - Could not find placeholder span %s in reconnectedTrace\n", oldSiblingID)
+											}
+											
+											// Update references
+											for i := range reconnectedTrace.Spans {
+												for j := range reconnectedTrace.Spans[i].References {
+													if reconnectedTrace.Spans[i].References[j].SpanID == oldSiblingID {
+														reconnectedTrace.Spans[i].References[j].SpanID = newSiblingID
+													}
+												}
+											}
+											
+											// Update parentToChildren
+											if children, exists := parentToChildren[oldSiblingID]; exists {
+												if existingChildren, exists := parentToChildren[newSiblingID]; exists {
+													childSet := make(map[string]bool)
+													for _, c := range existingChildren {
+														childSet[c] = true
+													}
+													for _, c := range children {
+														if !childSet[c] {
+															parentToChildren[newSiblingID] = append(parentToChildren[newSiblingID], c)
+														}
+													}
+												} else {
+													parentToChildren[newSiblingID] = children
+												}
+												delete(parentToChildren, oldSiblingID)
+											}
+											
+											// Update childToParent
+											for childID, pid := range childToParent {
+												if pid == oldSiblingID {
+													childToParent[childID] = newSiblingID
+												}
+											}
+											
+											delete(visited, oldSiblingID)
+											break
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			} else {
+				fmt.Printf("  RECONNECTION - BFS: %s is not a synthetic node, skipping merge check\n", currentID)
+			}
+			
+			// Add children to queue
+			children := parentToChildren[currentID]
+			fmt.Printf("  RECONNECTION - BFS: Adding %d children of %s to queue: %v\n", len(children), currentID, children)
+			for _, childID := range children {
+				if !visited[childID] {
+					visited[childID] = true
+					queue = append(queue, childID)
+				} else {
+					fmt.Printf("  RECONNECTION - BFS: Skipping already visited child %s\n", childID)
+				}
+			}
+		}
+		
+		fmt.Printf("  RECONNECTION - BFS: Processed %d nodes during BFS traversal\n", processedCount)
 	}
 	
 	// Calculate total synthetic spans created across all bridge edges

@@ -461,8 +461,40 @@ func (tp *TraceProcessor) processSpanGroup(spans []*OTelSpan) error {
 	}
 
 	// Process each span to set ancestry tags (only for high priority)
+	// Also set depth tag for high priority spans only:
+	// - Root span keeps its absolute depth (0)
+	// - All other checkpoints keep their absolute depth
+	// - Depth resets to 0 at the child of a checkpoint (even if that child is a checkpoint itself)
 	for spanID, span := range spanMap {
 		if priorityMap[spanID] {
+			// Calculate depth tag (only for high priority spans)
+			spanDepth := depthMap[spanID]
+			var depthTag int
+			
+			// Check if this is a root span
+			parentID := tp.getParentSpanID(span)
+			isRoot := parentID == ""
+			
+			if isRoot {
+				// Root always keeps absolute depth (0) - only edge case that doesn't reset
+				depthTag = spanDepth
+			} else {
+				// For all non-root checkpoints, check if parent is a checkpoint
+				parentIsCheckpoint := priorityMap[parentID]
+				if parentIsCheckpoint {
+					// Parent is a checkpoint, so depth resets at this child
+					// Child of checkpoint gets depth = spanDepth - checkpointDepth
+					checkpointDepth := depthMap[parentID]
+					depthTag = spanDepth - checkpointDepth
+					if depthTag < 1 {
+						depthTag = 1 // Should be at least 1 for child of checkpoint
+					}
+				} else {
+					// Parent is not a checkpoint, so this checkpoint keeps its absolute depth
+					depthTag = spanDepth
+				}
+			}
+			tp.setTag(span, "depth", fmt.Sprintf("%d", depthTag))
 			tp.setTag(span, "ancestry_mode", tp.AncestryMode)
 			
 			// Build ancestry data with reset path (from last high priority ancestor to this span)

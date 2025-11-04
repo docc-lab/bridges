@@ -86,6 +86,70 @@ def calculate_false_positive_rate(metadata):
     
     return fpr_values
 
+def calculate_reconnection_rates(metadata):
+    """Extract reconnection rates from metadata."""
+    traces = metadata.get('traces', [])
+    reconnection_rates = []
+    
+    for trace in traces:
+        # Filter out traces with only 1 span
+        original_spans = trace.get('original_spans', 0)
+        reconstructed_spans = trace.get('reconstructed_spans', 0)
+        if original_spans <= 1 and reconstructed_spans <= 1:
+            continue
+        
+        # Get reconnection rate from reconnection_result
+        reconnection_result = trace.get('reconnection_result')
+        if reconnection_result:
+            rate = reconnection_result.get('reconnectionRate', 0.0)
+            reconnection_rates.append(rate)
+        else:
+            # No reconnection data, default to 0
+            reconnection_rates.append(0.0)
+    
+    return reconnection_rates
+
+def calculate_span_differences(metadata, original_span_counts=None):
+    """
+    Calculate the difference between reconstructed and original span counts.
+    Uses original_span_counts lookup (from tagged trace files) to get true original (before data loss).
+    """
+    traces = metadata.get('traces', [])
+    span_differences = []
+    
+    for trace in traces:
+        trace_id = trace.get('trace_id')
+        if not trace_id:
+            continue
+            
+        # Filter out traces with only 1 span
+        reconstructed_spans = trace.get('reconstructed_spans', 0)
+        if reconstructed_spans <= 1:
+            continue
+        
+        # Get true original (before data loss) from original_span_counts lookup
+        original_spans_before_loss = None
+        if original_span_counts and trace_id in original_span_counts:
+            original_spans_before_loss = original_span_counts[trace_id]
+        
+        # Fall back to taggedTrace in reconnection_result if available
+        if original_spans_before_loss is None or original_spans_before_loss <= 1:
+            rr = trace.get('reconnection_result', {})
+            if rr:
+                tagged_trace = rr.get('taggedTrace')
+                if tagged_trace and 'spans' in tagged_trace:
+                    original_spans_before_loss = len(tagged_trace['spans'])
+        
+        # If still not found, skip this trace
+        if original_spans_before_loss is None or original_spans_before_loss <= 1:
+            continue
+        
+        # Calculate difference: reconstructed - original (before data loss)
+        difference = reconstructed_spans - original_spans_before_loss
+        span_differences.append(difference)
+    
+    return span_differences
+
 def extract_checkpoint_from_dir_name(dir_name):
     """Extract checkpoint distance from directory name (e.g., 'tagged-hash-3-reconstructed' -> 3)."""
     # Remove suffixes
@@ -113,10 +177,7 @@ def extract_type_from_dir_name(dir_name):
 def aggregate_data_by_checkpoint(metadata_dir):
     """Load all metadata files from *-reconstructed directories and aggregate by checkpoint distance.
     
-    Note: We only need reconstructed metadata as it contains:
-    - Ancestry data size (calculated from original trace before data loss)
-    - Reconnection results (for FPR calculation)
-    - Checkpoint distance
+    Also loads original tagged trace files to get true original span counts (before data loss).
     """
     metadata_dir_path = Path(metadata_dir)
     
@@ -124,9 +185,36 @@ def aggregate_data_by_checkpoint(metadata_dir):
         'ancestry_sizes': [],
         'ancestry_sizes_per_span': [],
         'fpr_values': [],
+        'reconnection_rates': [],
+        'span_differences': [],  # reconstructed_spans - original_spans (before data loss)
         'source': [],
         'types': []  # Track hash vs bloom
     })
+    
+    # First, build a lookup of original span counts from tagged trace files
+    original_span_counts = {}
+    # Find tagged directories (not lossy or reconstructed)
+    tagged_dirs = [d for d in metadata_dir_path.iterdir() 
+                   if d.is_dir() and d.name.startswith('tagged-') 
+                   and not d.name.endswith('-lossy') and not d.name.endswith('-reconstructed')]
+    
+    for tagged_dir in tagged_dirs:
+        trace_files = list(tagged_dir.glob('*.json'))
+        for trace_file in trace_files:
+            try:
+                with open(trace_file) as f:
+                    trace_data = json.load(f)
+                # Jaeger format: data[0].spans
+                if 'data' in trace_data and trace_data['data']:
+                    for trace in trace_data['data']:
+                        trace_id = trace.get('traceID', '')
+                        spans = trace.get('spans', [])
+                        if trace_id and len(spans) > 0:
+                            original_span_counts[trace_id] = len(spans)
+            except Exception as e:
+                print(f"Warning: Error loading trace file {trace_file}: {e}")
+    
+    print(f"Loaded original span counts for {len(original_span_counts)} traces from tagged files")
     
     # Find all directories matching the pattern
     reconstructed_dirs = list(metadata_dir_path.glob('*-reconstructed'))
@@ -145,11 +233,15 @@ def aggregate_data_by_checkpoint(metadata_dir):
                 if checkpoint_from_metadata > 0:
                     checkpoint = checkpoint_from_metadata
                 fpr_values = calculate_false_positive_rate(reconstructed_metadata)
+                reconnection_rates = calculate_reconnection_rates(reconstructed_metadata)
+                span_differences = calculate_span_differences(reconstructed_metadata, original_span_counts)
                 
                 if checkpoint > 0:  # Only include if checkpoint distance was set
                     aggregated[checkpoint]['ancestry_sizes'].extend(ancestry_sizes)
                     aggregated[checkpoint]['ancestry_sizes_per_span'].extend(ancestry_sizes_per_span)
                     aggregated[checkpoint]['fpr_values'].extend(fpr_values)
+                    aggregated[checkpoint]['reconnection_rates'].extend(reconnection_rates)
+                    aggregated[checkpoint]['span_differences'].extend(span_differences)
                     aggregated[checkpoint]['source'].extend(['reconstructed'] * len(ancestry_sizes))
                     aggregated[checkpoint]['types'].extend([ancestry_type] * len(ancestry_sizes))
                 else:
@@ -311,6 +403,149 @@ def plot_checkpoint_vs_ancestry_per_span_with_fpr(aggregated_data, output_file='
     print(f"Plot saved to {output_file}")
     plt.close()
 
+def plot_checkpoint_vs_reconnection_rate(aggregated_data, output_file='checkpoint_reconnection_rate.png'):
+    """
+    Plot checkpoint distance (x-axis) vs reconnection rate (y-axis) 
+    with distribution visualization, differentiated by hash/bloom type.
+    Shows trend lines connecting averages across checkpoint distances.
+    """
+    # Organize data by checkpoint and type
+    hash_by_checkpoint = defaultdict(list)
+    bloom_by_checkpoint = defaultdict(list)
+    
+    for checkpoint, data in sorted(aggregated_data.items()):
+        for reconnection_rate, ancestry_type in zip(data['reconnection_rates'], data['types']):
+            if ancestry_type == 'hash':
+                hash_by_checkpoint[checkpoint].append(reconnection_rate)
+            elif ancestry_type == 'bloom':
+                bloom_by_checkpoint[checkpoint].append(reconnection_rate)
+    
+    if not hash_by_checkpoint and not bloom_by_checkpoint:
+        print("No data to plot. Make sure metadata files contain reconnection_rate.")
+        return
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot hash data
+    if hash_by_checkpoint:
+        hash_checkpoints = sorted(hash_by_checkpoint.keys())
+        hash_means = [np.mean(hash_by_checkpoint[cp]) for cp in hash_checkpoints]
+        hash_stds = [np.std(hash_by_checkpoint[cp]) for cp in hash_checkpoints]
+        
+        # Plot individual data points with jitter
+        for cp in hash_checkpoints:
+            y_data = hash_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='blue', marker='o')
+        
+        # Plot mean line with error bars
+        ax.errorbar(hash_checkpoints, hash_means, yerr=hash_stds,
+                   marker='o', linestyle='-', linewidth=2, markersize=8,
+                   color='blue', label='Hash', capsize=5, capthick=2)
+    
+    # Plot bloom data
+    if bloom_by_checkpoint:
+        bloom_checkpoints = sorted(bloom_by_checkpoint.keys())
+        bloom_means = [np.mean(bloom_by_checkpoint[cp]) for cp in bloom_checkpoints]
+        bloom_stds = [np.std(bloom_by_checkpoint[cp]) for cp in bloom_checkpoints]
+        
+        # Plot individual data points with jitter
+        for cp in bloom_checkpoints:
+            y_data = bloom_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='red', marker='^')
+        
+        # Plot mean line with error bars
+        ax.errorbar(bloom_checkpoints, bloom_means, yerr=bloom_stds,
+                   marker='^', linestyle='-', linewidth=2, markersize=8,
+                   color='red', label='Bloom', capsize=5, capthick=2)
+    
+    # Add legend
+    ax.legend(loc='best', fontsize=11)
+    
+    # Set labels and title
+    ax.set_xlabel('Checkpoint Distance', fontsize=12)
+    ax.set_ylabel('Reconnection Rate (%)', fontsize=12)
+    ax.set_title('Checkpoint Distance vs Reconnection Rate\n(with distribution)', fontsize=14)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Plot saved to {output_file}")
+    plt.close()
+
+def plot_checkpoint_vs_span_difference(aggregated_data, output_file='checkpoint_span_difference.png'):
+    """
+    Plot checkpoint distance (x-axis) vs span difference (reconstructed - original) (y-axis) 
+    with distribution visualization, differentiated by hash/bloom type.
+    Shows trend lines connecting averages across checkpoint distances.
+    """
+    # Organize data by checkpoint and type
+    hash_by_checkpoint = defaultdict(list)
+    bloom_by_checkpoint = defaultdict(list)
+    
+    for checkpoint, data in sorted(aggregated_data.items()):
+        for span_diff, ancestry_type in zip(data['span_differences'], data['types']):
+            if ancestry_type == 'hash':
+                hash_by_checkpoint[checkpoint].append(span_diff)
+            elif ancestry_type == 'bloom':
+                bloom_by_checkpoint[checkpoint].append(span_diff)
+    
+    if not hash_by_checkpoint and not bloom_by_checkpoint:
+        print("No data to plot. Make sure metadata files contain span count information.")
+        return
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot hash data
+    if hash_by_checkpoint:
+        hash_checkpoints = sorted(hash_by_checkpoint.keys())
+        hash_means = [np.mean(hash_by_checkpoint[cp]) for cp in hash_checkpoints]
+        hash_stds = [np.std(hash_by_checkpoint[cp]) for cp in hash_checkpoints]
+        
+        # Plot individual data points with jitter
+        for cp in hash_checkpoints:
+            y_data = hash_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='blue', marker='o')
+        
+        # Plot mean line with error bars
+        ax.errorbar(hash_checkpoints, hash_means, yerr=hash_stds,
+                   marker='o', linestyle='-', linewidth=2, markersize=8,
+                   color='blue', label='Hash', capsize=5, capthick=2)
+    
+    # Plot bloom data
+    if bloom_by_checkpoint:
+        bloom_checkpoints = sorted(bloom_by_checkpoint.keys())
+        bloom_means = [np.mean(bloom_by_checkpoint[cp]) for cp in bloom_checkpoints]
+        bloom_stds = [np.std(bloom_by_checkpoint[cp]) for cp in bloom_checkpoints]
+        
+        # Plot individual data points with jitter
+        for cp in bloom_checkpoints:
+            y_data = bloom_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='red', marker='^')
+        
+        # Plot mean line with error bars
+        ax.errorbar(bloom_checkpoints, bloom_means, yerr=bloom_stds,
+                   marker='^', linestyle='-', linewidth=2, markersize=8,
+                   color='red', label='Bloom', capsize=5, capthick=2)
+    
+    # Add legend
+    ax.legend(loc='best', fontsize=11)
+    
+    # Set labels and title
+    ax.set_xlabel('Checkpoint Distance', fontsize=12)
+    ax.set_ylabel('Span Difference (Reconstructed - Original)', fontsize=12)
+    ax.set_title('Checkpoint Distance vs Span Difference\n(with distribution)', fontsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Plot saved to {output_file}")
+    plt.close()
+
 def main():
     """Main function."""
     # Default data directory
@@ -341,6 +576,8 @@ def main():
     print("\nGenerating plots...")
     plot_checkpoint_vs_ancestry_with_fpr(aggregated_data)
     plot_checkpoint_vs_ancestry_per_span_with_fpr(aggregated_data)
+    plot_checkpoint_vs_reconnection_rate(aggregated_data)
+    plot_checkpoint_vs_span_difference(aggregated_data)
     
     print("\nDone!")
 

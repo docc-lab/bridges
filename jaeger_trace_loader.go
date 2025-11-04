@@ -216,14 +216,23 @@ func calculateAncestryDataSize(trace *JaegerTrace) int64 {
 							}
 						}
 					} else if ancestryMode == "bloom" {
-						// For bloom mode: count the actual decoded binary size
-						// The string is base64-encoded, so decode it to get actual size
-						decoded, err := base64.StdEncoding.DecodeString(str)
+						// For bloom mode: count the actual bit array size (capacity in bytes)
+						// Deserialize the bloom filter to get its capacity
+						bf, err := deserializeBloomFilter(str)
 						if err == nil {
-							totalSize += int64(len(decoded))
+							// Capacity is in bits, convert to bytes (round up)
+							capacityBits := bf.Cap()
+							capacityBytes := int64((capacityBits + 7) / 8) // Ceiling division
+							totalSize += capacityBytes
 						} else {
-							// If decoding fails, fall back to string size (though this shouldn't happen)
-							totalSize += int64(len(str))
+							// If deserialization fails, fall back to decoded Gob size
+							decoded, err := base64.StdEncoding.DecodeString(str)
+							if err == nil {
+								totalSize += int64(len(decoded))
+							} else {
+								// Last resort: count as string size
+								totalSize += int64(len(str))
+							}
 						}
 					} else {
 						// Unknown mode, count as string
@@ -1336,11 +1345,13 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 	}
 	
 	// Find orphaned spans (spans with missing parents)
+	// A span is orphaned if it has CHILD_OF or FOLLOWS_FROM references but none of them point to existing spans
 	var orphanedSpans []JaegerSpan
 	for _, span := range trace.Spans {
 		hasValidParent := false
 		for _, ref := range span.References {
-			if ref.RefType == "CHILD_OF" {
+			// Check both CHILD_OF and FOLLOWS_FROM as valid parent relationships
+			if ref.RefType == "CHILD_OF" || ref.RefType == "FOLLOWS_FROM" {
 				if spanIDMap[ref.SpanID] {
 					hasValidParent = true
 					break
@@ -1378,7 +1389,6 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
         
         // Try to get ancestry from the orphan's own tags
         mode, payload := getAncestryFromTags(orphanedSpan)
-        donorSpan := orphanedSpan
         
         // If orphan doesn't have ancestry data, find nearest descendant
         if payload == "" {
@@ -1402,7 +1412,6 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
                 }
             } else {
                 mode, payload = getAncestryFromTags(*descendant)
-                donorSpan = *descendant
                 fmt.Printf("    RECONNECTION - Orphan %s: using ancestry from descendant %s (mode=%s)\n", orphanedSpan.SpanID, descendant.SpanID, mode)
             }
         } else {
@@ -1421,11 +1430,21 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 			}
 
 			// Find the missing parent ID
+			// Check CHILD_OF first, then FOLLOWS_FROM as fallback
 			var missingParentID string
 			for _, ref := range orphanedSpan.References {
 				if ref.RefType == "CHILD_OF" && !spanIDMap[ref.SpanID] {
 					missingParentID = ref.SpanID
 					break
+				}
+			}
+			// If no CHILD_OF missing parent, check FOLLOWS_FROM
+			if missingParentID == "" {
+				for _, ref := range orphanedSpan.References {
+					if ref.RefType == "FOLLOWS_FROM" && !spanIDMap[ref.SpanID] {
+						missingParentID = ref.SpanID
+						break
+					}
 				}
 			}
             if missingParentID == "" {
@@ -1452,7 +1471,8 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 				for i := range reconnectedTrace.Spans {
 					if reconnectedTrace.Spans[i].SpanID == orphanedSpan.SpanID {
 						for j := range reconnectedTrace.Spans[i].References {
-							if reconnectedTrace.Spans[i].References[j].RefType == "CHILD_OF" && reconnectedTrace.Spans[i].References[j].SpanID == missingParentID {
+							// Update both CHILD_OF and FOLLOWS_FROM references
+							if (reconnectedTrace.Spans[i].References[j].RefType == "CHILD_OF" || reconnectedTrace.Spans[i].References[j].RefType == "FOLLOWS_FROM") && reconnectedTrace.Spans[i].References[j].SpanID == missingParentID {
 								reconnectedTrace.Spans[i].References[j].SpanID = bestAncestor
 							}
 						}
@@ -1471,50 +1491,52 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 
         if mode == "hash" {
 			// Parse ancestry array
+            // Ancestry format: [nearest_high_priority_ancestor, ..., parent]
+            // Does NOT include the current span
             parts := strings.Split(payload, ",")
             fmt.Printf("    RECONNECTION - Orphan %s: hash parts=%v\n", orphanedSpan.SpanID, parts)
-            // Do not require len>=2; proceed and validate below
-			// Locate orphan in ancestry chain
-			idx := -1
-			for i := len(parts) - 1; i >= 0; i-- {
-				if parts[i] == orphanedSpan.SpanID {
-					idx = i
-					break
-				}
-			}
-            if idx <= 0 { // not found or no parent
-                if idx == -1 {
-                    fmt.Printf("    RECONNECTION - Orphan %s: not found in ancestry array (donor=%s); skipping\n", orphanedSpan.SpanID, donorSpan.SpanID)
-                } else {
-                    fmt.Printf("    RECONNECTION - Orphan %s: found at idx=0 (no parent); skipping\n", orphanedSpan.SpanID)
-                }
+            
+            if len(parts) == 0 {
+                fmt.Printf("    RECONNECTION - Orphan %s: empty ancestry array; skipping\n", orphanedSpan.SpanID)
                 continue
             }
-			parentChain := parts[:idx] // up to but not including orphan
-			// Find deepest existing ancestor in chain
-			anchorIdx := -1
-			for i := len(parentChain) - 1; i >= 0; i-- {
-				if spanIDMap[parentChain[i]] {
-					anchorIdx = i
-					break
-				}
-			}
-            fmt.Printf("    RECONNECTION - Orphan %s: anchorIdx=%d anchorSpan=%s\n", orphanedSpan.SpanID, anchorIdx, func() string { if anchorIdx>=0 { return parentChain[anchorIdx] } ; return "" }())
-            // Determine original missing parent before adding synthetic spans
-            originalSpanSet := make(map[string]bool, len(spanIDMap))
-            for k, v := range spanIDMap { originalSpanSet[k] = v }
-            originalParent := ""
-            for _, ref := range orphanedSpan.References {
-                if ref.RefType == "CHILD_OF" && !originalSpanSet[ref.SpanID] {
-                    originalParent = ref.SpanID
+            
+            // The parent is always the last element in ancestry (since current span is not included)
+            parentChain := parts // entire ancestry chain
+            // Find deepest existing ancestor in chain
+            anchorIdx := -1
+            for i := len(parentChain) - 1; i >= 0; i-- {
+                if spanIDMap[parentChain[i]] {
+                    anchorIdx = i
                     break
                 }
             }
+            fmt.Printf("    RECONNECTION - Orphan %s: anchorIdx=%d anchorSpan=%s\n", orphanedSpan.SpanID, anchorIdx, func() string { if anchorIdx>=0 { return parentChain[anchorIdx] } ; return "" }())
+            
+			// Determine original missing parent before adding synthetic spans
+			originalSpanSet := make(map[string]bool, len(spanIDMap))
+			for k, v := range spanIDMap { originalSpanSet[k] = v }
+			originalParent := ""
+			// Check CHILD_OF first, then FOLLOWS_FROM as fallback
+			for _, ref := range orphanedSpan.References {
+				if ref.RefType == "CHILD_OF" && !originalSpanSet[ref.SpanID] {
+					originalParent = ref.SpanID
+					break
+				}
+			}
+			// If no CHILD_OF missing parent, check FOLLOWS_FROM
+			if originalParent == "" {
+				for _, ref := range orphanedSpan.References {
+					if ref.RefType == "FOLLOWS_FROM" && !originalSpanSet[ref.SpanID] {
+						originalParent = ref.SpanID
+						break
+					}
+				}
+			}
             // If originalParent not found in references, derive it from ancestry chain
-            // (This can happen when a previous orphan already synthesized the missing parent)
-            if originalParent == "" && idx > 0 {
-                // The parent should be the span immediately before the orphan in the ancestry chain
-                candidateParent := parts[idx-1]
+            // Parent is the last element in ancestry (since current span is not included)
+            if originalParent == "" && len(parts) > 0 {
+                candidateParent := parts[len(parts)-1]
                 if !originalSpanSet[candidateParent] {
                     originalParent = candidateParent
                     fmt.Printf("    RECONNECTION - Orphan %s: inferred missing parent %s from ancestry chain (not in references)\n", orphanedSpan.SpanID, originalParent)
@@ -1553,8 +1575,8 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 			parentAlreadyExists := spanIDMap[originalParent]
 			
 			// Determine which spans need to be synthesized
-			// parentChain is parts[:idx], so originalParent should be at parentChain[idx-1] (which is parts[idx-1])
-			parentIdxInChain := idx - 1
+			// parentChain is the entire ancestry (parts), so originalParent should be at parentChain[len-1]
+			parentIdxInChain := len(parentChain) - 1
 			var missing []string
 			
 			if parentAlreadyExists && parentIdxInChain >= anchorIdx {
@@ -1606,7 +1628,8 @@ func (loader *JaegerTraceLoader) ReconnectTrace(trace *JaegerTrace) *Reconnectio
 			for i := range reconnectedTrace.Spans {
 				if reconnectedTrace.Spans[i].SpanID == orphanedSpan.SpanID {
 					for j := range reconnectedTrace.Spans[i].References {
-						if reconnectedTrace.Spans[i].References[j].RefType == "CHILD_OF" && reconnectedTrace.Spans[i].References[j].SpanID == originalParent {
+						// Update both CHILD_OF and FOLLOWS_FROM references
+						if (reconnectedTrace.Spans[i].References[j].RefType == "CHILD_OF" || reconnectedTrace.Spans[i].References[j].RefType == "FOLLOWS_FROM") && reconnectedTrace.Spans[i].References[j].SpanID == originalParent {
 							reconnectedTrace.Spans[i].References[j].SpanID = lastParentID
 						}
 					}

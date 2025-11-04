@@ -180,6 +180,19 @@ func (tp *TraceProcessor) processSpanGroup(spans []*OTelSpan) error {
 			parentMap[spanID] = parentID
 		}
 	}
+	
+	// Check for missing parent references after all spans are added
+	missingParentCount := 0
+	for spanID, parentID := range parentMap {
+		if _, exists := spanMap[parentID]; !exists {
+			missingParentCount++
+			fmt.Printf("  ERROR: Span %s references parent %s that does not exist in this trace\n", spanID, parentID)
+		}
+	}
+	
+	if missingParentCount > 0 {
+		fmt.Printf("  Total missing parent references: %d\n", missingParentCount)
+	}
 
 	// Calculate depth for each span from root
 	depthMap := make(map[string]int)
@@ -230,7 +243,8 @@ func (tp *TraceProcessor) processSpanGroup(spans []*OTelSpan) error {
 		}
 	}
 
-	// Process each span to set priority and ancestry tags
+	// First pass: mark all spans with their priority
+	priorityMap := make(map[string]bool) // spanID -> isHighPriority
 	for spanID, span := range spanMap {
 		depth := depthMap[spanID]
 		parentID := tp.getParentSpanID(span)
@@ -244,20 +258,106 @@ func (tp *TraceProcessor) processSpanGroup(spans []*OTelSpan) error {
 		} else if tp.PriorityDepth > 0 && depth%tp.PriorityDepth == 0 {
 			highPriority = true
 		}
-
+		
+		priorityMap[spanID] = highPriority
+		
 		// Set priority tag
 		if highPriority {
 			tp.setTag(span, "prio", "high")
 		} else {
 			tp.setTag(span, "prio", "low")
 		}
+	}
 
-		// If high priority, set ancestry tags
-		if highPriority {
+	// Second pass: build ancestry paths that reset at each high priority span
+	// Ancestry includes only spans from the last high priority ancestor (or root) to current span
+	// Reconstruction code expects: ancestry includes the span itself as last element, and parent is at idx-1
+	var findLastHighPriorityAncestor func(spanID string, skipSelf bool) string
+	findLastHighPriorityAncestor = func(spanID string, skipSelf bool) string {
+		// Check if span exists in spanMap
+		span, exists := spanMap[spanID]
+		if !exists || span == nil {
+			// Span not found, return empty (shouldn't happen, but handle gracefully)
+			fmt.Printf("  ERROR: findLastHighPriorityAncestor: spanID %s not found in spanMap\n", spanID)
+			return ""
+		}
+		// If skipSelf is false and this span is high priority, return it
+		// If skipSelf is true, we want to skip this span and find the previous high priority
+		if !skipSelf && priorityMap[spanID] {
+			return spanID
+		}
+		// Go up to parent
+		parentID := tp.getParentSpanID(span)
+		if parentID == "" {
+			// Reached root, return it (root is always considered high priority)
+			return spanID
+		}
+		// Check if parent exists before recursing
+		if _, exists := spanMap[parentID]; !exists {
+			fmt.Printf("  ERROR: findLastHighPriorityAncestor: spanID %s references missing parent %s\n", spanID, parentID)
+			// Return current spanID as fallback (treat as root)
+			return spanID
+		}
+		// Recursively find in parent (always check parent, don't skip it)
+		return findLastHighPriorityAncestor(parentID, false)
+	}
+	
+	var buildPathFromAncestor func(spanID string, ancestorID string) []string
+	buildPathFromAncestor = func(spanID string, ancestorID string) []string {
+		if spanID == ancestorID {
+			return []string{spanID}
+		}
+		// Check if span exists in spanMap
+		span, exists := spanMap[spanID]
+		if !exists || span == nil {
+			// Span not found, return empty (shouldn't happen, but handle gracefully)
+			fmt.Printf("  ERROR: buildPathFromAncestor: spanID %s not found in spanMap\n", spanID)
+			return []string{}
+		}
+		parentID := tp.getParentSpanID(span)
+		if parentID == "" {
+			// Shouldn't happen, but handle gracefully
+			return []string{spanID}
+		}
+		// Check if parent exists before recursing
+		if _, exists := spanMap[parentID]; !exists {
+			fmt.Printf("  ERROR: buildPathFromAncestor: spanID %s references missing parent %s\n", spanID, parentID)
+			return []string{spanID}
+		}
+		parentPath := buildPathFromAncestor(parentID, ancestorID)
+		return append(parentPath, spanID)
+	}
+	
+	buildResetPath := func(spanID string) []string {
+		// Check if span exists in spanMap
+		span, exists := spanMap[spanID]
+		if !exists || span == nil {
+			// Span not found, return empty
+			return []string{}
+		}
+		// Find the last high priority ancestor (or root), skipping current span
+		ancestorID := findLastHighPriorityAncestor(spanID, true)
+		if ancestorID == "" {
+			// Couldn't find ancestor, return empty
+			return []string{}
+		}
+		// Get parent of current span
+		parentID := tp.getParentSpanID(span)
+		if parentID == "" {
+			// This is a root, no ancestry needed (or return empty)
+			return []string{}
+		}
+		// Build path from ancestor to parent (NOT including current span)
+		return buildPathFromAncestor(parentID, ancestorID)
+	}
+
+	// Process each span to set ancestry tags (only for high priority)
+	for spanID, span := range spanMap {
+		if priorityMap[spanID] {
 			tp.setTag(span, "ancestry_mode", tp.AncestryMode)
 			
-			// Build ancestry data based on mode
-			path := pathMap[spanID]
+			// Build ancestry data with reset path (from last high priority ancestor to this span)
+			path := buildResetPath(spanID)
 			var ancestryData string
 			
 			if tp.AncestryMode == "bloom" {
@@ -304,11 +404,19 @@ func (tp *TraceProcessor) getSpanID(span *OTelSpan) string {
 }
 
 // getParentSpanID gets parent span ID from span
-// Checks References array for CHILD_OF relationships (Jaeger format) or direct parentSpanID field
+// Checks References array for CHILD_OF or FOLLOWS_FROM relationships (Jaeger format) or direct parentSpanID field
+// FOLLOWS_FROM is used as a fallback if CHILD_OF is not present, as long as the referenced span exists
 func (tp *TraceProcessor) getParentSpanID(span *OTelSpan) string {
-	// First check References array for CHILD_OF (Jaeger format)
+	// First check References array for CHILD_OF (Jaeger format) - highest priority
 	for _, ref := range span.References {
 		if ref.RefType == "CHILD_OF" {
+			return ref.SpanID
+		}
+	}
+	// Fallback to FOLLOWS_FROM if CHILD_OF not found
+	// Note: We use FOLLOWS_FROM as a valid parent relationship
+	for _, ref := range span.References {
+		if ref.RefType == "FOLLOWS_FROM" {
 			return ref.SpanID
 		}
 	}
@@ -358,10 +466,16 @@ func (tp *TraceProcessor) setTag(span *OTelSpan, key string, value interface{}) 
 
 // buildBloomFilterAncestry creates a bloom filter containing all span IDs in the path and serializes it
 func (tp *TraceProcessor) buildBloomFilterAncestry(path []string) string {
-	// Create bloom filter with same parameters as priority_processor.go
-	bf := bloom.New(10, 7)
+	// Create bloom filter sized for depth elements with 1% false positive rate
+	// Use PriorityDepth as the expected number of elements (worst case ancestry path length)
+	depth := uint(tp.PriorityDepth)
+	if depth == 0 {
+		// Fallback to reasonable default if depth not set
+		depth = 10
+	}
+	bf := bloom.NewWithEstimates(depth, 0.01)
 	
-	// Add all span IDs from root to current span
+	// Add all span IDs from the ancestry path
 	for _, spanID := range path {
 		bf.Add([]byte(spanID))
 	}

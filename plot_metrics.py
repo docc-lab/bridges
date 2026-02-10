@@ -171,8 +171,90 @@ def extract_type_from_dir_name(dir_name):
     # Split by hyphen: tagged-<type>-<depth>
     parts = base.split('-')
     if len(parts) >= 3 and parts[0] == 'tagged':
-        return parts[1]  # Return 'hash' or 'bloom'
+        return parts[1]  # Return 'hash', 'bloom', or 'hybrid'
     return 'unknown'
+
+def calculate_total_trace_sizes(metadata_dir_path):
+    """
+    Calculate total trace sizes from tagged trace files.
+    Returns a dict: {(trace_id, checkpoint, type): {'size_bytes': int, 'num_spans': int}}
+    Size is calculated as the JSON serialized size of each trace.
+    Note: Trace sizes vary by checkpoint distance AND ancestry mode because ancestry tags differ.
+    """
+    trace_sizes = {}
+    
+    # Find all tagged directories (not lossy or reconstructed)
+    tagged_dirs = [d for d in metadata_dir_path.iterdir() 
+                   if d.is_dir() and d.name.startswith('tagged-') 
+                   and not d.name.endswith('-lossy') and not d.name.endswith('-reconstructed')]
+    
+    for tagged_dir in tagged_dirs:
+        checkpoint = extract_checkpoint_from_dir_name(tagged_dir.name)
+        ancestry_type = extract_type_from_dir_name(tagged_dir.name)
+        
+        trace_files = list(tagged_dir.glob('*.json'))
+        for trace_file in trace_files:
+            try:
+                # Load trace data
+                with open(trace_file) as f:
+                    trace_data = json.load(f)
+                
+                # Jaeger format: data[0].spans
+                if 'data' in trace_data and trace_data['data']:
+                    for trace in trace_data['data']:
+                        trace_id = trace.get('traceID', '')
+                        spans = trace.get('spans', [])
+                        if trace_id and len(spans) > 0:
+                            # Calculate JSON serialized size of the full trace object
+                            # Use the entire trace object as-is from the JSON file
+                            # This includes all fields: traceID, spans, processes, warnings, etc.
+                            trace_size = len(json.dumps(trace).encode('utf-8'))
+                            
+                            # Store trace size info keyed by (trace_id, checkpoint, type)
+                            # Trace sizes differ by checkpoint AND mode because ancestry tags differ
+                            key = (trace_id, checkpoint, ancestry_type)
+                            trace_sizes[key] = {
+                                'size_bytes': trace_size,
+                                'num_spans': len(spans)
+                            }
+            except Exception as e:
+                print(f"Warning: Error loading trace file {trace_file}: {e}")
+    
+    return trace_sizes
+
+def calculate_original_trace_sizes(metadata_dir_path):
+    """
+    Calculate total trace sizes from original untagged trace files (data/uber/*.json).
+    Returns a list of average span sizes (total trace size / num spans) for original traces.
+    """
+    original_span_sizes = []
+    
+    # Find the uber directory
+    uber_dir = metadata_dir_path / 'uber'
+    if not uber_dir.exists():
+        return original_span_sizes
+    
+    trace_files = list(uber_dir.glob('*.json'))
+    for trace_file in trace_files:
+        try:
+            # Load trace data
+            with open(trace_file) as f:
+                trace_data = json.load(f)
+            
+            # Jaeger format: data[0].spans
+            if 'data' in trace_data and trace_data['data']:
+                for trace in trace_data['data']:
+                    spans = trace.get('spans', [])
+                    if len(spans) > 0:
+                        # Calculate JSON serialized size of the full trace object
+                        trace_size = len(json.dumps(trace).encode('utf-8'))
+                        # Calculate average: total size / number of spans
+                        avg_size = trace_size / len(spans) if len(spans) > 0 else 0
+                        original_span_sizes.append(avg_size)
+        except Exception as e:
+            print(f"Warning: Error loading original trace file {trace_file}: {e}")
+    
+    return original_span_sizes
 
 def aggregate_data_by_checkpoint(metadata_dir):
     """Load all metadata files from *-reconstructed directories and aggregate by checkpoint distance.
@@ -187,8 +269,9 @@ def aggregate_data_by_checkpoint(metadata_dir):
         'fpr_values': [],
         'reconnection_rates': [],
         'span_differences': [],  # reconstructed_spans - original_spans (before data loss)
+        'total_span_sizes': [],  # total trace size / num spans (bytes per span)
         'source': [],
-        'types': []  # Track hash vs bloom
+        'types': []  # Track hash vs bloom vs hybrid
     })
     
     # First, build a lookup of original span counts from tagged trace files
@@ -216,6 +299,11 @@ def aggregate_data_by_checkpoint(metadata_dir):
     
     print(f"Loaded original span counts for {len(original_span_counts)} traces from tagged files")
     
+    # Calculate total trace sizes from tagged files
+    print("Calculating total trace sizes from tagged files...")
+    trace_sizes = calculate_total_trace_sizes(metadata_dir_path)
+    print(f"Loaded total trace sizes for {len(trace_sizes)} traces")
+    
     # Find all directories matching the pattern
     reconstructed_dirs = list(metadata_dir_path.glob('*-reconstructed'))
     
@@ -236,12 +324,38 @@ def aggregate_data_by_checkpoint(metadata_dir):
                 reconnection_rates = calculate_reconnection_rates(reconstructed_metadata)
                 span_differences = calculate_span_differences(reconstructed_metadata, original_span_counts)
                 
+                # Calculate total span sizes for traces in this metadata
+                # CRITICAL: Must match exactly the same traces as ancestry_sizes, in the same order
+                # Trace sizes vary by checkpoint distance AND ancestry mode because ancestry tags differ
+                total_span_sizes = []
+                metadata_traces = reconstructed_metadata.get('traces', [])
+                for trace in metadata_traces:
+                    # Apply same filter as calculate_ancestry_metrics (must match exactly)
+                    original_spans = trace.get('original_spans', 0)
+                    reconstructed_spans = trace.get('reconstructed_spans', 0)
+                    if original_spans <= 1 and reconstructed_spans <= 1:
+                        continue
+                    
+                    trace_id = trace.get('trace_id', '')
+                    # Look up trace size by (trace_id, checkpoint, ancestry_type) since sizes differ by both
+                    key = (trace_id, checkpoint, ancestry_type)
+                    if key in trace_sizes:
+                        trace_info = trace_sizes[key]
+                        # Calculate average: total size / number of spans
+                        avg_size = trace_info['size_bytes'] / trace_info['num_spans'] if trace_info['num_spans'] > 0 else 0
+                        total_span_sizes.append(avg_size)
+                    else:
+                        # Trace not found for this checkpoint/type - append 0 to maintain alignment with ancestry_sizes
+                        # This ensures total_span_sizes has the same length as ancestry_sizes
+                        total_span_sizes.append(0.0)
+                
                 if checkpoint > 0:  # Only include if checkpoint distance was set
                     aggregated[checkpoint]['ancestry_sizes'].extend(ancestry_sizes)
                     aggregated[checkpoint]['ancestry_sizes_per_span'].extend(ancestry_sizes_per_span)
                     aggregated[checkpoint]['fpr_values'].extend(fpr_values)
                     aggregated[checkpoint]['reconnection_rates'].extend(reconnection_rates)
                     aggregated[checkpoint]['span_differences'].extend(span_differences)
+                    aggregated[checkpoint]['total_span_sizes'].extend(total_span_sizes)
                     aggregated[checkpoint]['source'].extend(['reconstructed'] * len(ancestry_sizes))
                     aggregated[checkpoint]['types'].extend([ancestry_type] * len(ancestry_sizes))
                 else:
@@ -249,26 +363,39 @@ def aggregate_data_by_checkpoint(metadata_dir):
             except Exception as e:
                 print(f"Error loading {metadata_path}: {e}")
     
+    # Calculate original trace sizes (no bridges) from data/uber/*.json
+    print("Calculating original trace sizes (no bridges) from data/uber...")
+    original_span_sizes = calculate_original_trace_sizes(metadata_dir_path)
+    if original_span_sizes:
+        aggregated['original'] = {
+            'total_span_sizes': original_span_sizes,
+            'types': ['original'] * len(original_span_sizes)
+        }
+        print(f"Loaded {len(original_span_sizes)} original trace sizes")
+    
     return aggregated
 
-def plot_checkpoint_vs_ancestry_with_fpr(aggregated_data, output_file='checkpoint_ancestry_fpr.png'):
+def plot_checkpoint_vs_ancestry_with_fpr(aggregated_data, output_file='checkpoint_ancestry_fpr.pdf'):
     """
     Plot checkpoint distance (x-axis) vs average ancestry data size (y-axis) 
-    with distribution visualization, differentiated by hash/bloom type.
+    with distribution visualization, differentiated by hash/bloom/hybrid type.
     Shows trend lines connecting averages across checkpoint distances.
     """
     # Organize data by checkpoint and type
     hash_by_checkpoint = defaultdict(list)
     bloom_by_checkpoint = defaultdict(list)
+    hybrid_by_checkpoint = defaultdict(list)
     
-    for checkpoint, data in sorted(aggregated_data.items()):
+    for checkpoint, data in sorted([(k, v) for k, v in aggregated_data.items() if isinstance(k, int)]):
         for ancestry_size, ancestry_type in zip(data['ancestry_sizes'], data['types']):
             if ancestry_type == 'hash':
                 hash_by_checkpoint[checkpoint].append(ancestry_size)
             elif ancestry_type == 'bloom':
                 bloom_by_checkpoint[checkpoint].append(ancestry_size)
+            elif ancestry_type == 'hybrid':
+                hybrid_by_checkpoint[checkpoint].append(ancestry_size)
     
-    if not hash_by_checkpoint and not bloom_by_checkpoint:
+    if not hash_by_checkpoint and not bloom_by_checkpoint and not hybrid_by_checkpoint:
         print("No data to plot. Make sure metadata files contain checkpoint_distance and ancestry data.")
         return
     
@@ -311,7 +438,26 @@ def plot_checkpoint_vs_ancestry_with_fpr(aggregated_data, output_file='checkpoin
         # Plot mean line with error bars
         ax.errorbar(bloom_checkpoints, bloom_means, yerr=bloom_stds,
                    marker='^', linestyle='-', linewidth=2, markersize=8,
-                   color='red', label='Bloom', capsize=5, capthick=2)
+                   color='red', label='Path', capsize=5, capthick=2)
+    
+    # Plot hybrid data
+    if hybrid_by_checkpoint:
+        hybrid_checkpoints = sorted(hybrid_by_checkpoint.keys())
+        hybrid_means = [np.mean(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        hybrid_stds = [np.std(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        
+        # Plot individual data points with distribution
+        for cp in hybrid_checkpoints:
+            y_data = hybrid_by_checkpoint[cp]
+            x_data = [cp] * len(y_data)
+            # Add small jitter for visibility
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in x_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='green', marker='s')
+        
+        # Plot mean line with error bars
+        ax.errorbar(hybrid_checkpoints, hybrid_means, yerr=hybrid_stds,
+                   marker='s', linestyle='-', linewidth=2, markersize=8,
+                   color='green', label='CGP', capsize=5, capthick=2)
     
     # Add legend
     ax.legend(loc='best', fontsize=11)
@@ -327,15 +473,16 @@ def plot_checkpoint_vs_ancestry_with_fpr(aggregated_data, output_file='checkpoin
     print(f"Plot saved to {output_file}")
     plt.close()
 
-def plot_checkpoint_vs_ancestry_per_span_with_fpr(aggregated_data, output_file='checkpoint_ancestry_per_span_fpr.png'):
+def plot_checkpoint_vs_ancestry_per_span_with_fpr(aggregated_data, output_file='checkpoint_ancestry_per_span_fpr.pdf'):
     """
     Plot checkpoint distance (x-axis) vs average ancestry data size per span (y-axis) 
-    with distribution visualization, differentiated by hash/bloom type.
+    with distribution visualization, differentiated by hash/bloom/hybrid type.
     Shows trend lines connecting averages across checkpoint distances.
     """
     # Organize data by checkpoint and type
     hash_by_checkpoint = defaultdict(list)
     bloom_by_checkpoint = defaultdict(list)
+    hybrid_by_checkpoint = defaultdict(list)
     
     for checkpoint, data in sorted(aggregated_data.items()):
         for ancestry_size_per_span, ancestry_type in zip(data['ancestry_sizes_per_span'], data['types']):
@@ -343,8 +490,10 @@ def plot_checkpoint_vs_ancestry_per_span_with_fpr(aggregated_data, output_file='
                 hash_by_checkpoint[checkpoint].append(ancestry_size_per_span)
             elif ancestry_type == 'bloom':
                 bloom_by_checkpoint[checkpoint].append(ancestry_size_per_span)
+            elif ancestry_type == 'hybrid':
+                hybrid_by_checkpoint[checkpoint].append(ancestry_size_per_span)
     
-    if not hash_by_checkpoint and not bloom_by_checkpoint:
+    if not hash_by_checkpoint and not bloom_by_checkpoint and not hybrid_by_checkpoint:
         print("No data to plot. Make sure metadata files contain checkpoint_distance and ancestry data.")
         return
     
@@ -387,7 +536,26 @@ def plot_checkpoint_vs_ancestry_per_span_with_fpr(aggregated_data, output_file='
         # Plot mean line with error bars
         ax.errorbar(bloom_checkpoints, bloom_means, yerr=bloom_stds,
                    marker='^', linestyle='-', linewidth=2, markersize=8,
-                   color='red', label='Bloom', capsize=5, capthick=2)
+                   color='red', label='Path', capsize=5, capthick=2)
+    
+    # Plot hybrid data
+    if hybrid_by_checkpoint:
+        hybrid_checkpoints = sorted(hybrid_by_checkpoint.keys())
+        hybrid_means = [np.mean(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        hybrid_stds = [np.std(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        
+        # Plot individual data points with distribution
+        for cp in hybrid_checkpoints:
+            y_data = hybrid_by_checkpoint[cp]
+            x_data = [cp] * len(y_data)
+            # Add small jitter for visibility
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in x_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='green', marker='s')
+        
+        # Plot mean line with error bars
+        ax.errorbar(hybrid_checkpoints, hybrid_means, yerr=hybrid_stds,
+                   marker='s', linestyle='-', linewidth=2, markersize=8,
+                   color='green', label='CGP', capsize=5, capthick=2)
     
     # Add legend
     ax.legend(loc='best', fontsize=11)
@@ -403,15 +571,16 @@ def plot_checkpoint_vs_ancestry_per_span_with_fpr(aggregated_data, output_file='
     print(f"Plot saved to {output_file}")
     plt.close()
 
-def plot_checkpoint_vs_reconnection_rate(aggregated_data, output_file='checkpoint_reconnection_rate.png'):
+def plot_checkpoint_vs_reconnection_rate(aggregated_data, output_file='checkpoint_reconnection_rate.pdf'):
     """
     Plot checkpoint distance (x-axis) vs reconnection rate (y-axis) 
-    with distribution visualization, differentiated by hash/bloom type.
+    with distribution visualization, differentiated by hash/bloom/hybrid type.
     Shows trend lines connecting averages across checkpoint distances.
     """
     # Organize data by checkpoint and type
     hash_by_checkpoint = defaultdict(list)
     bloom_by_checkpoint = defaultdict(list)
+    hybrid_by_checkpoint = defaultdict(list)
     
     for checkpoint, data in sorted(aggregated_data.items()):
         for reconnection_rate, ancestry_type in zip(data['reconnection_rates'], data['types']):
@@ -419,8 +588,10 @@ def plot_checkpoint_vs_reconnection_rate(aggregated_data, output_file='checkpoin
                 hash_by_checkpoint[checkpoint].append(reconnection_rate)
             elif ancestry_type == 'bloom':
                 bloom_by_checkpoint[checkpoint].append(reconnection_rate)
+            elif ancestry_type == 'hybrid':
+                hybrid_by_checkpoint[checkpoint].append(reconnection_rate)
     
-    if not hash_by_checkpoint and not bloom_by_checkpoint:
+    if not hash_by_checkpoint and not bloom_by_checkpoint and not hybrid_by_checkpoint:
         print("No data to plot. Make sure metadata files contain reconnection_rate.")
         return
     
@@ -458,7 +629,24 @@ def plot_checkpoint_vs_reconnection_rate(aggregated_data, output_file='checkpoin
         # Plot mean line with error bars
         ax.errorbar(bloom_checkpoints, bloom_means, yerr=bloom_stds,
                    marker='^', linestyle='-', linewidth=2, markersize=8,
-                   color='red', label='Bloom', capsize=5, capthick=2)
+                   color='red', label='Path', capsize=5, capthick=2)
+    
+    # Plot hybrid data
+    if hybrid_by_checkpoint:
+        hybrid_checkpoints = sorted(hybrid_by_checkpoint.keys())
+        hybrid_means = [np.mean(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        hybrid_stds = [np.std(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        
+        # Plot individual data points with jitter
+        for cp in hybrid_checkpoints:
+            y_data = hybrid_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='green', marker='s')
+        
+        # Plot mean line with error bars
+        ax.errorbar(hybrid_checkpoints, hybrid_means, yerr=hybrid_stds,
+                   marker='s', linestyle='-', linewidth=2, markersize=8,
+                   color='green', label='CGP', capsize=5, capthick=2)
     
     # Add legend
     ax.legend(loc='best', fontsize=11)
@@ -477,12 +665,13 @@ def plot_checkpoint_vs_reconnection_rate(aggregated_data, output_file='checkpoin
 def plot_checkpoint_vs_span_difference(aggregated_data, output_file='checkpoint_span_difference.png'):
     """
     Plot checkpoint distance (x-axis) vs span difference (reconstructed - original) (y-axis) 
-    with distribution visualization, differentiated by hash/bloom type.
+    with distribution visualization, differentiated by hash/bloom/hybrid type.
     Shows trend lines connecting averages across checkpoint distances.
     """
     # Organize data by checkpoint and type
     hash_by_checkpoint = defaultdict(list)
     bloom_by_checkpoint = defaultdict(list)
+    hybrid_by_checkpoint = defaultdict(list)
     
     for checkpoint, data in sorted(aggregated_data.items()):
         for span_diff, ancestry_type in zip(data['span_differences'], data['types']):
@@ -490,8 +679,10 @@ def plot_checkpoint_vs_span_difference(aggregated_data, output_file='checkpoint_
                 hash_by_checkpoint[checkpoint].append(span_diff)
             elif ancestry_type == 'bloom':
                 bloom_by_checkpoint[checkpoint].append(span_diff)
+            elif ancestry_type == 'hybrid':
+                hybrid_by_checkpoint[checkpoint].append(span_diff)
     
-    if not hash_by_checkpoint and not bloom_by_checkpoint:
+    if not hash_by_checkpoint and not bloom_by_checkpoint and not hybrid_by_checkpoint:
         print("No data to plot. Make sure metadata files contain span count information.")
         return
     
@@ -529,7 +720,24 @@ def plot_checkpoint_vs_span_difference(aggregated_data, output_file='checkpoint_
         # Plot mean line with error bars
         ax.errorbar(bloom_checkpoints, bloom_means, yerr=bloom_stds,
                    marker='^', linestyle='-', linewidth=2, markersize=8,
-                   color='red', label='Bloom', capsize=5, capthick=2)
+                   color='red', label='Path', capsize=5, capthick=2)
+    
+    # Plot hybrid data
+    if hybrid_by_checkpoint:
+        hybrid_checkpoints = sorted(hybrid_by_checkpoint.keys())
+        hybrid_means = [np.mean(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        hybrid_stds = [np.std(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        
+        # Plot individual data points with jitter
+        for cp in hybrid_checkpoints:
+            y_data = hybrid_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='green', marker='s')
+        
+        # Plot mean line with error bars
+        ax.errorbar(hybrid_checkpoints, hybrid_means, yerr=hybrid_stds,
+                   marker='s', linestyle='-', linewidth=2, markersize=8,
+                   color='green', label='CGP', capsize=5, capthick=2)
     
     # Add legend
     ax.legend(loc='best', fontsize=11)
@@ -540,6 +748,98 @@ def plot_checkpoint_vs_span_difference(aggregated_data, output_file='checkpoint_
     ax.set_title('Checkpoint Distance vs Span Difference\n(with distribution)', fontsize=14)
     ax.grid(True, alpha=0.3)
     ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Plot saved to {output_file}")
+    plt.close()
+
+def plot_checkpoint_vs_total_span_size(aggregated_data, output_file='checkpoint_total_span_size.pdf'):
+    """
+    Plot checkpoint distance (x-axis) vs average total span size (total trace size / num spans) (y-axis) 
+    with distribution visualization, differentiated by hash/bloom/hybrid type.
+    Shows trend lines connecting averages across checkpoint distances.
+    """
+    # Organize data by checkpoint and type
+    hash_by_checkpoint = defaultdict(list)
+    bloom_by_checkpoint = defaultdict(list)
+    hybrid_by_checkpoint = defaultdict(list)
+    
+    for checkpoint, data in sorted(aggregated_data.items()):
+        for total_span_size, ancestry_type in zip(data['total_span_sizes'], data['types']):
+            if ancestry_type == 'hash':
+                hash_by_checkpoint[checkpoint].append(total_span_size)
+            elif ancestry_type == 'bloom':
+                bloom_by_checkpoint[checkpoint].append(total_span_size)
+            elif ancestry_type == 'hybrid':
+                hybrid_by_checkpoint[checkpoint].append(total_span_size)
+    
+    if not hash_by_checkpoint and not bloom_by_checkpoint and not hybrid_by_checkpoint:
+        print("No data to plot. Make sure tagged trace files exist and contain trace size information.")
+        return
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot hash data
+    if hash_by_checkpoint:
+        hash_checkpoints = sorted(hash_by_checkpoint.keys())
+        hash_means = [np.mean(hash_by_checkpoint[cp]) for cp in hash_checkpoints]
+        hash_stds = [np.std(hash_by_checkpoint[cp]) for cp in hash_checkpoints]
+        
+        # Plot individual data points with distribution
+        for cp in hash_checkpoints:
+            y_data = hash_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='blue', marker='o')
+        
+        # Plot mean line with error bars
+        ax.errorbar(hash_checkpoints, hash_means, yerr=hash_stds,
+                   marker='o', linestyle='-', linewidth=2, markersize=8,
+                   color='blue', label='Hash', capsize=5, capthick=2)
+    
+    # Plot bloom data
+    if bloom_by_checkpoint:
+        bloom_checkpoints = sorted(bloom_by_checkpoint.keys())
+        bloom_means = [np.mean(bloom_by_checkpoint[cp]) for cp in bloom_checkpoints]
+        bloom_stds = [np.std(bloom_by_checkpoint[cp]) for cp in bloom_checkpoints]
+        
+        # Plot individual data points with distribution
+        for cp in bloom_checkpoints:
+            y_data = bloom_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='red', marker='^')
+        
+        # Plot mean line with error bars
+        ax.errorbar(bloom_checkpoints, bloom_means, yerr=bloom_stds,
+                   marker='^', linestyle='-', linewidth=2, markersize=8,
+                   color='red', label='Path', capsize=5, capthick=2)
+    
+    # Plot hybrid data
+    if hybrid_by_checkpoint:
+        hybrid_checkpoints = sorted(hybrid_by_checkpoint.keys())
+        hybrid_means = [np.mean(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        hybrid_stds = [np.std(hybrid_by_checkpoint[cp]) for cp in hybrid_checkpoints]
+        
+        # Plot individual data points with distribution
+        for cp in hybrid_checkpoints:
+            y_data = hybrid_by_checkpoint[cp]
+            x_jittered = [cp + np.random.uniform(-0.1, 0.1) for _ in y_data]
+            ax.scatter(x_jittered, y_data, alpha=0.3, s=20, color='green', marker='s')
+        
+        # Plot mean line with error bars
+        ax.errorbar(hybrid_checkpoints, hybrid_means, yerr=hybrid_stds,
+                   marker='s', linestyle='-', linewidth=2, markersize=8,
+                   color='green', label='CGP', capsize=5, capthick=2)
+    
+    # Add legend
+    ax.legend(loc='best', fontsize=11)
+    
+    # Set labels and title
+    ax.set_xlabel('Checkpoint Distance', fontsize=12)
+    ax.set_ylabel('Average Total Span Size (bytes/span)', fontsize=12)
+    ax.set_title('Checkpoint Distance vs Average Total Span Size\n(total trace size / number of spans)', fontsize=14)
+    ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -578,6 +878,7 @@ def main():
     plot_checkpoint_vs_ancestry_per_span_with_fpr(aggregated_data)
     plot_checkpoint_vs_reconnection_rate(aggregated_data)
     plot_checkpoint_vs_span_difference(aggregated_data)
+    plot_checkpoint_vs_total_span_size(aggregated_data)
     
     print("\nDone!")
 

@@ -1,0 +1,81 @@
+{
+  "spans": [
+    {
+      "traceID": "tid1",
+      "spanID": "s1",
+      "operationName": "root",
+      "startTime": 1000,
+      "duration": 100,
+      "tags": [
+        {
+          "key": "__bag.depth",
+          "value": 0
+        },
+        {
+          "key": "__bag.bf",
+          "value": "2449922449"
+        },
+        {
+          "key": "__bag.prio",
+          "value": 1
+        },
+        {
+          "key": "ancestry_mode",
+          "value": "pb"
+        },
+        {
+          "key": "ancestry",
+          "value": "2449922449"
+        },
+        {
+          "key": "depth",
+          "value": 0
+        }
+      ],
+      "traceId": "tid1",
+      "spanId": "s1",
+      "parent_span_id": null,
+      "start_time_ns": 1000000,
+      "end_time_ns": 1100000
+    },
+    {
+      "traceID": "tid1",
+      "spanID": "s2",
+      "parentSpanID": "s1",
+      "operationName": "child",
+      "startTime": 1100,
+      "duration": 50,
+      "tags": [
+        {
+          "key": "__bag.depth",
+          "value": 1
+        },
+        {
+          "key": "__bag.bf",
+          "value": "6ecddaa54b"
+        },
+        {
+          "key": "__bag.prio",
+          "value": 0
+        },
+        {
+          "key": "ancestry_mode",
+          "value": "pb"
+        },
+        {
+          "key": "ancestry",
+          "value": "6ecddaa54b"
+        },
+        {
+          "key": "depth",
+          "value": 1
+        }
+      ],
+      "traceId": "tid1",
+      "spanId": "s2",
+      "parent_span_id": "s1",
+      "start_time_ns": 1100000,
+      "end_time_ns": 1150000
+    }
+  ]
+}

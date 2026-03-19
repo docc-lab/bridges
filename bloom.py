@@ -144,26 +144,33 @@ class BloomFilter:
         return True
 
     def serialize(self) -> str:
-        """Encode bit array as hex (no m/k in payload)."""
+        """Encode bit array as hex (for display/output only)."""
         return bytes(self._bits).hex()
+
+    def to_bytes(self) -> bytes:
+        """Raw bit array for baggage/wire (no encoding)."""
+        return bytes(self._bits)
 
     def byte_size(self) -> int:
         """Raw byte size of the bit array in transit (e.g. over the wire)."""
         return len(self._bits)
 
     @classmethod
-    def deserialize(cls, serialized: str, m: int, k: int) -> "BloomFilter":
+    def deserialize(cls, serialized: "str | bytes", m: int, k: int) -> "BloomFilter":
         """
-        Rebuild from hex-encoded bit array. m and k must be provided.
-        Empty string or decode/size mismatch -> new empty filter with given m, k.
+        Rebuild from raw bytes or hex string. m and k must be provided.
+        Empty or size mismatch -> new empty filter with given m, k.
         """
         bf = cls(m, k)
         if not serialized:
             return bf
-        try:
-            data = bytes.fromhex(serialized)
-        except (ValueError, TypeError):
-            return bf
+        if isinstance(serialized, bytes):
+            data = serialized
+        else:
+            try:
+                data = bytes.fromhex(serialized)
+            except (ValueError, TypeError):
+                return bf
         expected = (m + 7) // 8
         if len(data) != expected:
             return bf

@@ -1,0 +1,44 @@
+{
+  "checkpoint_distance": 2,
+  "num_traces": 3,
+  "num_spans": [
+    4060,
+    124,
+    26431
+  ],
+  "num_checkpoint_spans": [
+    2746,
+    93,
+    18994
+  ],
+  "amortized_by_total": [
+    6.763546798029557,
+    7.5,
+    7.186258560024214
+  ],
+  "amortized_by_checkpoint": [
+    10.0,
+    10.0,
+    10.0
+  ],
+  "max_checkpoint_payload": [
+    10,
+    10,
+    10
+  ],
+  "num_baggage_calls": [
+    3966,
+    123,
+    26349
+  ],
+  "avg_baggage_call": [
+    10.0,
+    10.0,
+    10.0
+  ],
+  "max_baggage_call": [
+    10,
+    10,
+    10
+  ]
+}

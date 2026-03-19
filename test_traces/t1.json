@@ -1,0 +1,23 @@
+{
+  "traceID": "tid1",
+  "spans": [
+    {
+      "traceID": "tid1",
+      "spanID": "s1",
+      "operationName": "root",
+      "startTime": 1000,
+      "duration": 100,
+      "tags": []
+    },
+    {
+      "traceID": "tid1",
+      "spanID": "s2",
+      "parentSpanID": "s1",
+      "operationName": "child",
+      "startTime": 1100,
+      "duration": 50,
+      "tags": []
+    }
+  ],
+  "processes": {}
+}

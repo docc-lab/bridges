@@ -1,0 +1,28 @@
+{
+  "checkpoint_distance": 3,
+  "num_traces": 1,
+  "num_spans": [
+    2
+  ],
+  "num_checkpoint_spans": [
+    1
+  ],
+  "amortized_by_total": [
+    7.0
+  ],
+  "amortized_by_checkpoint": [
+    14.0
+  ],
+  "max_checkpoint_payload": [
+    14
+  ],
+  "num_baggage_calls": [
+    1
+  ],
+  "avg_baggage_call": [
+    12.0
+  ],
+  "max_baggage_call": [
+    12
+  ]
+}

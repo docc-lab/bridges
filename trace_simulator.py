@@ -159,11 +159,12 @@ def baggage_byte_size_breakdown(span: dict) -> dict:
 class ParentContext:
     """Minimal context for OnStart: identifies the parent so the handler can look up state."""
 
-    __slots__ = ("trace_id", "parent_span_id")
+    __slots__ = ("trace_id", "parent_span_id", "seq_num")
 
-    def __init__(self, trace_id: str, parent_span_id: Optional[str]):
+    def __init__(self, trace_id: str, parent_span_id: Optional[str], seq_num: int = 0):
         self.trace_id = trace_id
         self.parent_span_id = parent_span_id  # None for root spans
+        self.seq_num = seq_num  # 1-based index of this span among its siblings (as processed)
 
 
 # -----------------------------------------------------------------------------
@@ -226,7 +227,9 @@ BR_PROPERTY_NAME_OVERHEAD_BYTES = 3  # "_br" property name overhead (as discusse
 
 
 # -----------------------------------------------------------------------------
-# Packed bridge baggage: _br = varint(depth_mod) || bloom_bytes
+# Packed bridge baggage: _br layout(s)
+# - PB:  varint(depth_mod) || bloom_bytes
+# - CGPB: varint(depth_mod) || bloom_bytes || hash_array_bytes
 # (No explicit priority; checkpoint-ness is derived from depth_mod==0 or leaf status.)
 # -----------------------------------------------------------------------------
 
@@ -276,6 +279,50 @@ def unpack_br(data: bytes, bloom_len: int) -> Optional[Tuple[int, bytes]]:
         return None
     bloom_bytes = data[i : i + bloom_len]
     return (depth_mod, bloom_bytes)
+
+
+def _span_id_hex_to_8bytes(span_id: str) -> Optional[bytes]:
+    """
+    Convert a Jaeger spanID hex string into a fixed 8-byte representation.
+
+    Jaeger spanIDs are 64-bit = 16 hex chars. Some synthetic traces may use shorter IDs;
+    we left-pad with zeros to 8 bytes for deterministic packing.
+    """
+    if not span_id:
+        return None
+    s = span_id.strip().lower()
+    if any(c not in "0123456789abcdef" for c in s):
+        return None
+    try:
+        raw = bytes.fromhex(s)
+    except ValueError:
+        return None
+    if len(raw) > 8:
+        # Unexpected width; keep the last 8 bytes to avoid negative packing.
+        return raw[-8:]
+    if len(raw) < 8:
+        return b"\x00" * (8 - len(raw)) + raw
+    return raw
+
+
+def pack_cgpb_br(depth_mod: int, bloom_bytes: bytes, ha_bytes: bytes) -> bytes:
+    """Pack CGPB bridge baggage: varint(depth_mod) || bloom_bytes || hash_array_bytes."""
+    return _varint_encode(depth_mod) + bloom_bytes + ha_bytes
+
+
+def unpack_cgpb_br(data: bytes, bloom_len: int) -> Optional[Tuple[int, bytes, bytes]]:
+    """
+    Unpack CGPB _br payload. Returns (depth_mod, bloom_bytes, ha_bytes) or None.
+    bloom_len must match the fixed bloom byte length.
+    """
+    if len(data) < bloom_len:
+        return None
+    depth_mod, i = _varint_decode(data, 0)
+    if i + bloom_len > len(data):
+        return None
+    bloom_bytes = data[i : i + bloom_len]
+    ha_bytes = data[i + bloom_len :]
+    return (depth_mod, bloom_bytes, ha_bytes)
 
 
 # -----------------------------------------------------------------------------
@@ -393,6 +440,163 @@ class PathBridgeHandler(BridgeHandler):
                 + PB_BRIDGE_TYPE_ID
                 + len(_varint_encode(depth_mod))
                 + len(bloom_bytes)
+            )
+            span_set_tag(span, EMIT_PAYLOAD_BYTES_TAG, emitted_bytes)
+
+        if not is_checkpoint:
+            span_remove_tag(span, AncestryKey)
+            span_remove_tag(span, AncestryModeKey)
+
+
+# -----------------------------------------------------------------------------
+# CGPB bridge handler (Bloom + call-graph hash array; packed _br baggage)
+# -----------------------------------------------------------------------------
+
+# Payload-emission metric needs to count the bytes of the checkpoint payload we "emit".
+# For CGPB that includes bloom bytes plus the packed hash-array bytes.
+CGP_BRIDGE_TYPE_ID = 2  # call-graph preserving bridge type id
+
+
+def _ha_append_entry(ha: bytes, parent_span_id: str, depth_mod: int) -> Optional[bytes]:
+    """
+    Append one CGPB hash-array entry:
+      entry := parent_span_id_bytes(8) || varint(depth_mod)
+    """
+    pid_bytes = _span_id_hex_to_8bytes(parent_span_id)
+    if pid_bytes is None:
+        return None
+    return ha + pid_bytes + _varint_encode(depth_mod)
+
+
+class CGPBBridgeHandler(BridgeHandler):
+    """
+    CGPB: uses a packed baggage field __bag._br containing:
+      varint(depth_mod) || bloom_bytes || hash_array_bytes
+
+    - Bloom propagation matches PB: bloom accumulates span IDs, and resets on depth_mod==0.
+    - Hash-array propagation: on the 2nd started sibling of a given parent (seq_num == 2),
+      append (parent_span_id_bytes, varint(depth_mod)) to the hash-array bytes.
+    """
+
+    def __init__(self, checkpoint_distance: int = 1, bloom_fp_rate: float = 0.0001):
+        if BloomFilter is None or estimate_parameters is None:
+            raise RuntimeError("CGPB bridge requires bloom module (bloom.py)")
+        self._cpd = max(1, checkpoint_distance)
+        self._bloom_p = bloom_fp_rate
+        n = max(1, self._cpd)
+        self._bloom_m, self._bloom_k = estimate_parameters(n, self._bloom_p)
+        self._bloom_len = (self._bloom_m + 7) // 8
+        self._span_info: dict = {}  # (trace_id, span_id) -> {"_br": packed_bytes}
+        self._has_children: set = set()
+
+    def _empty_bloom(self) -> BloomFilter:
+        return BloomFilter(self._bloom_m, self._bloom_k)
+
+    def on_start(self, parent_ctx: ParentContext, span: dict) -> bool:
+        trace_id = span.get("traceID") or span.get("traceId") or ""
+        span_id = span.get("spanID") or span.get("spanId") or ""
+        parent_id = parent_ctx.parent_span_id
+
+        if parent_id is not None:
+            self._has_children.add((trace_id, parent_id))
+
+        parent_info = self._span_info.get((trace_id, parent_id)) if parent_id else None
+        baggage_found = parent_info is not None
+
+        # Unpack parent bridge state (if present)
+        if parent_info is not None:
+            packed = parent_info.get("_br")
+            if packed is None:
+                parent_depth_mod, parent_bf_bytes, parent_ha_bytes = 0, b"", b""
+            else:
+                if isinstance(packed, str):
+                    packed = bytes.fromhex(packed)
+                unpacked = unpack_cgpb_br(packed, self._bloom_len)
+                if unpacked is None:
+                    parent_depth_mod, parent_bf_bytes, parent_ha_bytes = 0, b"", b""
+                else:
+                    parent_depth_mod, parent_bf_bytes, parent_ha_bytes = unpacked
+        else:
+            parent_depth_mod, parent_bf_bytes, parent_ha_bytes = 0, b"", b""
+
+        depth_mod = (parent_depth_mod + 1) % self._cpd
+
+        # Bloom state: deserialize parent bloom, add current span, then possibly reset at checkpoint.
+        if parent_info is not None and parent_bf_bytes:
+            bf = BloomFilter.deserialize(parent_bf_bytes, self._bloom_m, self._bloom_k)
+        else:
+            bf = self._empty_bloom()
+
+        span_id_bytes = span_id.encode("utf-8")
+        # Note: bloom hash inputs must match the rest of the simulator's assumptions.
+        # Current PB uses span_id.encode("utf-8") (ASCII hex) as the bloom insertion input.
+        bf.add(span_id_bytes)
+
+        # Hash-array propagation: only the 2nd sibling append happens here (seq_num comes from processed order).
+        ha_bytes = parent_ha_bytes
+        if parent_id is not None and parent_ctx.seq_num == 2:
+            updated = _ha_append_entry(ha_bytes, parent_id, depth_mod)
+            if updated is not None:
+                ha_bytes = updated
+
+        is_checkpoint = (depth_mod == 0)
+
+        if is_checkpoint:
+            # Pre-reset bloom bytes are what the checkpoint payload measures.
+            pre_reset_bf_bytes = bf.to_bytes()
+            emitted_bytes = (
+                BR_PROPERTY_NAME_OVERHEAD_BYTES
+                + CGP_BRIDGE_TYPE_ID
+                + len(_varint_encode(depth_mod))
+                + len(pre_reset_bf_bytes)
+                + len(ha_bytes)
+            )
+            span_set_tag(span, EMIT_PAYLOAD_BYTES_TAG, emitted_bytes)
+
+            # Reset bloom state (hash array is not cleared here; it is carried forward).
+            bf = self._empty_bloom()
+            bf.add(span_id_bytes)
+
+        bf_bytes = bf.to_bytes()
+        packed = pack_cgpb_br(depth_mod, bf_bytes, ha_bytes)
+        span_set_tag(span, BAG_BR, packed)
+        span_set_tag(span, AncestryModeKey, "cgpb")
+        span_set_tag(span, AncestryKey, bf.serialize())
+        span_set_tag(span, "_d", depth_mod)
+
+        self._span_info[(trace_id, span_id)] = {"_br": packed}
+        return baggage_found
+
+    def on_end(self, span: dict) -> None:
+        trace_id = span.get("traceID") or span.get("traceId") or ""
+        span_id = span.get("spanID") or span.get("spanId") or ""
+        raw = span_get_tag(span, BAG_BR)
+
+        is_leaf = (trace_id, span_id) not in self._has_children
+
+        if raw is None:
+            depth_mod = 0
+            bloom_bytes = b""
+            ha_bytes = b""
+        else:
+            if isinstance(raw, str):
+                raw = bytes.fromhex(raw)
+            unpacked = unpack_cgpb_br(raw, self._bloom_len)
+            if unpacked is None:
+                depth_mod, bloom_bytes, ha_bytes = 0, b"", b""
+            else:
+                depth_mod, bloom_bytes, ha_bytes = unpacked
+
+        is_checkpoint = (depth_mod == 0) or is_leaf
+
+        # Leaf-based checkpoint emission (only if we didn't already emit at depth-based checkpoint).
+        if is_leaf and span_get_tag(span, EMIT_PAYLOAD_BYTES_TAG) is None:
+            emitted_bytes = (
+                BR_PROPERTY_NAME_OVERHEAD_BYTES
+                + CGP_BRIDGE_TYPE_ID
+                + len(_varint_encode(depth_mod))
+                + len(bloom_bytes)
+                + len(ha_bytes)
             )
             span_set_tag(span, EMIT_PAYLOAD_BYTES_TAG, emitted_bytes)
 
@@ -666,10 +870,21 @@ def run_trace(trace: dict, handler: BridgeHandler, bagsize: bool) -> List[Any]:
     trace_id = trace.get("trace_id") or ""
     span_count = len(trace.get("spans") or [])
 
+    # CGPB needs a deterministic sibling ordering signal ("seqNum"): the 1-based index
+    # of each child's start among the starts of its siblings. We assign it from the
+    # simulator's deterministic event order.
+    next_seq_num: dict = {}  # (trace_id, parent_span_id) -> next 1-based seq
+
     for ts_ns, typ, _depth, span in events:
         if typ == "start":
             parent_id = span.get("parent_span_id")
-            parent_ctx = ParentContext(trace_id, parent_id)
+            if parent_id is None:
+                seq_num = 0
+            else:
+                key = (trace_id, parent_id)
+                seq_num = next_seq_num.get(key, 1)
+                next_seq_num[key] = seq_num + 1
+            parent_ctx = ParentContext(trace_id, parent_id, seq_num=seq_num)
             baggage_found = handler.on_start(parent_ctx, span)
             if bagsize and baggage_found:
                 total = baggage_byte_size(span)
@@ -763,9 +978,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["vanilla", "pb"],
+        choices=["vanilla", "pb", "cgpb"],
         default="vanilla",
-        help="Bridge mode: vanilla (no-op) or pb (path bridge)",
+        help="Bridge mode: vanilla (no-op), pb (path bridge), or cgpb (call-graph preserving bridge)",
     )
     parser.add_argument(
         "--checkpoint-distance",
@@ -819,6 +1034,11 @@ def main() -> int:
         handler = VanillaHandler()
     elif args.mode == "pb":
         handler = PathBridgeHandler(
+            checkpoint_distance=args.checkpoint_distance,
+            bloom_fp_rate=0.0001,
+        )
+    elif args.mode == "cgpb":
+        handler = CGPBBridgeHandler(
             checkpoint_distance=args.checkpoint_distance,
             bloom_fp_rate=0.0001,
         )

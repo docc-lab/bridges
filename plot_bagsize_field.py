@@ -25,6 +25,7 @@ BRIDGE_META = {
     # mode -> (label, color, marker)
     "pb": ("Path", "#2f9e44", "s"),
     "cgpb": ("Call Graph Preserving", "#e03131", "^"),
+    "sbridge": ("Structural (S-Bridge)", "#1c7ed6", "o"),
     "structural": ("Structural", "#1c7ed6", "o"),
     "sb": ("Structural", "#1c7ed6", "o"),  # allow alias
 }
@@ -112,6 +113,11 @@ def main() -> None:
         default=0.0,
         help="Minimum y-axis value (default: 0). Use something like -1 to let matplotlib autoscale below 0.",
     )
+    parser.add_argument(
+        "--ylog",
+        action="store_true",
+        help="Use logarithmic scale for the y-axis.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Seed for jitter randomness.")
     args = parser.parse_args()
 
@@ -186,7 +192,13 @@ def main() -> None:
 
     ax.set_xlabel("Checkpoint distance")
     ax.set_ylabel(ylabel)
-    ax.set_ylim(bottom=args.ymin)
+    if args.ylog:
+        ax.set_yscale("log")
+        # Log scale requires strictly positive lower bound.
+        if args.ymin > 0:
+            ax.set_ylim(bottom=args.ymin)
+    else:
+        ax.set_ylim(bottom=args.ymin)
     ax.set_xticks(cpds)
     ax.grid(True, alpha=0.28)
     ax.legend(loc=args.legend_loc, fontsize=11)

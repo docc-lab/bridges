@@ -4,6 +4,11 @@ Trace simulator: loads trace JSON, turns spans into start/end events,
 and runs them through a pluggable bridge (OnStart/OnEnd), mirroring
 OpenTelemetry SDK SpanProcessor semantics.
 
+With multiple loaded traces, events are interleaved into one timeline by default
+(sort key: time, start/end, depth, trace_id) so a shared handler sees concurrent
+work; use --sequential-traces for isolated per-trace runs. S-Bridge DEE queues are
+per service name across traces.
+
 Handlers implement the same conceptual interface as in
 blueprint-docc-mod/runtime/plugins/otelcol (e.g. vanilla_processor.go):
   - OnStart(parent_ctx, span): span is mutable (e.g. add baggage/attributes).
@@ -12,11 +17,13 @@ blueprint-docc-mod/runtime/plugins/otelcol (e.g. vanilla_processor.go):
 """
 
 import argparse
+import copy
 import json
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from collections import defaultdict, deque
+from typing import Any, Dict, List, Optional, Tuple
 
 # Bloom filter for path bridge (and later CGPB)
 try:
@@ -218,11 +225,14 @@ BAG_BR = "__bag._br"
 AncestryKey = "ancestry"
 AncestryModeKey = "ancestry_mode"
 ANCESTRY_MODE_PB = "pb"
+# Single-byte ancestry mode ids (match blueprint style: one byte as string)
+ANCESTRY_MODE_SBRIDGE = "\x03"
 
 # Payload-emission metric (Figure 10): emitted checkpoint payload bytes.
 # This is different from baggage/tag wire-size.
 EMIT_PAYLOAD_BYTES_TAG = "__emit._br_payload_bytes"
 PB_BRIDGE_TYPE_ID = 1  # path bridge type id (fits in 1 byte)
+SB_BRIDGE_TYPE_ID = 3  # structural (S-) bridge type id
 BR_PROPERTY_NAME_OVERHEAD_BYTES = 3  # "_br" property name overhead (as discussed)
 
 
@@ -323,6 +333,114 @@ def unpack_cgpb_br(data: bytes, bloom_len: int) -> Optional[Tuple[int, bytes, by
     bloom_bytes = data[i : i + bloom_len]
     ha_bytes = data[i + bloom_len :]
     return (depth_mod, bloom_bytes, ha_bytes)
+
+
+def _trace_id_hex_to_16bytes(trace_id: str) -> bytes:
+    """W3C trace id: 32 hex chars -> 16 bytes (left-pad with zeros if shorter)."""
+    if not trace_id:
+        return b"\x00" * 16
+    s = trace_id.strip().lower()
+    if any(c not in "0123456789abcdef" for c in s):
+        return b"\x00" * 16
+    try:
+        raw = bytes.fromhex(s)
+    except ValueError:
+        return b"\x00" * 16
+    if len(raw) > 16:
+        return raw[-16:]
+    if len(raw) < 16:
+        return b"\x00" * (16 - len(raw)) + raw
+    return raw
+
+
+def pack_sbridge_br(
+    depth: int,
+    checkpoint_span_8: bytes,
+    ordinal_groups: Dict[int, List[int]],
+    end_events: List[int],
+    dee_bytes: bytes,
+) -> bytes:
+    """
+    S-Bridge packed __bag._br:
+      varint(depth)
+      8 bytes checkpoint span id (raw)
+      varint(num_depth_groups)
+      repeated: varint(depth) varint(n_seqs) n_seqs * varint(seq)
+      varint(n_end_events)
+      n_end_events * varint(start_seq)   # start ordinal of each ended span; end order is list order
+      dee_bytes (concatenated triples: 16-byte trace_id | varint(depth) | varint(n_seqs) | n_seqs * varint)
+    """
+    if len(checkpoint_span_8) != 8:
+        checkpoint_span_8 = (checkpoint_span_8 + b"\x00" * 8)[:8]
+    out = bytearray()
+    out.extend(_varint_encode(max(0, depth)))
+    out.extend(checkpoint_span_8)
+    depths_sorted = sorted(ordinal_groups.keys())
+    out.extend(_varint_encode(len(depths_sorted)))
+    for d in depths_sorted:
+        seqs = ordinal_groups[d]
+        out.extend(_varint_encode(d))
+        out.extend(_varint_encode(len(seqs)))
+        for s in seqs:
+            out.extend(_varint_encode(s))
+    out.extend(_varint_encode(len(end_events)))
+    for start_seq in end_events:
+        out.extend(_varint_encode(start_seq))
+    out.extend(dee_bytes)
+    return bytes(out)
+
+
+def unpack_sbridge_br(data: bytes) -> Optional[dict]:
+    """Unpack S-Bridge _br; returns dict or None."""
+    if not data:
+        return None
+    try:
+        depth, i = _varint_decode(data, 0)
+        if i + 8 > len(data):
+            return None
+        ckpt = data[i : i + 8]
+        i += 8
+        num_groups, i = _varint_decode(data, i)
+        ordinal_groups: Dict[int, List[int]] = {}
+        for _ in range(num_groups):
+            d, i = _varint_decode(data, i)
+            n_seqs, i = _varint_decode(data, i)
+            seqs: List[int] = []
+            for _j in range(n_seqs):
+                s, i = _varint_decode(data, i)
+                seqs.append(s)
+            ordinal_groups[d] = seqs
+        n_end, i = _varint_decode(data, i)
+        end_events: List[int] = []
+        for _ in range(n_end):
+            start_seq, i = _varint_decode(data, i)
+            end_events.append(start_seq)
+        dee_bytes = data[i:]
+        return {
+            "depth": depth,
+            "checkpoint_span_8": ckpt,
+            "ordinal_groups": ordinal_groups,
+            "end_events": end_events,
+            "dee_bytes": dee_bytes,
+        }
+    except (IndexError, TypeError):
+        return None
+
+
+def _encode_dee_triple(trace_id: str, depth: int, seqs: List[int]) -> bytes:
+    """
+    One DEE triple: 16-byte trace id | varint(depth) | varint(n) | n * varint(start_seq).
+
+    Same semantics as inline end_events in pack_sbridge_br: only start ordinals of ended
+    spans, in end order; no explicit end ordinals.
+    """
+    out = bytearray()
+    out.extend(_trace_id_hex_to_16bytes(trace_id))
+    out.extend(_varint_encode(max(0, depth)))
+    out.extend(_varint_encode(len(seqs)))
+    for s in seqs:
+        out.extend(_varint_encode(s))
+    return bytes(out)
 
 
 # -----------------------------------------------------------------------------
@@ -606,6 +724,300 @@ class CGPBBridgeHandler(BridgeHandler):
 
 
 # -----------------------------------------------------------------------------
+# S-Bridge (structural): ordinal + end-event pairs + delayed end events; packed _br
+# -----------------------------------------------------------------------------
+
+
+class DeeSizeLogger:
+    """
+    stderr logging for S-bridge delayed end-event (DEE) byte sizes.
+
+    - pickup: a span start drains the per-service DEE queue and incoming bytes exceed threshold.
+    - queue_over_threshold: after an enqueue, the per-service DEE queue total exceeds threshold.
+    """
+
+    __slots__ = ("threshold_bytes",)
+
+    def __init__(self, threshold_bytes: int):
+        self.threshold_bytes = threshold_bytes
+
+    def log_pickup(
+        self,
+        *,
+        service: str,
+        incoming_bytes: int,
+        trace_id: str,
+        source_file: str,
+    ) -> None:
+        if incoming_bytes > self.threshold_bytes:
+            print(
+                "dee_log: kind=pickup "
+                f"service={service!r} incoming_bytes={incoming_bytes} "
+                f"trace_id={trace_id} source_file={source_file or '?'}",
+                file=sys.stderr,
+            )
+
+    def log_enqueue_queue_over_threshold(
+        self,
+        *,
+        service: str,
+        new_queue_bytes: int,
+        trace_id: str,
+        source_file: str,
+        added_bytes: int,
+    ) -> None:
+        if new_queue_bytes > self.threshold_bytes:
+            print(
+                "dee_log: kind=queue_over_threshold "
+                f"service={service!r} queue_total_bytes={new_queue_bytes} "
+                f"added_bytes={added_bytes} trace_id={trace_id} source_file={source_file or '?'}",
+                file=sys.stderr,
+            )
+
+
+class SBridgeBridgeHandler(BridgeHandler):
+    """
+    Structural bridge: monotonic depth; checkpoint when depth % cpd == 0 or leaf.
+    Packed __bag._br via pack_sbridge_br. Per-service (service name) delayed DEE queue.
+
+    Only the first child of a parent (seq_num == 1) receives full inline baggage: end
+    events, deferred bytes from the parent, and DEE drained at this start. Later siblings
+    inherit only the parent's ordinal chain (plus this span's ordinal); end_events and
+    dee_bytes are empty (DEE queue is still drained so backlog does not stick).
+    """
+
+    def __init__(
+        self,
+        checkpoint_distance: int = 1,
+        dee_size_logger: Optional[DeeSizeLogger] = None,
+    ):
+        self._cpd = max(1, checkpoint_distance)
+        self._dee_size_logger = dee_size_logger
+        self._span_info: dict = {}  # (trace_id, span_id) -> {"_br": bytes}
+        self._has_children: set = set()
+
+        self._parent_event_count: Dict[Tuple[str, str], int] = {}
+        self._child_seq_start: Dict[Tuple[str, str], int] = {}
+        # Per parent: start ordinals of children that have ended (on_end order); no explicit end ordinals.
+        self._parent_ee_acc: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+
+        # service_name -> deque of bytes (DEE triples; cross-request / cross-trace on same service)
+        self._dee_queue: Dict[str, deque] = defaultdict(deque)
+
+    def _bump_event(self, tid: str, parent_span_id: str) -> int:
+        k = (tid, parent_span_id)
+        self._parent_event_count[k] = self._parent_event_count.get(k, 0) + 1
+        return self._parent_event_count[k]
+
+    def _dee_queue_total_bytes(self, service: str) -> int:
+        q = self._dee_queue.get(service)
+        if not q:
+            return 0
+        return sum(len(b) for b in q)
+
+    def _drain_dee_for_service(
+        self,
+        service: str,
+        consuming_trace_id: str,
+        consuming_source_file: str,
+    ) -> bytes:
+        q = self._dee_queue.get(service)
+        if not q:
+            return b""
+        parts = []
+        while q:
+            parts.append(q.popleft())
+        combined = b"".join(parts)
+        if self._dee_size_logger is not None:
+            self._dee_size_logger.log_pickup(
+                service=service,
+                incoming_bytes=len(combined),
+                trace_id=consuming_trace_id,
+                source_file=consuming_source_file,
+            )
+        return combined
+
+    def _enqueue_dee(
+        self,
+        service: str,
+        triple_bytes: bytes,
+        contributing_trace_id: str,
+        contributing_source_file: str,
+    ) -> None:
+        prev = self._dee_queue_total_bytes(service)
+        self._dee_queue[service].append(triple_bytes)
+        new = prev + len(triple_bytes)
+        if self._dee_size_logger is not None:
+            self._dee_size_logger.log_enqueue_queue_over_threshold(
+                service=service,
+                new_queue_bytes=new,
+                trace_id=contributing_trace_id,
+                source_file=contributing_source_file,
+                added_bytes=len(triple_bytes),
+            )
+
+    def on_start(self, parent_ctx: ParentContext, span: dict) -> bool:
+        trace_id = span.get("traceID") or span.get("traceId") or ""
+        span_id = span.get("spanID") or span.get("spanId") or ""
+        parent_id = parent_ctx.parent_span_id
+        service = span.get("_service_name") or "missing_service"
+        src_file = span.get("_trace_source_file") or ""
+
+        if parent_id is not None:
+            self._has_children.add((trace_id, parent_id))
+
+        dee_incoming = self._drain_dee_for_service(service, trace_id, src_file)
+
+        parent_info = self._span_info.get((trace_id, parent_id)) if parent_id else None
+        baggage_found = parent_info is not None
+
+        if parent_id is None:
+            depth = 0
+            ckpt_8 = b"\x00" * 8
+            ordinal_groups: Dict[int, List[int]] = {}
+            ee_from_parent: List[int] = []
+            dee_from_parent = b""
+            end_events: List[int] = []
+        else:
+            packed_parent = parent_info.get("_br") if parent_info else None
+            if packed_parent is None:
+                parent_depth = 0
+                ckpt_8 = b"\x00" * 8
+                ordinal_groups = {}
+                ee_from_parent = []
+                dee_from_parent = b""
+            else:
+                if isinstance(packed_parent, str):
+                    packed_parent = bytes.fromhex(packed_parent)
+                unpacked = unpack_sbridge_br(packed_parent)
+                if unpacked is None:
+                    parent_depth = 0
+                    ckpt_8 = b"\x00" * 8
+                    ordinal_groups = {}
+                    ee_from_parent = []
+                    dee_from_parent = b""
+                else:
+                    parent_depth = unpacked["depth"]
+                    ckpt_8 = unpacked["checkpoint_span_8"]
+                    ordinal_groups = {d: list(v) for d, v in unpacked["ordinal_groups"].items()}
+                    ee_from_parent = list(unpacked["end_events"])
+                    dee_from_parent = unpacked["dee_bytes"]
+
+            depth = parent_depth + 1
+
+            # merge ordinal: copy groups (all siblings inherit parent's ordinal chain)
+            ordinal_groups = {d: list(v) for d, v in ordinal_groups.items()}
+            seq_start = self._bump_event(trace_id, parent_id)
+            self._child_seq_start[(trace_id, span_id)] = seq_start
+            ordinal_groups.setdefault(depth, []).append(seq_start)
+
+            # Consume-on-handoff: only the first child carries full end events + DEE; others
+            # get ordinals only (acc still cleared so sibling ends are not re-merged later).
+            acc_ends = list(self._parent_ee_acc[(trace_id, parent_id)])
+            if parent_ctx.seq_num == 1:
+                end_events = ee_from_parent + acc_ends
+            else:
+                end_events = []
+            self._parent_ee_acc[(trace_id, parent_id)].clear()
+
+        dee_bytes = dee_from_parent + dee_incoming
+        if parent_id is not None and parent_ctx.seq_num != 1:
+            dee_bytes = b""
+
+        is_checkpoint = (depth % self._cpd == 0)
+
+        if is_checkpoint:
+            pre_payload = pack_sbridge_br(depth, ckpt_8, ordinal_groups, end_events, dee_bytes)
+            emitted_bytes = (
+                BR_PROPERTY_NAME_OVERHEAD_BYTES
+                + SB_BRIDGE_TYPE_ID
+                + len(pre_payload)
+            )
+            span_set_tag(span, EMIT_PAYLOAD_BYTES_TAG, emitted_bytes)
+
+            ckpt_8 = _span_id_hex_to_8bytes(span_id) or b"\x00" * 8
+            ordinal_groups = {}
+            end_events = []
+            dee_bytes = b""
+
+            self._parent_event_count[(trace_id, span_id)] = 0
+            self._parent_ee_acc[(trace_id, span_id)] = []
+
+        packed = pack_sbridge_br(depth, ckpt_8, ordinal_groups, end_events, dee_bytes)
+        span_set_tag(span, BAG_BR, packed)
+        span_set_tag(span, AncestryModeKey, ANCESTRY_MODE_SBRIDGE)
+        span_set_tag(span, AncestryKey, packed.hex())
+        span_set_tag(span, "_d", depth)
+
+        self._span_info[(trace_id, span_id)] = {"_br": packed}
+        return baggage_found
+
+    def on_end(self, span: dict) -> None:
+        trace_id = span.get("traceID") or span.get("traceId") or ""
+        span_id = span.get("spanID") or span.get("spanId") or ""
+        parent_id = span.get("parent_span_id")
+        service = span.get("_service_name") or "missing_service"
+        src_file = span.get("_trace_source_file") or ""
+        raw = span_get_tag(span, BAG_BR)
+
+        is_leaf = (trace_id, span_id) not in self._has_children
+
+        if raw is None:
+            depth = 0
+            ckpt_8 = b"\x00" * 8
+            ordinal_groups: Dict[int, List[int]] = {}
+            end_events: List[int] = []
+            dee_bytes = b""
+        else:
+            if isinstance(raw, str):
+                raw = bytes.fromhex(raw)
+            unpacked = unpack_sbridge_br(raw)
+            if unpacked is None:
+                depth = 0
+                ckpt_8 = b"\x00" * 8
+                ordinal_groups = {}
+                end_events = []
+                dee_bytes = b""
+            else:
+                depth = unpacked["depth"]
+                ckpt_8 = unpacked["checkpoint_span_8"]
+                ordinal_groups = unpacked["ordinal_groups"]
+                end_events = list(unpacked["end_events"])
+                dee_bytes = unpacked["dee_bytes"]
+
+        if parent_id is not None:
+            seq_start = self._child_seq_start.pop((trace_id, span_id), None)
+            if seq_start is not None:
+                self._parent_ee_acc[(trace_id, parent_id)].append(seq_start)
+
+        # Start ordinals still in the accumulator were never handed to a later child start → delayed.
+        rem = list(self._parent_ee_acc[(trace_id, span_id)])
+        if rem:
+            # Last end is implied at reconstruction; omit it from the triple. If only one
+            # remained, nothing is queued.
+            rem = rem[:-1]
+            if rem:
+                triple = _encode_dee_triple(trace_id, depth, rem)
+                self._enqueue_dee(service, triple, trace_id, src_file)
+            self._parent_ee_acc[(trace_id, span_id)].clear()
+
+        is_checkpoint = (depth % self._cpd == 0) or is_leaf
+
+        if is_leaf and span_get_tag(span, EMIT_PAYLOAD_BYTES_TAG) is None:
+            pre_payload = pack_sbridge_br(depth, ckpt_8, ordinal_groups, end_events, dee_bytes)
+            emitted_bytes = (
+                BR_PROPERTY_NAME_OVERHEAD_BYTES
+                + SB_BRIDGE_TYPE_ID
+                + len(pre_payload)
+            )
+            span_set_tag(span, EMIT_PAYLOAD_BYTES_TAG, emitted_bytes)
+
+        if not is_checkpoint:
+            span_remove_tag(span, AncestryKey)
+            span_remove_tag(span, AncestryModeKey)
+
+
+# -----------------------------------------------------------------------------
 # Trace loading
 # -----------------------------------------------------------------------------
 
@@ -645,6 +1057,18 @@ def _normalize_span(span: dict, processes: Optional[dict], trace_id: str) -> dic
         pass
     else:
         out["tags"] = [{"key": k, "value": v} for k, v in (out.get("attributes") or {}).items()]
+
+    proc_id = out.get("processID") or out.get("processId")
+    svc = None
+    if processes and proc_id and proc_id in processes:
+        pinfo = processes[proc_id]
+        if isinstance(pinfo, dict):
+            svc = pinfo.get("serviceName") or pinfo.get("service_name")
+    if not svc:
+        svc = span_get_tag(out, "service.name")
+    if not svc:
+        svc = "missing_service"
+    out["_service_name"] = str(svc)
     return out
 
 
@@ -750,10 +1174,20 @@ def load_traces_from_dir(
                     _normalize_span(s, processes, tid)
                     for s in spans
                 ]
+                _src = str(f.resolve())
+                for s in normalized:
+                    s["_trace_source_file"] = _src
                 if require_clean:
                     if not _trace_is_clean(normalized):
                         continue
-                traces.append({"trace_id": tid, "spans": normalized, "processes": processes})
+                traces.append(
+                    {
+                        "trace_id": tid,
+                        "spans": normalized,
+                        "processes": processes,
+                        "_source_file": _src,
+                    }
+                )
                 if require_clean and len(traces) % 100 == 0:
                     print(f"Clean-sampling processed traces: {len(traces)}", file=sys.stderr)
                 if trace_count and len(traces) >= trace_count:
@@ -765,10 +1199,20 @@ def load_traces_from_dir(
         spans = data.get("spans") or []
         processes = data.get("processes") or {}
         normalized = [_normalize_span(s, processes, tid) for s in spans]
+        _src = str(f.resolve())
+        for s in normalized:
+            s["_trace_source_file"] = _src
         if require_clean:
             if not _trace_is_clean(normalized):
                 continue
-        traces.append({"trace_id": tid, "spans": normalized, "processes": processes})
+        traces.append(
+            {
+                "trace_id": tid,
+                "spans": normalized,
+                "processes": processes,
+                "_source_file": _src,
+            }
+        )
         if require_clean and len(traces) % 100 == 0:
             print(f"Clean-sampling processed traces: {len(traces)}", file=sys.stderr)
         if trace_count and len(traces) >= trace_count:
@@ -803,8 +1247,6 @@ def build_events(trace: dict) -> List[Tuple[int, str, int, dict]]:
             roots.append(sid)
         else:
             children.setdefault(pid, []).append(sid)
-
-    from collections import deque
 
     depth_by_sid: dict = {}
     q = deque()
@@ -853,10 +1295,18 @@ def sort_events(events: List[Tuple[int, str, int, dict]]) -> List[Tuple[int, str
 # Simulator: run events through a handler and collect output spans
 # -----------------------------------------------------------------------------
 
-def run_trace(trace: dict, handler: BridgeHandler, bagsize: bool) -> List[Any]:
+def run_trace(
+    trace: dict,
+    handler: BridgeHandler,
+    bagsize: bool,
+    log_large_threshold: Optional[int] = None,
+) -> List[Any]:
     """
     Run one trace: build events, sort, call handler.on_start / handler.on_end,
     and return the list of spans (one per span, after on_end).
+
+    If bagsize and log_large_threshold is set, stderr logs trace_id, source file,
+    and baggage bytes whenever a single call exceeds that threshold.
     """
     events = build_events(trace)
     events = sort_events(events)
@@ -865,9 +1315,10 @@ def run_trace(trace: dict, handler: BridgeHandler, bagsize: bool) -> List[Any]:
     checkpoint_payload_sum = 0
     checkpoint_payload_count = 0
     checkpoint_payload_max = 0
-    emitted_span_ids: set = set()
+    emitted_span_ids: set = set()  # (trace_id, span_id) — span IDs can repeat across traces
 
     trace_id = trace.get("trace_id") or ""
+    source_file = trace.get("_source_file") or ""
     span_count = len(trace.get("spans") or [])
 
     # CGPB needs a deterministic sibling ordering signal ("seqNum"): the 1-based index
@@ -888,15 +1339,20 @@ def run_trace(trace: dict, handler: BridgeHandler, bagsize: bool) -> List[Any]:
             baggage_found = handler.on_start(parent_ctx, span)
             if bagsize and baggage_found:
                 total = baggage_byte_size(span)
-                breakdown = baggage_byte_size_breakdown(span)
                 output_calls.append(total)
-                # Intentionally no per-call logging: output is already compact.
+                if log_large_threshold is not None and total > log_large_threshold:
+                    print(
+                        f"loglarge: trace_id={trace_id} baggage_bytes={total} "
+                        f"source_file={source_file or '?'}",
+                        file=sys.stderr,
+                    )
 
             if bagsize:
                 span_id = span.get("spanID") or span.get("spanId") or ""
+                ck = (trace_id, span_id)
                 emitted = span_get_tag(span, EMIT_PAYLOAD_BYTES_TAG)
-                if emitted is not None and span_id not in emitted_span_ids:
-                    emitted_span_ids.add(span_id)
+                if emitted is not None and ck not in emitted_span_ids:
+                    emitted_span_ids.add(ck)
                     val = int(emitted)
                     checkpoint_payload_sum += val
                     checkpoint_payload_count += 1
@@ -905,16 +1361,16 @@ def run_trace(trace: dict, handler: BridgeHandler, bagsize: bool) -> List[Any]:
             handler.on_end(span)
             if bagsize:
                 span_id = span.get("spanID") or span.get("spanId") or ""
+                ck = (trace_id, span_id)
                 emitted = span_get_tag(span, EMIT_PAYLOAD_BYTES_TAG)
-                if emitted is not None and span_id not in emitted_span_ids:
-                    emitted_span_ids.add(span_id)
+                if emitted is not None and ck not in emitted_span_ids:
+                    emitted_span_ids.add(ck)
                     val = int(emitted)
                     checkpoint_payload_sum += val
                     checkpoint_payload_count += 1
                     checkpoint_payload_max = max(checkpoint_payload_max, val)
             # Export: append a copy so handler can't mutate after the fact
             if not bagsize:
-                import copy
                 output_spans.append(copy.deepcopy(span))
 
     if not bagsize:
@@ -947,16 +1403,131 @@ def run_trace(trace: dict, handler: BridgeHandler, bagsize: bool) -> List[Any]:
     }
 
 
-def run_traces(traces: List[dict], handler: BridgeHandler, bagsize: bool) -> List[Any]:
-    """Run all traces through the handler; return concatenated output."""
-    out: List[Any] = []
-    for trace in traces:
-        r = run_trace(trace, handler, bagsize=bagsize)
-        if bagsize:
-            out.append(r)
+def run_traces(
+    traces: List[dict],
+    handler: BridgeHandler,
+    bagsize: bool,
+    log_large_threshold: Optional[int] = None,
+    interleave: bool = True,
+) -> List[Any]:
+    """
+    Run all traces through one shared handler.
+
+    If interleave is True and len(traces) > 1, build a single sorted event stream
+    across traces (same sort key as sort_events: time, then start/end, depth, trace_id).
+    Per-trace metrics and non-bagsize export stay grouped by input trace order.
+
+    If interleave is False or only one trace, each trace runs in isolation (legacy).
+    """
+    if (not interleave) or len(traces) <= 1:
+        out: List[Any] = []
+        for trace in traces:
+            r = run_trace(trace, handler, bagsize=bagsize, log_large_threshold=log_large_threshold)
+            if bagsize:
+                out.append(r)
+            else:
+                out.extend(r)
+        return out
+
+    all_events: List[Tuple[int, str, int, dict]] = []
+    for t in traces:
+        all_events.extend(build_events(t))
+    all_events = sort_events(all_events)
+
+    trace_order = [t.get("trace_id") or "" for t in traces]
+    trace_source = {t.get("trace_id") or "": t.get("_source_file") or "" for t in traces}
+    span_count_by_tid = {t.get("trace_id") or "": len(t.get("spans") or []) for t in traces}
+
+    def empty_acc() -> dict:
+        return {
+            "output_calls": [],
+            "checkpoint_sum": 0,
+            "checkpoint_count": 0,
+            "checkpoint_max": 0,
+            "emitted": set(),
+        }
+
+    acc: Dict[str, dict] = {tid: empty_acc() for tid in trace_order}
+    next_seq_num: dict = {}
+    completed_by_tid: Dict[str, List[dict]] = {tid: [] for tid in trace_order}
+
+    for _ts_ns, typ, _depth, span in all_events:
+        trace_id = span.get("traceID") or span.get("traceId") or ""
+        source_file = trace_source.get(trace_id, "")
+        a = acc.setdefault(trace_id, empty_acc())
+
+        if typ == "start":
+            parent_id = span.get("parent_span_id")
+            if parent_id is None:
+                seq_num = 0
+            else:
+                sk = (trace_id, parent_id)
+                seq_num = next_seq_num.get(sk, 1)
+                next_seq_num[sk] = seq_num + 1
+            parent_ctx = ParentContext(trace_id, parent_id, seq_num=seq_num)
+            baggage_found = handler.on_start(parent_ctx, span)
+            if bagsize and baggage_found:
+                total = baggage_byte_size(span)
+                a["output_calls"].append(total)
+                if log_large_threshold is not None and total > log_large_threshold:
+                    print(
+                        f"loglarge: trace_id={trace_id} baggage_bytes={total} "
+                        f"source_file={source_file or '?'}",
+                        file=sys.stderr,
+                    )
+            if bagsize:
+                span_id = span.get("spanID") or span.get("spanId") or ""
+                ck = (trace_id, span_id)
+                emitted = span_get_tag(span, EMIT_PAYLOAD_BYTES_TAG)
+                if emitted is not None and ck not in a["emitted"]:
+                    a["emitted"].add(ck)
+                    v = int(emitted)
+                    a["checkpoint_sum"] += v
+                    a["checkpoint_count"] += 1
+                    a["checkpoint_max"] = max(a["checkpoint_max"], v)
         else:
-            out.extend(r)
-    return out
+            handler.on_end(span)
+            if bagsize:
+                span_id = span.get("spanID") or span.get("spanId") or ""
+                ck = (trace_id, span_id)
+                emitted = span_get_tag(span, EMIT_PAYLOAD_BYTES_TAG)
+                if emitted is not None and ck not in a["emitted"]:
+                    a["emitted"].add(ck)
+                    v = int(emitted)
+                    a["checkpoint_sum"] += v
+                    a["checkpoint_count"] += 1
+                    a["checkpoint_max"] = max(a["checkpoint_max"], v)
+            else:
+                completed_by_tid.setdefault(trace_id, []).append(copy.deepcopy(span))
+
+    if bagsize:
+        results: List[dict] = []
+        for tid in trace_order:
+            a = acc.get(tid, empty_acc())
+            sc = span_count_by_tid.get(tid, 0)
+            calls: List[int] = a["output_calls"]
+            nbc = len(calls)
+            csum = a["checkpoint_sum"]
+            ccnt = a["checkpoint_count"]
+            results.append(
+                {
+                    "trace_id": tid,
+                    "num_spans": sc,
+                    "amortized_by_total": (csum / sc) if sc else 0.0,
+                    "amortized_by_checkpoint": (csum / ccnt) if ccnt else 0.0,
+                    "num_checkpoint_spans": ccnt,
+                    "max_checkpoint_payload": a["checkpoint_max"],
+                    "num_baggage_calls": nbc,
+                    "avg_baggage_call": float(sum(calls)) / nbc if nbc else 0.0,
+                    "max_baggage_call": int(max(calls)) if nbc else 0,
+                }
+            )
+        return results
+
+    out_flat: List[dict] = []
+    for tid in trace_order:
+        out_flat.extend(completed_by_tid.get(tid, []))
+    return out_flat
 
 
 # -----------------------------------------------------------------------------
@@ -978,9 +1549,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["vanilla", "pb", "cgpb"],
+        choices=["vanilla", "pb", "cgpb", "sbridge"],
         default="vanilla",
-        help="Bridge mode: vanilla (no-op), pb (path bridge), or cgpb (call-graph preserving bridge)",
+        help="Bridge mode: vanilla (no-op), pb, cgpb, or sbridge (structural bridge)",
     )
     parser.add_argument(
         "--checkpoint-distance",
@@ -1016,7 +1587,47 @@ def main() -> int:
         action="store_true",
         help="Output per-trace baggage call sizes and checkpoint payload overhead (Figure 10 metrics).",
     )
+    parser.add_argument(
+        "--loglarge",
+        action="store_true",
+        help="With --bagsize: log trace_id and source JSON path to stderr when any call's baggage exceeds the threshold.",
+    )
+    parser.add_argument(
+        "--loglarge-bytes",
+        type=int,
+        default=100,
+        help="With --loglarge: baggage byte threshold (default: 100).",
+    )
+    parser.add_argument(
+        "--sequential-traces",
+        action="store_true",
+        help="Finish each trace before starting the next (no cross-trace event interleaving).",
+    )
+    parser.add_argument(
+        "--log-dee",
+        action="store_true",
+        help="S-bridge only: log to stderr when DEE pickup or per-service queue size crosses "
+        "--dee-log-bytes (see DeeSizeLogger).",
+    )
+    parser.add_argument(
+        "--dee-log-bytes",
+        type=int,
+        default=10000,
+        help="With --log-dee: threshold in bytes (default: 10000).",
+    )
     args = parser.parse_args()
+
+    if args.loglarge and not args.bagsize:
+        print("--loglarge requires --bagsize", file=sys.stderr)
+        return 2
+    if args.loglarge and args.loglarge_bytes < 1:
+        print("--loglarge-bytes must be >= 1", file=sys.stderr)
+        return 2
+    if args.log_dee and args.dee_log_bytes < 1:
+        print("--dee-log-bytes must be >= 1", file=sys.stderr)
+        return 2
+    if args.log_dee and args.mode != "sbridge":
+        print("warning: --log-dee only applies to --mode sbridge", file=sys.stderr)
 
     traces = load_traces_from_dir(
         args.input_dir,
@@ -1042,10 +1653,23 @@ def main() -> int:
             checkpoint_distance=args.checkpoint_distance,
             bloom_fp_rate=0.0001,
         )
+    elif args.mode == "sbridge":
+        dee_logger = DeeSizeLogger(args.dee_log_bytes) if args.log_dee else None
+        handler = SBridgeBridgeHandler(
+            checkpoint_distance=args.checkpoint_distance,
+            dee_size_logger=dee_logger,
+        )
     else:
         handler = VanillaHandler()
 
-    outputs = run_traces(traces, handler, bagsize=args.bagsize)
+    log_large_threshold = int(args.loglarge_bytes) if args.loglarge else None
+    outputs = run_traces(
+        traces,
+        handler,
+        bagsize=args.bagsize,
+        log_large_threshold=log_large_threshold,
+        interleave=not args.sequential_traces,
+    )
 
     # Write output
     if args.bagsize:

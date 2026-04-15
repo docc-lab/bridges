@@ -780,10 +780,12 @@ class SBridgeBridgeHandler(BridgeHandler):
     Structural bridge: monotonic depth; checkpoint when depth % cpd == 0 or leaf.
     Packed __bag._br via pack_sbridge_br. Per-service (service name) delayed DEE queue.
 
-    Only the first child of a parent (seq_num == 1) receives full inline baggage: end
-    events, deferred bytes from the parent, and DEE drained at this start. Later siblings
-    inherit only the parent's ordinal chain (plus this span's ordinal); end_events and
-    dee_bytes are empty (DEE queue is still drained so backlog does not stick).
+    Only the first child of a parent (seq_num == 1) receives full inline baggage: upstream
+    end events (ee_from_parent), deferred bytes from the parent, and DEE drained at this
+    start. Later siblings receive only local sibling end events (acc_ends) — which siblings
+    ended before this child started — but not upstream EE/DEE. This preserves the full
+    sibling endpoint interleaving at every fanout while avoiding redundant replication of
+    upstream lateral state across branches.
     """
 
     def __init__(
@@ -911,13 +913,11 @@ class SBridgeBridgeHandler(BridgeHandler):
             self._child_seq_start[(trace_id, span_id)] = seq_start
             ordinal_groups.setdefault(depth, []).append(seq_start)
 
-            # Consume-on-handoff: only the first child carries full end events + DEE; others
-            # get ordinals only (acc still cleared so sibling ends are not re-merged later).
             acc_ends = list(self._parent_ee_acc[(trace_id, parent_id)])
             if parent_ctx.seq_num == 1:
                 end_events = ee_from_parent + acc_ends
             else:
-                end_events = []
+                end_events = list(acc_ends)
             self._parent_ee_acc[(trace_id, parent_id)].clear()
 
         dee_bytes = dee_from_parent + dee_incoming

@@ -1,0 +1,1206 @@
+{
+  "vanilla": [
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    }
+  ],
+  "pb_cpd1": [
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 8
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    }
+  ],
+  "pb_cpd3": [
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 13
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 13
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "emit_bytes": 13
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "emit_bytes": 13
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "emit_bytes": 13
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "emit_bytes": 13
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "emit_bytes": 13
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 13
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "emit_bytes": 13
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    }
+  ],
+  "cgpb_cpd1": [
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 9
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 9
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 16,
+      "emit_bytes": 18
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 16,
+      "emit_bytes": 18
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 9
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 9
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 25,
+      "emit_bytes": 27
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 16,
+      "emit_bytes": 18
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 9
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 7,
+      "emit_bytes": 9
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    }
+  ],
+  "cgpb_cpd3": [
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 21,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 21,
+      "emit_bytes": 23
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 30,
+      "emit_bytes": 32
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 21,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "emit_bytes": 14
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "emit_bytes": 14
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "emit_bytes": 23
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 12,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "emit_bytes": 14
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    }
+  ],
+  "sb_cpd1": [
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 17
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 14,
+      "emit_bytes": 20
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 14,
+      "emit_bytes": 20
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 14,
+      "emit_bytes": 20
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 17
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 14,
+      "emit_bytes": 20
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 14,
+      "emit_bytes": 20
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 14,
+      "emit_bytes": 20
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 55
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 14,
+      "emit_bytes": 39
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    }
+  ],
+  "sb_cpd3": [
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 17
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 17,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 17,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 20,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 17
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 17,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 20,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "seq_num": 2,
+      "baggage_found": true,
+      "baggage_bytes": 17,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000004",
+      "service": "svc1",
+      "emit_bytes": 23
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000002",
+      "service": "svc1",
+      "emit_bytes": 20
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000002",
+      "service": "svc1",
+      "emit_bytes": 20
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000005",
+      "service": "svc2",
+      "emit_bytes": 23
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000003",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000003",
+      "service": "svc2",
+      "emit_bytes": 20
+    },
+    {
+      "kind": "end",
+      "trace_id": "bbbbbbbbbbbbbbb2",
+      "span_id": "bbbb000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "aaaaaaaaaaaaaaa1",
+      "span_id": "aaaa000000000001",
+      "service": "svc1",
+      "emit_bytes": 0
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "seq_num": 0,
+      "baggage_found": false,
+      "baggage_bytes": 0,
+      "emit_bytes": 55
+    },
+    {
+      "kind": "start",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "seq_num": 1,
+      "baggage_found": true,
+      "baggage_bytes": 36,
+      "emit_bytes": 0
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000002",
+      "service": "svc1",
+      "emit_bytes": 39
+    },
+    {
+      "kind": "end",
+      "trace_id": "cccccccccccccccc",
+      "span_id": "cccc000000000001",
+      "service": "svc2",
+      "emit_bytes": 0
+    }
+  ]
+}

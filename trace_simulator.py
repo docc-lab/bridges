@@ -1079,6 +1079,7 @@ def _trace_is_clean(spans: List[dict]) -> bool:
     - no broken CHILD_OF references (referenced span IDs must exist)
     - each span has at most one CHILD_OF reference
     - if a CHILD_OF reference exists, it must match the normalized parent_span_id
+    - span IDs are unique within the trace (no duplicate spanID entries)
     """
     if not spans:
         return False
@@ -1088,6 +1089,10 @@ def _trace_is_clean(spans: List[dict]) -> bool:
         sid = s.get("spanID") or s.get("spanId") or ""
         if not sid:
             return False
+        if sid in span_ids:
+            # Duplicate span ID. OpenTracing/Jaeger requires uniqueness
+            # within a trace; reject the whole trace as untrustworthy.
+            return False
         span_ids.add(sid)
 
     roots = []
@@ -1096,14 +1101,19 @@ def _trace_is_clean(spans: List[dict]) -> bool:
         pid = s.get("parent_span_id")
 
         refs = s.get("references") or []
+        # Dedupe CHILD_OF references by spanID — duplicate refs to the same
+        # parent are an instrumentation artifact (the same parent listed
+        # multiple times), not real DAG topology. Only count distinct parents.
         child_of = []
+        seen_co = set()
         for r in refs:
             if not r:
                 continue
             if r.get("refType") != "CHILD_OF":
                 continue
             parent_sid = r.get("spanID") or r.get("spanId") or ""
-            if parent_sid:
+            if parent_sid and parent_sid not in seen_co:
+                seen_co.add(parent_sid)
                 child_of.append(parent_sid)
 
         if len(child_of) > 1:
@@ -1225,12 +1235,95 @@ def load_traces_from_dir(
 # Event stream: start/end events sorted like SDK order
 # -----------------------------------------------------------------------------
 
+def crisp_normalize_spans(spans: List[dict]) -> List[dict]:
+    """
+    Apply CRISP's three preprocessing rules from §5.2 of Zhang et al.,
+    USENIX ATC '22 to enforce strict span nesting:
+
+      1. Underflow: if child.start < parent.start, set child.start =
+         parent.start (and recurse — descendants may now violate against
+         the truncated child).
+      2. Overflow: if child.end > parent.end, set child.end = parent.end
+         (and recurse).
+      3. Out-of-window: if child.end < parent.start OR child.start >
+         parent.end, drop the whole subtree rooted at child.
+
+    Pre-order traversal: parent first, then each child clipped against the
+    parent's *current* (already clipped) bounds.
+
+    Returns the surviving spans (subtree drops applied). Mutates
+    start_time_ns / end_time_ns in place on retained spans.
+    """
+    if not spans:
+        return spans
+
+    span_by_id: dict = {}
+    for s in spans:
+        sid = s.get("spanID") or s.get("spanId") or ""
+        if sid:
+            span_by_id[sid] = s
+    children: Dict[str, List[str]] = {}
+    roots: List[str] = []
+    for sid, s in span_by_id.items():
+        pid = s.get("parent_span_id")
+        if pid is None or pid not in span_by_id:
+            roots.append(sid)
+        else:
+            children.setdefault(pid, []).append(sid)
+
+    dropped: set = set()
+
+    def drop_subtree(start_sid: str) -> None:
+        s = [start_sid]
+        while s:
+            cur = s.pop()
+            if cur in dropped:
+                continue
+            dropped.add(cur)
+            for ch in children.get(cur, []):
+                s.append(ch)
+
+    # Iterative pre-order: stack of (sid, parent_start, parent_end).
+    # Roots have no parent bounds (None) -> no clipping at the root.
+    stack: List[Tuple[str, Any, Any]] = []
+    for r in reversed(roots):
+        stack.append((r, None, None))
+    while stack:
+        sid, ps, pe = stack.pop()
+        if sid in dropped:
+            continue
+        node = span_by_id[sid]
+        if ps is not None:
+            if node["end_time_ns"] < ps or node["start_time_ns"] > pe:
+                drop_subtree(sid)
+                continue
+            if node["start_time_ns"] < ps:
+                node["start_time_ns"] = ps
+            if node["end_time_ns"] > pe:
+                node["end_time_ns"] = pe
+        for ch in children.get(sid, []):
+            stack.append((ch, node["start_time_ns"], node["end_time_ns"]))
+
+    if not dropped:
+        return spans
+    return [
+        s for s in spans
+        if (s.get("spanID") or s.get("spanId") or "") not in dropped
+    ]
+
+
 def build_events(trace: dict) -> List[Tuple[int, str, int, dict]]:
     """
     Build (timestamp_ns, "start"|"end", depth, span) for a trace.
     Caller must sort.
     """
     spans = trace.get("spans") or []
+
+    # Apply CRISP-style timestamp normalization: clip children to parent
+    # windows; drop subtrees fully outside parent. After this every parent
+    # strictly nests its descendants in time.
+    spans = crisp_normalize_spans(spans)
+    trace["spans"] = spans
 
     # Compute a stable tree depth so that, when start times tie,
     # parents are processed before children.

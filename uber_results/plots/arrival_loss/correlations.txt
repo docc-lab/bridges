@@ -1,0 +1,13 @@
+# trace-level correlations (proxy vs has_dangling)
+proxy	n	spearman	p_spearman	point_biserial	p_pb
+num_spans	531085	0.3137	0.000e+00	0.4467	0.000e+00
+max_concurrent_spans	531085	0.3060	0.000e+00	0.4077	0.000e+00
+max_depth	531085	0.2751	0.000e+00	0.2997	0.000e+00
+max_fanout	531085	0.2355	0.000e+00	0.2442	0.000e+00
+span_emission_rate	531085	-0.0258	7.392e-79	0.1951	0.000e+00
+trace_duration_us	531085	0.2881	0.000e+00	0.3341	0.000e+00
+
+# service-level correlations (proxy vs dangling_rate)
+proxy	spearman	p	pearson_log	p
+total_spans	0.5742	7.652e-92	-0.0357	2.514e-01
+total_traces	0.5377	1.348e-78	-0.0368	2.368e-01

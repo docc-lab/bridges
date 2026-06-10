@@ -1072,41 +1072,45 @@ def _normalize_span(span: dict, processes: Optional[dict], trace_id: str) -> dic
     return out
 
 
-def _trace_is_clean(spans: List[dict]) -> bool:
+def _clean_trace(spans: List[dict]) -> Optional[List[dict]]:
     """
-    Validate that a trace is "clean" for sampling:
-    - exactly one root span (a span whose normalized `parent_span_id` is None)
-    - no broken CHILD_OF references (referenced span IDs must exist)
-    - each span has at most one CHILD_OF reference
-    - if a CHILD_OF reference exists, it must match the normalized parent_span_id
-    - span IDs are unique within the trace (no duplicate spanID entries)
+    Validate / repair a trace for sampling. Returns the spans to process,
+    or None if the trace is rejected. Order matters:
+
+    1. span IDs must be unique within the trace (duplicates reject)
+    2. any dangling parent reference (normalized `parent_span_id` not
+       present in the trace) rejects the whole trace, BEFORE multi-root
+       salvage is considered
+    3. exactly one root (normalized `parent_span_id` is None): the original
+       strict filter applies — at most one distinct CHILD_OF per span,
+       CHILD_OF must match `parent_span_id`
+    4. multiple roots: instead of rejecting, keep the largest tree rooted
+       at one of the roots (ties broken by lowest numeric root span ID) and
+       drop every other span; the kept tree must satisfy the same per-span
+       checks
+    5. zero roots: reject
     """
     if not spans:
-        return False
+        return None
 
     span_ids = set()
     for s in spans:
         sid = s.get("spanID") or s.get("spanId") or ""
         if not sid:
-            return False
+            return None
         if sid in span_ids:
             # Duplicate span ID. OpenTracing/Jaeger requires uniqueness
             # within a trace; reject the whole trace as untrustworthy.
-            return False
+            return None
         span_ids.add(sid)
 
-    roots = []
-    for s in spans:
-        sid = s.get("spanID") or s.get("spanId") or ""
-        pid = s.get("parent_span_id")
-
-        refs = s.get("references") or []
+    def _distinct_child_of(s: dict) -> List[str]:
         # Dedupe CHILD_OF references by spanID — duplicate refs to the same
         # parent are an instrumentation artifact (the same parent listed
         # multiple times), not real DAG topology. Only count distinct parents.
         child_of = []
         seen_co = set()
-        for r in refs:
+        for r in s.get("references") or []:
             if not r:
                 continue
             if r.get("refType") != "CHILD_OF":
@@ -1115,24 +1119,90 @@ def _trace_is_clean(spans: List[dict]) -> bool:
             if parent_sid and parent_sid not in seen_co:
                 seen_co.add(parent_sid)
                 child_of.append(parent_sid)
+        return child_of
 
+    def _span_is_clean(s: dict) -> bool:
+        pid = s.get("parent_span_id")
+        child_of = _distinct_child_of(s)
         if len(child_of) > 1:
             return False
-
         if pid is None:
             # Root: must not have any CHILD_OF references
-            if child_of:
-                return False
-            roots.append(sid)
-        else:
-            # Non-root: parent must exist
-            if pid not in span_ids:
-                return False
-            # If there is an explicit CHILD_OF reference, it must match normalized parent
-            if child_of and child_of[0] != pid:
-                return False
+            return not child_of
+        # Non-root: parent must exist
+        if pid not in span_ids:
+            return False
+        # If there is an explicit CHILD_OF reference, it must match normalized parent
+        if child_of and child_of[0] != pid:
+            return False
+        return True
 
-    return len(roots) == 1
+    roots = []
+    for i, s in enumerate(spans):
+        pid = s.get("parent_span_id")
+        if pid is None:
+            roots.append(i)
+        elif pid not in span_ids:
+            # C2: dangling parent reference anywhere rejects the whole
+            # trace, before any multi-root salvage.
+            return None
+    if not roots:
+        return None
+
+    if len(roots) == 1:
+        # Single root: original strict filter — any dirty span anywhere
+        # rejects the trace.
+        if all(_span_is_clean(s) for s in spans):
+            return spans
+        return None
+
+    # Multi-root: keep the biggest tree rooted at one of the roots, drop
+    # every other span (the other roots' trees).
+    children: Dict[str, List[int]] = {}
+    for i, s in enumerate(spans):
+        pid = s.get("parent_span_id")
+        if pid is not None:
+            children.setdefault(pid, []).append(i)
+
+    def _root_key(i: int) -> int:
+        sid = spans[i].get("spanID") or spans[i].get("spanId") or ""
+        try:
+            return int(sid, 16)
+        except ValueError:
+            return 2**128
+
+    best_keep: Optional[set] = None
+    best_root_key = 0
+    for r in roots:
+        keep: set = set()
+        stack = [r]
+        while stack:
+            cur = stack.pop()
+            if cur in keep:
+                continue
+            keep.add(cur)
+            sid = spans[cur].get("spanID") or spans[cur].get("spanId") or ""
+            stack.extend(children.get(sid, []))
+        rk = _root_key(r)
+        if (
+            best_keep is None
+            or len(keep) > len(best_keep)
+            or (len(keep) == len(best_keep) and rk < best_root_key)
+        ):
+            best_keep, best_root_key = keep, rk
+
+    kept = [spans[i] for i in sorted(best_keep)]
+    if not all(_span_is_clean(s) for s in kept):
+        return None
+    return kept
+
+
+def _trace_is_clean(spans: List[dict]) -> bool:
+    """
+    Back-compat boolean wrapper around _clean_trace: True iff the trace is
+    accepted by the cleaning pipeline (possibly after multi-root salvage).
+    """
+    return _clean_trace(spans) is not None
 
 
 def load_traces_from_dir(
@@ -1188,7 +1258,8 @@ def load_traces_from_dir(
                 for s in normalized:
                     s["_trace_source_file"] = _src
                 if require_clean:
-                    if not _trace_is_clean(normalized):
+                    normalized = _clean_trace(normalized)
+                    if normalized is None:
                         continue
                 traces.append(
                     {
@@ -1213,7 +1284,8 @@ def load_traces_from_dir(
         for s in normalized:
             s["_trace_source_file"] = _src
         if require_clean:
-            if not _trace_is_clean(normalized):
+            normalized = _clean_trace(normalized)
+            if normalized is None:
                 continue
         traces.append(
             {

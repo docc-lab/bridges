@@ -84,7 +84,9 @@ func (s *ServiceTable) Name(id uint16) string {
 // Trace structs. Handles both wrapper {"data": [...]} and bare-trace shapes.
 //
 // services is shared across files so the same name maps to the same id.
-// requireClean drops traces that fail _trace_is_clean (Python parity).
+// requireClean applies the cleanliness filter (Python _clean_trace parity):
+// dirty traces are dropped, except multi-root traces, which are salvaged by
+// keeping only the largest tree rooted at one of the roots.
 func LoadTraceFile(path string, services *ServiceTable, requireClean bool) ([]Trace, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -208,29 +210,81 @@ func normalizeTrace(rt rawTrace, services *ServiceTable, requireClean bool) (Tra
 		xs[i] = sx{raw: s, spanID: spanID, parentID: parentID, parentH: parentH, spanH: s.SpanID, coRefs: coRefs}
 	}
 
-	// Cleanliness filter (Python _trace_is_clean).
+	// Cleanliness filter (Python _clean_trace). Order matters:
+	// C5 (duplicate span IDs, checked above) and C2 (dangling parent
+	// reference anywhere in the trace) are trace-fatal first. Only then is
+	// multi-root salvage considered: instead of rejecting a multi-root
+	// trace, keep the largest tree rooted at one of the roots and drop
+	// every other span. The kept tree must itself pass the per-span
+	// C3/C4 checks. Single-root traces get the original strict filter:
+	// any dirty span anywhere rejects the trace.
 	if requireClean {
-		var roots int
-		for _, x := range xs {
-			if len(x.coRefs) > 1 {
-				return Trace{}, false, nil
-			}
+		var roots []int
+		children := make(map[string][]int)
+		for i, x := range xs {
 			if x.parentH == "" {
 				if len(x.coRefs) > 0 {
 					return Trace{}, false, nil
 				}
-				roots++
+				roots = append(roots, i)
 			} else {
 				if _, ok := idSet[x.parentH]; !ok {
+					// C2: dangling parent reference rejects the whole
+					// trace, before any multi-root salvage.
+					return Trace{}, false, nil
+				}
+				children[x.parentH] = append(children[x.parentH], i)
+			}
+		}
+		if len(roots) == 0 {
+			return Trace{}, false, nil
+		}
+		if len(roots) == 1 {
+			for _, x := range xs {
+				if len(x.coRefs) > 1 {
 					return Trace{}, false, nil
 				}
 				if len(x.coRefs) > 0 && x.coRefs[0] != x.parentH {
 					return Trace{}, false, nil
 				}
 			}
-		}
-		if roots != 1 {
-			return Trace{}, false, nil
+		} else {
+			// Size each root's tree (spans reachable via parent links);
+			// ties broken by lowest numeric root span ID for determinism.
+			best, bestSize := -1, 0
+			var bestKeep []bool
+			for _, r := range roots {
+				keep := make([]bool, len(xs))
+				size := 0
+				stack := []int{r}
+				for len(stack) > 0 {
+					cur := stack[len(stack)-1]
+					stack = stack[:len(stack)-1]
+					if keep[cur] {
+						continue
+					}
+					keep[cur] = true
+					size++
+					stack = append(stack, children[xs[cur].spanH]...)
+				}
+				if size > bestSize || (size == bestSize && xs[r].spanID < xs[best].spanID) {
+					best, bestSize, bestKeep = r, size, keep
+				}
+			}
+			kept := make([]sx, 0, bestSize)
+			for i, x := range xs {
+				if !bestKeep[i] {
+					continue
+				}
+				if len(x.coRefs) > 1 {
+					return Trace{}, false, nil
+				}
+				if len(x.coRefs) > 0 && x.coRefs[0] != x.parentH {
+					return Trace{}, false, nil
+				}
+				kept = append(kept, x)
+			}
+			xs = kept
 		}
 	}
 

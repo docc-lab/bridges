@@ -45,7 +45,7 @@ func parseFlags() config {
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
 	flag.BoolVar(&c.bagsize, "bagsize", false, "Output per-trace bagsize metrics")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
-	flag.BoolVar(&c.requireClean, "require-clean", false, "Drop traces failing _trace_is_clean (JSON mode only)")
+	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
 	flag.BoolVar(&c.logDee, "log-dee", false, "S-bridge: log DEE pickup/queue events to stderr")
 	flag.IntVar(&c.deeLogBytes, "dee-log-bytes", 10000, "Threshold for --log-dee")
 	flag.Usage = func() {

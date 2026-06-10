@@ -118,6 +118,14 @@ def main() -> None:
         action="store_true",
         help="Use logarithmic scale for the y-axis.",
     )
+    parser.add_argument(
+        "--ymax-iqr-pct",
+        type=float,
+        default=None,
+        help="Cap the y-axis at the highest error-bar top (Q3 across all series/cpds) "
+        "plus this percent margin, e.g. 20 caps at 1.2x the highest Q3. "
+        "Scatter outliers above the cap are clipped out of view. Default: no cap.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Seed for jitter randomness.")
     args = parser.parse_args()
 
@@ -135,6 +143,7 @@ def main() -> None:
 
     bridge_modes = list(args.bridges)
     n_series = len(bridge_modes)
+    max_bar_top = float("-inf")  # highest Q3 across all series/cpds, for --ymax-iqr-pct
 
     for series_idx, mode in enumerate(bridge_modes):
         if mode not in BRIDGE_META:
@@ -173,6 +182,7 @@ def main() -> None:
             medians.append(median)
             iqr_lows.append(q1)
             iqr_highs.append(q3)
+            max_bar_top = max(max_bar_top, q3)
 
         # Mean line with error bars
         x_positions = [cpd + x_offset for cpd in cpds]
@@ -199,6 +209,8 @@ def main() -> None:
             ax.set_ylim(bottom=args.ymin)
     else:
         ax.set_ylim(bottom=args.ymin)
+    if args.ymax_iqr_pct is not None and max_bar_top > 0:
+        ax.set_ylim(top=max_bar_top * (1.0 + args.ymax_iqr_pct / 100.0))
     ax.set_xticks(cpds)
     ax.grid(True, alpha=0.28)
     ax.legend(loc=args.legend_loc, fontsize=11)

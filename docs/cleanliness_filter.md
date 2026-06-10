@@ -7,12 +7,26 @@ because the filter is non-trivially selective on real tracing data.
 
 ## Definition
 
-`_trace_is_clean` (`bridges/trace_simulator.py`, lines 1075–1125) accepts a
-trace iff **all five** of the following hold:
+`_clean_trace` (`bridges/trace_simulator.py`; Go port in
+`loader/loader.go` `normalizeTrace`) accepts a trace iff **all five** of
+the following hold:
 
-1. **Exactly one root span.** A root is a span whose normalized
-   `parent_span_id` is `None` (i.e., no `parentSpanID` field and no
-   `CHILD_OF` reference resolvable to a span in this trace).
+1. **Exactly one root span — after multi-root salvage.** A root is a span
+   whose normalized `parent_span_id` is `None` (i.e., no `parentSpanID`
+   field and no `CHILD_OF` reference resolvable to a span in this trace).
+   Traces with **multiple roots are no longer rejected outright**: the
+   filter keeps the largest tree rooted at one of the roots (spans
+   reachable from that root via parent links; ties broken by lowest
+   numeric root span ID) and **drops every other span** — the other
+   roots' trees. The kept tree must then satisfy conditions 3–4 below.
+   Traces with zero roots are rejected. Single-root traces get the
+   original strict treatment: conditions 2–4 apply to *every* span.
+
+   **Filter order:** conditions 5 (duplicate span IDs) and 2 (dangling
+   parent references) are evaluated **trace-wide first** and are always
+   fatal — a multi-root trace containing a dangling parent reference
+   anywhere is rejected, *not* salvaged. Multi-root salvage is only
+   attempted on traces whose spans all have resolvable parents.
 
 2. **No dangling `CHILD_OF` references.** Every span ID referenced by a
    `CHILD_OF` must exist among the trace's own span IDs. Pointers to
@@ -36,7 +50,18 @@ trace iff **all five** of the following hold:
    (likely from retry/sampling mechanics emitting the same span twice).
    Treating duplicates as untrustworthy, we reject the entire trace.
 
-A single bad span anywhere in the trace dirties the whole trace.
+For single-root traces, a single bad span anywhere dirties the whole
+trace. For multi-root traces, duplicate span IDs (C5) and dangling
+parent references (C2) anywhere are still fatal; beyond that, only bad
+spans *inside the selected biggest tree* (C3/C4) dirty the trace —
+dirty spans in the dropped trees are discarded along with them.
+
+> **Note:** the empirical numbers below were measured under the previous
+> policy, where any multi-root trace was rejected (C1). Under the
+> current salvage policy, C1-only rejections are instead reduced to
+> their largest root tree and processed; multi-root traces that also
+> violate C2 or C5 anywhere, or whose largest tree violates C3/C4, are
+> still rejected.
 
 ## When it is applied
 

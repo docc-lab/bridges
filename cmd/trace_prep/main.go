@@ -51,7 +51,7 @@ func main() {
 	var (
 		inputDir     = flag.String("input-dir", "", "Directory of Jaeger trace JSON files (required)")
 		outputDir    = flag.String("output-dir", "", "Output corpus directory (required)")
-		requireClean = flag.Bool("require-clean", true, "Drop traces failing _trace_is_clean (Python parity)")
+		requireClean = flag.Bool("require-clean", true, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (Python parity)")
 		workers      = flag.Int("workers", runtime.NumCPU(), "Parallel parse workers")
 		progressN    = flag.Int("progress", 0, "Print progress every N files (0 = silent)")
 	)

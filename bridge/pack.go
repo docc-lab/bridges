@@ -32,6 +32,11 @@ const (
 	// __bag.* tag set by any handler is __bag._br, whose stripped key is
 	// "_br" = 3 bytes.
 	BaggageKeyBytes = 3
+
+	// Key byte size for the per-span "_d" attribute carrying varint(absolute
+	// depth) on spans that never emit a _br payload (--emit-depth mode; see
+	// docs/depth_emission.md).
+	DepthKeyBytes = 2
 )
 
 // VarintEncode encodes a non-negative integer as a protobuf-style varint.

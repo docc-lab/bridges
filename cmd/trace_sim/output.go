@@ -12,7 +12,7 @@ import (
 // representation of the bagsize output. Float formatting matches Python's
 // repr(): whole-number floats get a trailing ".0", others use the shortest
 // roundtrip representation.
-func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics) error {
+func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emitDepth bool) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -48,7 +48,11 @@ func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics) err
 		}
 		return float64(t.BaggageSum) / float64(t.NumBaggageCalls)
 	}, true)
-	writeIntArr(w, "max_baggage_call", m, func(t TraceMetrics) int { return t.BaggageMax }, false)
+	writeIntArr(w, "max_baggage_call", m, func(t TraceMetrics) int { return t.BaggageMax }, emitDepth)
+	if emitDepth {
+		writeIntArr(w, "num_depth_spans", m, func(t TraceMetrics) int { return t.NumDepthSpans }, true)
+		writeIntArr(w, "depth_overhead_sum", m, func(t TraceMetrics) int { return t.DepthSum }, false)
+	}
 
 	io.WriteString(w, "}")
 	return nil

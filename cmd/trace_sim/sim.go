@@ -91,6 +91,8 @@ type TraceMetrics struct {
 	NumBaggageCalls    int
 	BaggageSum         int
 	BaggageMax         int
+	NumDepthSpans      int // spans carrying a _d attribute (--emit-depth only)
+	DepthSum           int // total _d attribute bytes (--emit-depth only)
 	emitted            map[uint64]struct{} // (span_id) — dedupe Start vs End emit
 }
 
@@ -190,6 +192,10 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 					m.CheckpointMax = r.EmitBytes
 				}
 			}
+		}
+		if r.DepthBytes > 0 && m != nil {
+			m.NumDepthSpans++
+			m.DepthSum += r.DepthBytes
 		}
 	}
 

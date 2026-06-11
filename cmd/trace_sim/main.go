@@ -34,6 +34,7 @@ type config struct {
 	requireClean       bool
 	logDee             bool
 	deeLogBytes        int
+	emitDepth          bool
 }
 
 func parseFlags() config {
@@ -46,6 +47,7 @@ func parseFlags() config {
 	flag.BoolVar(&c.bagsize, "bagsize", false, "Output per-trace bagsize metrics")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
 	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
+	flag.BoolVar(&c.emitDepth, "emit-depth", false, "Emit absolute depth: varint(depth) replaces varint(depthMod) in _br payloads, and interior non-checkpoint spans carry a _d attribute (see docs/depth_emission.md)")
 	flag.BoolVar(&c.logDee, "log-dee", false, "S-bridge: log DEE pickup/queue events to stderr")
 	flag.IntVar(&c.deeLogBytes, "dee-log-bytes", 10000, "Threshold for --log-dee")
 	flag.Usage = func() {
@@ -78,9 +80,13 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 	case "vanilla":
 		return bridge.NewVanillaHandler()
 	case "pb":
-		return bridge.NewPathBridgeHandler(c.checkpointDistance, bridge.DefaultBloomFPRate)
+		h := bridge.NewPathBridgeHandler(c.checkpointDistance, bridge.DefaultBloomFPRate)
+		h.EmitDepth = c.emitDepth
+		return h
 	case "cgpb":
-		return bridge.NewCGPBBridgeHandler(c.checkpointDistance, bridge.DefaultBloomFPRate)
+		h := bridge.NewCGPBBridgeHandler(c.checkpointDistance, bridge.DefaultBloomFPRate)
+		h.EmitDepth = c.emitDepth
+		return h
 	case "sbridge":
 		var logger *bridge.DeeSizeLogger
 		if c.logDee {
@@ -90,7 +96,9 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 				SourceFile:     sourceFile,
 			}
 		}
-		return bridge.NewSBridgeHandler(c.checkpointDistance, logger)
+		h := bridge.NewSBridgeHandler(c.checkpointDistance, logger)
+		h.EmitDepth = c.emitDepth
+		return h
 	}
 	fmt.Fprintf(os.Stderr, "unknown mode %q\n", c.mode)
 	os.Exit(2)
@@ -107,7 +115,7 @@ func main() {
 		metrics = runFromJSON(c)
 	}
 
-	if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics); err != nil {
+	if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth); err != nil {
 		fmt.Fprintf(os.Stderr, "write output: %v\n", err)
 		os.Exit(1)
 	}

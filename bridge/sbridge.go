@@ -74,6 +74,11 @@ type SBridgeHandler struct {
 	cpd       uint32
 	deeLogger *DeeSizeLogger
 
+	// EmitDepth emits a "_d" attribute on interior non-checkpoint spans. The
+	// _br payload already leads with absolute depth (PackSBridgeBR), so
+	// payload and baggage accounting are unchanged. See docs/depth_emission.md.
+	EmitDepth bool
+
 	state            map[stateKey]*sbState
 	parentEventCount map[stateKey]int
 	childSeqStart    map[stateKey]int
@@ -290,12 +295,16 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 	// their parent's end and need to find parent state alive.
 
 	isLeaf := !ps.hasChildren
-	var emitBytes int
+	var emitBytes, depthBytes int
 	if isLeaf && !ps.emitted {
 		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + ps.packedLen
 		ps.emitted = true
+	} else if h.EmitDepth && !ps.emitted {
+		// Interior non-checkpoint span: never carries _br, so absolute depth
+		// rides as its own "_d" attribute.
+		depthBytes = DepthKeyBytes + VarintLen(ps.depth)
 	}
-	return EndResult{EmitBytes: emitBytes}
+	return EndResult{EmitBytes: emitBytes, DepthBytes: depthBytes}
 }
 
 func (h *SBridgeHandler) EvictTrace(traceID uint64) {

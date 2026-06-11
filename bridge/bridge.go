@@ -35,11 +35,29 @@ type StartResult struct {
 	BaggageFound bool // parent had handler state -> count this as a baggage call
 	BaggageBytes int  // 3 + len(packed_br) when BaggageFound, else 0
 	EmitBytes    int  // EMIT_PAYLOAD_BYTES set in this OnStart, 0 if none
+
+	// Payload is the actual serialized _br value (type byte || body) when the
+	// handler emitted a checkpoint payload AND capture mode is on. nil
+	// otherwise. Consumed by the reconstruction harness, not by bagsize runs.
+	Payload []byte
 }
 
 // EndResult is the data the simulator needs from OnEnd.
 type EndResult struct {
 	EmitBytes int
+
+	// DepthBytes is the size of the "_d" attribute (DepthKeyBytes +
+	// varint(absolute depth)) emitted on interior non-checkpoint spans in
+	// EmitDepth mode. 0 when the span carries a _br payload instead, or when
+	// EmitDepth is off.
+	DepthBytes int
+
+	// Payload is the serialized _br value for leaf emission in capture mode.
+	Payload []byte
+
+	// Depth is the absolute depth carried by the _d attribute in capture
+	// mode. Valid only when DepthBytes > 0.
+	Depth int
 }
 
 // Handler is the Go analogue of trace_simulator.py BridgeHandler.

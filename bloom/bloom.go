@@ -46,6 +46,7 @@ func MurmurHash3_128(data []byte, seed uint64) (h1, h2 uint64) {
 		k1 *= c2_128
 		h1 ^= k1
 		h1 = (h1 << 27) | (h1 >> 37)
+		h1 += h2
 		h1 = h1*5 + 0x52DCE729
 
 		k2 *= c2_128
@@ -53,6 +54,7 @@ func MurmurHash3_128(data []byte, seed uint64) (h1, h2 uint64) {
 		k2 *= c1_128
 		h2 ^= k2
 		h2 = (h2 << 31) | (h2 >> 33)
+		h2 += h1
 		h2 = h2*5 + 0x38495AB5
 	}
 
@@ -100,12 +102,27 @@ func MurmurHash3_128(data []byte, seed uint64) (h1, h2 uint64) {
 	return h1, h2
 }
 
-// BaseHashes returns the four base hashes used by the filter (two seeds for
-// MurmurHash3-128).
+// BaseHashes returns the four base hashes used by the filter, matching
+// bits-and-blooms v2 baseHashes: h1/h2 = murmur128(data), h3/h4 =
+// murmur128(data || 0x01) (the library appends one byte to its streaming
+// hasher and re-sums).
 func BaseHashes(data []byte) (h1, h2, h3, h4 uint64) {
 	h1, h2 = MurmurHash3_128(data, 0)
-	h3, h4 = MurmurHash3_128(data, 1)
+	var buf [64]byte
+	ext := append(buf[:0], data...)
+	ext = append(ext, 1)
+	h3, h4 = MurmurHash3_128(ext, 0)
 	return
+}
+
+// location returns the ith probe position (pre-modulus), matching
+// bits-and-blooms v2 location(): h[i%2] + i*h[2+(((i+(i%2))%4)/2)], with
+// native uint64 wraparound. Mixing all four hashes prevents the probe
+// schedule from collapsing when any single hash is degenerate mod m (the
+// plain h1 + i*h2 schedule sets/tests a single bit for ~1/m of all keys).
+func location(h *[4]uint64, i uint32) uint64 {
+	ii := uint64(i)
+	return h[ii%2] + ii*h[2+(((ii+(ii%2))%4)/2)]
 }
 
 // EstimateParameters returns optimal m (bits) and k (hash count) for expected
@@ -135,9 +152,10 @@ func EstimateParameters(n int, p float64) (m, k uint32) {
 	return
 }
 
-// Filter is a bloom filter with m bits and k hash functions. Add/Test use
-// double hashing: pos = (h1 + i*h2) mod m, computed via reducing h2 mod m
-// first to avoid uint64 overflow while preserving the modular result.
+// Filter is a bloom filter with m bits and k hash functions. Add/Test derive
+// probe positions via the bits-and-blooms v2 location() schedule over four
+// murmur base hashes; see location() for why plain double hashing is not
+// safe at the small m values bridge checkpointing produces.
 type Filter struct {
 	m    uint32
 	k    uint32
@@ -174,24 +192,22 @@ func (f *Filter) ByteSize() int { return len(f.bits) }
 
 // Add inserts data into the filter.
 func (f *Filter) Add(data []byte) {
-	h1, h2, _, _ := BaseHashes(data)
+	h1, h2, h3, h4 := BaseHashes(data)
+	h := [4]uint64{h1, h2, h3, h4}
 	mu := uint64(f.m)
-	h1m := h1 % mu
-	h2m := h2 % mu
 	for i := uint32(0); i < f.k; i++ {
-		pos := (h1m + uint64(i)*h2m) % mu
+		pos := location(&h, i) % mu
 		f.bits[pos/8] |= 1 << (pos % 8)
 	}
 }
 
 // Test returns true if data may have been added (no false negatives).
 func (f *Filter) Test(data []byte) bool {
-	h1, h2, _, _ := BaseHashes(data)
+	h1, h2, h3, h4 := BaseHashes(data)
+	h := [4]uint64{h1, h2, h3, h4}
 	mu := uint64(f.m)
-	h1m := h1 % mu
-	h2m := h2 % mu
 	for i := uint32(0); i < f.k; i++ {
-		pos := (h1m + uint64(i)*h2m) % mu
+		pos := location(&h, i) % mu
 		if f.bits[pos/8]&(1<<(pos%8)) == 0 {
 			return false
 		}

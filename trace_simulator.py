@@ -621,7 +621,12 @@ class CGPBBridgeHandler(BridgeHandler):
         parent_info = self._span_info.get((trace_id, parent_id)) if parent_id else None
         baggage_found = parent_info is not None
 
-        # Unpack parent bridge state (if present)
+        # Unpack parent bridge state (if present). parent_state_found mirrors
+        # PB's branching: depth_mod restarts at 0 (checkpoint) whenever there
+        # is no usable parent _br — root spans included. Roots not being
+        # checkpoints was a bug that shifted CGPB's checkpoint cadence to
+        # depths cpd-1, 2*cpd-1, ... instead of 0, cpd, ...
+        parent_state_found = False
         if parent_info is not None:
             packed = parent_info.get("_br")
             if packed is None:
@@ -634,10 +639,11 @@ class CGPBBridgeHandler(BridgeHandler):
                     parent_depth_mod, parent_bf_bytes, parent_ha_bytes = 0, b"", b""
                 else:
                     parent_depth_mod, parent_bf_bytes, parent_ha_bytes = unpacked
+                    parent_state_found = True
         else:
             parent_depth_mod, parent_bf_bytes, parent_ha_bytes = 0, b"", b""
 
-        depth_mod = (parent_depth_mod + 1) % self._cpd
+        depth_mod = (parent_depth_mod + 1) % self._cpd if parent_state_found else 0
 
         # Bloom state: deserialize parent bloom, add current span, then possibly reset at checkpoint.
         if parent_info is not None and parent_bf_bytes:

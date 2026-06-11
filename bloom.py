@@ -43,6 +43,7 @@ def _murmur_hash3_128(data: bytes, seed: int) -> Tuple[int, int]:
         k1 = (k1 * _C2_128) & 0xFFFFFFFFFFFFFFFF
         h1 ^= k1
         h1 = ((h1 << 27) | (h1 >> 37)) & 0xFFFFFFFFFFFFFFFF
+        h1 = (h1 + h2) & 0xFFFFFFFFFFFFFFFF
         h1 = (h1 * 5 + 0x52DCE729) & 0xFFFFFFFFFFFFFFFF
 
         k2 = (k2 * _C2_128) & 0xFFFFFFFFFFFFFFFF
@@ -50,6 +51,7 @@ def _murmur_hash3_128(data: bytes, seed: int) -> Tuple[int, int]:
         k2 = (k2 * _C1_128) & 0xFFFFFFFFFFFFFFFF
         h2 ^= k2
         h2 = ((h2 << 31) | (h2 >> 33)) & 0xFFFFFFFFFFFFFFFF
+        h2 = (h2 + h1) & 0xFFFFFFFFFFFFFFFF
         h2 = (h2 * 5 + 0x38495AB5) & 0xFFFFFFFFFFFFFFFF
 
     tail = data[nblocks * 16:]
@@ -84,10 +86,25 @@ def _murmur_hash3_128(data: bytes, seed: int) -> Tuple[int, int]:
 
 
 def _base_hashes(data: bytes) -> Tuple[int, int, int, int]:
-    """Four base hashes (same as Go baseHashes: two seeds for MurmurHash3 128)."""
+    """
+    Four base hashes, matching bits-and-blooms v2 baseHashes: h1/h2 from
+    MurmurHash3-128(data), h3/h4 from MurmurHash3-128(data || 0x01) (the
+    library appends one byte to its streaming hasher and re-sums).
+    """
     h1, h2 = _murmur_hash3_128(data, 0)
-    h3, h4 = _murmur_hash3_128(data, 1)
+    h3, h4 = _murmur_hash3_128(data + b"\x01", 0)
     return h1, h2, h3, h4
+
+
+def _location(h: Tuple[int, int, int, int], i: int) -> int:
+    """
+    The ith probe position (pre-modulus), matching bits-and-blooms v2
+    location(): h[i%2] + i*h[2+(((i+(i%2))%4)//2)], wrapping at 2^64 like Go
+    uint64 arithmetic. Mixing all four hashes prevents the probe schedule
+    from collapsing when any single hash is degenerate mod m (the plain
+    h1 + i*h2 schedule sets/tests a single bit for ~1/m of all keys).
+    """
+    return (h[i % 2] + i * h[2 + (((i + (i % 2)) % 4) // 2)]) & 0xFFFFFFFFFFFFFFFF
 
 
 def estimate_parameters(n: int, p: float) -> Tuple[int, int]:
@@ -126,17 +143,17 @@ class BloomFilter:
         return self._k
 
     def add(self, data: bytes) -> None:
-        h1, h2, _, _ = _base_hashes(data)
+        h = _base_hashes(data)
         for i in range(self._k):
-            pos = (h1 + i * h2) % self._m
+            pos = _location(h, i) % self._m
             byte_idx = pos // 8
             bit_idx = pos % 8
             self._bits[byte_idx] |= 1 << bit_idx
 
     def test(self, data: bytes) -> bool:
-        h1, h2, _, _ = _base_hashes(data)
+        h = _base_hashes(data)
         for i in range(self._k):
-            pos = (h1 + i * h2) % self._m
+            pos = _location(h, i) % self._m
             byte_idx = pos // 8
             bit_idx = pos % 8
             if (self._bits[byte_idx] & (1 << bit_idx)) == 0:

@@ -696,7 +696,7 @@
       "seq_num": 0,
       "baggage_found": false,
       "baggage_bytes": 0,
-      "emit_bytes": 0
+      "emit_bytes": 14
     },
     {
       "kind": "start",
@@ -726,7 +726,7 @@
       "seq_num": 1,
       "baggage_found": true,
       "baggage_bytes": 21,
-      "emit_bytes": 23
+      "emit_bytes": 0
     },
     {
       "kind": "start",
@@ -736,7 +736,7 @@
       "seq_num": 0,
       "baggage_found": false,
       "baggage_bytes": 0,
-      "emit_bytes": 0
+      "emit_bytes": 14
     },
     {
       "kind": "start",
@@ -756,7 +756,7 @@
       "seq_num": 2,
       "baggage_found": true,
       "baggage_bytes": 30,
-      "emit_bytes": 32
+      "emit_bytes": 0
     },
     {
       "kind": "start",
@@ -773,7 +773,7 @@
       "trace_id": "aaaaaaaaaaaaaaa1",
       "span_id": "aaaa000000000004",
       "service": "svc1",
-      "emit_bytes": 0
+      "emit_bytes": 23
     },
     {
       "kind": "end",
@@ -794,7 +794,7 @@
       "trace_id": "aaaaaaaaaaaaaaa1",
       "span_id": "aaaa000000000005",
       "service": "svc2",
-      "emit_bytes": 0
+      "emit_bytes": 32
     },
     {
       "kind": "end",
@@ -832,7 +832,7 @@
       "seq_num": 0,
       "baggage_found": false,
       "baggage_bytes": 0,
-      "emit_bytes": 0
+      "emit_bytes": 14
     },
     {
       "kind": "start",

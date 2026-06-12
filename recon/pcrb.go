@@ -3,6 +3,8 @@ package recon
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"os"
 	"sort"
 
 	"bridges/bloom"
@@ -253,11 +255,13 @@ func ReconstructPCRB(survivors []Span, cfg Config) Result {
 		rsv map[int]bool  // depth -> reserved synthetic (dropped parent slots)
 	}
 	led := make(map[*fragState]*chainLedger, len(states))
-	prov := make(map[*fragState]map[int]byte) // write provenance: 'A' collapse, 'B' orphan placement, 'C'/'D' coverage
+	prov := make(map[*fragState]map[int]byte)      // write provenance: 'A' collapse, 'B' orphan placement, 'C'/'D' coverage
+	rsvOwner := make(map[*fragState]map[int]*Span) // reserving orphan root per level; nil/absent = the chain's own dropped-parent wall
 	for _, fs := range states {
 		l := &chainLedger{occ: make(map[int]*Span), rsv: map[int]bool{fs.p.o.Depth - 1: true}}
 		led[fs] = l
 		prov[fs] = make(map[int]byte)
+		rsvOwner[fs] = make(map[int]*Span)
 	}
 	open := func(fs *fragState, d int) bool {
 		if d <= fs.p.anchor.Depth || d >= fs.p.o.Depth {
@@ -349,6 +353,7 @@ func ReconstructPCRB(survivors []Span, cfg Config) Result {
 		seen := make(map[uint64]bool)
 		for _, f := range fits {
 			led[f.fs].rsv[r.Depth-1] = true
+			rsvOwner[f.fs][r.Depth-1] = r
 			for _, s := range f.path {
 				write(f.fs, s, 'B')
 				if !seen[s.SpanID] {
@@ -382,6 +387,7 @@ func ReconstructPCRB(survivors []Span, cfg Config) Result {
 		unplaced = append(unplaced, byID[id])
 	}
 	placedSet := make(map[uint64]bool)
+	rebindCount := make(map[uint64]int) // anti-ping-pong cap across rounds
 	resolveOrphans := func(wide bool) bool {
 		any := false
 		for changed := true; changed; {
@@ -546,17 +552,17 @@ func ReconstructPCRB(survivors []Span, cfg Config) Result {
 		if resolveOrphans(true) {
 			continue
 		}
-		// Escalation 2 (v7.3.2, rule D): generalized recursive displacement
-		// over the JOINT constraint graph. Demands = unmatched open ends AND
-		// unplaced orphans; supply = ledger levels; moves = drop (when the
-		// occupant's coverage is not solely demanded here) or re-home
-		// (recursively displacing the destination). Provenance-legal:
-		// 'B' orphan-placement writes and reservations are immovable.
-		// Dropped A/C evidence is self-healing — rule A re-collapses it on
-		// the next round wherever it is still uniquely supported. Every
-		// displacement is flagged; empirically displacement CORRECTS FPs
-		// (must-receive/must-place are theorem-backed; the displaced write
-		// rests on a single membership test).
+		// Escalation 2 (v7.3.4, rule D): FULL mutual movability to fixpoint.
+		// Demands (unmatched open ends, unplaced orphans) displace through
+		// any blocker: A/C/D writes drop or re-home; B-writes AND orphan
+		// reservations move by RE-BINDING the owning orphan — the whole
+		// coalesced placement, rigidity preserved, with rollback if no
+		// alternative fit exists. The only absolute wall is a chain's own
+		// dropped-parent slot (truth-backed). A per-orphan rebind cap
+		// prevents cross-round ping-pong. Spacing theorem note: a demand
+		// colliding with a reservation means a surviving span and a
+		// dropped parent claim one slot — impossible in truth, so one
+		// placement is FP and SHOULD be contested.
 		gate := func(s *Span, fs *fragState) bool {
 			if fs.p.threadBits == nil || s == fs.p.o || s.LeafCarrier {
 				return false
@@ -577,13 +583,182 @@ func ReconstructPCRB(survivors []Span, cfg Config) Result {
 			}
 			return n
 		}
+		ownerRoot := func(s *Span) *Span {
+			cur := s
+			for {
+				p, ok := byID[cur.ParentID]
+				if !ok {
+					break
+				}
+				cur = p
+			}
+			if placedSet[cur.SpanID] {
+				return cur
+			}
+			return nil
+		}
+		orphanSpanSet := func(root *Span) map[uint64]bool {
+			set := make(map[uint64]bool)
+			queue := []*Span{root}
+			for len(queue) > 0 {
+				s := queue[len(queue)-1]
+				queue = queue[:len(queue)-1]
+				set[s.SpanID] = true
+				queue = append(queue, children[s.SpanID]...)
+			}
+			return set
+		}
+		// undoOrphan removes a placement completely: every ledger write of
+		// any of the orphan's spans on ANY chain (cross-chain rule-A
+		// collapses included), its reservations, occupancy records, and
+		// pool entries.
+		undoOrphan := func(root *Span) []*oFit {
+			old := orphanChains[root.SpanID]
+			set := orphanSpanSet(root)
+			for _, fs2 := range states {
+				for d, s := range led[fs2].occ {
+					if s != nil && set[s.SpanID] {
+						led[fs2].occ[d] = nil
+						delete(prov[fs2], d)
+					}
+				}
+				for d, owner := range rsvOwner[fs2] {
+					if owner == root {
+						shared := false
+						for _, of := range occUpper[fs2] {
+							if of.path[0] != root && of.path[0].Depth == root.Depth {
+								shared = true
+								break
+							}
+						}
+						if !shared {
+							delete(led[fs2].rsv, d)
+						}
+						delete(rsvOwner[fs2], d)
+					}
+				}
+				fits := occUpper[fs2][:0]
+				for _, of := range occUpper[fs2] {
+					if of.path[0] != root {
+						fits = append(fits, of)
+					}
+				}
+				occUpper[fs2] = fits
+			}
+			for _, f := range old {
+				if pool := orphanSpansByW[f.fs.p.anchor.SpanID]; pool != nil {
+					for d := range pool {
+						lst := pool[d][:0]
+						for _, c := range pool[d] {
+							if !set[c.SpanID] {
+								lst = append(lst, c)
+							}
+						}
+						pool[d] = lst
+					}
+				}
+			}
+			delete(orphanChains, root.SpanID)
+			res.OrphansPlaced--
+			return old
+		}
 		type lvlKey struct {
 			fs *fragState
 			d  int
 		}
 		var displace func(fs *fragState, d int, visited map[lvlKey]bool) bool
+		var rebindOrphan func(root *Span, visited map[lvlKey]bool) bool
+		slotForce := func(fs *fragState, d int) bool {
+			return d > fs.p.anchor.Depth && d < fs.p.o.Depth
+		}
+		forceFitOn := func(r *Span, fs *fragState, visited map[lvlKey]bool) *oFit {
+			if fs.p.threadBits == nil || r == fs.p.o || r.Depth > fs.p.o.Depth-2 {
+				return nil
+			}
+			if !slotForce(fs, r.Depth-1) || !slotForce(fs, r.Depth) {
+				return nil
+			}
+			bf := bloom.Deserialize(fs.p.threadBits, cfg.BloomM, cfg.BloomK)
+			ph := bridge.HexOf(r.ParentID)
+			rh := bridge.HexOf(r.SpanID)
+			if !bf.Test(ph[:]) || !bf.Test(rh[:]) {
+				return nil
+			}
+			path := []*Span{r}
+			cur := r
+			for {
+				var next *Span
+				n := 0
+				for _, c := range children[cur.SpanID] {
+					if c.Depth > fs.p.o.Depth-2 || !slotForce(fs, c.Depth) {
+						continue
+					}
+					hex := bridge.HexOf(c.SpanID)
+					if bf.Test(hex[:]) {
+						n++
+						next = c
+					}
+				}
+				if n != 1 {
+					break
+				}
+				path = append(path, next)
+				cur = next
+			}
+			// Clear the reservation slot and every path level.
+			need := []int{r.Depth - 1}
+			for _, s := range path {
+				need = append(need, s.Depth)
+			}
+			for _, d := range need {
+				if led[fs].rsv[d] || led[fs].occ[d] != nil {
+					if !displace(fs, d, visited) {
+						return nil
+					}
+				}
+			}
+			return &oFit{fs: fs, path: path}
+		}
+		rebindOrphan = func(root *Span, visited map[lvlKey]bool) bool {
+			if rebindCount[root.SpanID] >= 3 {
+				return false // anti-ping-pong cap
+			}
+			oldChains := make(map[*fragState]bool)
+			for _, f := range orphanChains[root.SpanID] {
+				oldChains[f.fs] = true
+			}
+			old := undoOrphan(root)
+			rebindCount[root.SpanID]++
+			for _, fs2 := range states {
+				if oldChains[fs2] {
+					continue // fixed depths: same chain = same conflict
+				}
+				if f := forceFitOn(root, fs2, visited); f != nil {
+					commitFits(root, []*oFit{f}, true)
+					return true
+				}
+			}
+			// No alternative: roll the old placement back.
+			commitFits(root, old, true)
+			return false
+		}
 		displace = func(fs *fragState, d int, visited map[lvlKey]bool) bool {
-			if d <= fs.p.anchor.Depth || d >= fs.p.o.Depth || led[fs].rsv[d] {
+			if d <= fs.p.anchor.Depth || d >= fs.p.o.Depth {
+				return false
+			}
+			k := lvlKey{fs, d}
+			if visited[k] {
+				return false
+			}
+			visited[k] = true
+			if led[fs].rsv[d] {
+				owner := rsvOwner[fs][d]
+				if owner == nil {
+					return false // the chain's own dropped-parent slot: truth-backed wall
+				}
+				if rebindOrphan(owner, visited) && !led[fs].rsv[d] {
+					return led[fs].occ[d] == nil
+				}
 				return false
 			}
 			x := led[fs].occ[d]
@@ -591,25 +766,22 @@ func ReconstructPCRB(survivors []Span, cfg Config) Result {
 				return true
 			}
 			if prov[fs][d] == 'B' {
-				return false // unification-backed: immovable here
-			}
-			k := lvlKey{fs, d}
-			if visited[k] {
+				root := ownerRoot(x)
+				if root != nil && rebindOrphan(root, visited) && led[fs].occ[d] == nil {
+					return true
+				}
 				return false
 			}
-			visited[k] = true
-			// Free drop: the occupant's coverage is not solely demanded here.
 			if !(isOpenEnd(x) && appearances(x) == 1) {
 				led[fs].occ[d] = nil
 				delete(prov[fs], d)
 				return true
 			}
-			// Sole-coverage open end: re-home it first (recursively).
 			for _, fs2 := range states {
 				if fs2 == fs || !gate(x, fs2) {
 					continue
 				}
-				if led[fs2].occ[x.Depth] == nil && open(fs2, x.Depth) || displace(fs2, x.Depth, visited) {
+				if open(fs2, x.Depth) || displace(fs2, x.Depth, visited) {
 					write(fs2, x, 'D')
 					led[fs].occ[d] = nil
 					delete(prov[fs], d)
@@ -638,76 +810,310 @@ func ReconstructPCRB(survivors []Span, cfg Config) Result {
 				}
 			}
 		}
-		// Demand class 2: unplaced orphans — force-fit with displacement.
-		// Path walk treats displaceable levels as viable, then clears them.
-		slotForce := func(fs *fragState, d int) bool {
-			if d <= fs.p.anchor.Depth || d >= fs.p.o.Depth || led[fs].rsv[d] {
-				return false
-			}
-			return led[fs].occ[d] == nil || prov[fs][d] != 'B'
-		}
+		// Demand class 2: unplaced orphans.
 		for _, r := range unplaced {
 			if placedSet[r.SpanID] {
 				continue
 			}
+			fitted := false
 			for _, fs := range states {
-				if fs.p.threadBits == nil || r == fs.p.o || r.Depth > fs.p.o.Depth-2 {
-					continue
+				if f := forceFitOn(r, fs, make(map[lvlKey]bool)); f != nil {
+					commitFits(r, []*oFit{f}, true)
+					placedSet[r.SpanID] = true
+					ladder, fitted = true, true
+					break
 				}
-				if !slotForce(fs, r.Depth-1) || !slotForce(fs, r.Depth) {
-					continue
-				}
-				bf := bloom.Deserialize(fs.p.threadBits, cfg.BloomM, cfg.BloomK)
-				ph := bridge.HexOf(r.ParentID)
-				rh := bridge.HexOf(r.SpanID)
-				if !bf.Test(ph[:]) || !bf.Test(rh[:]) {
-					continue
-				}
-				path := []*Span{r}
-				cur := r
-				for {
-					var next *Span
-					n := 0
-					for _, c := range children[cur.SpanID] {
-						if c.Depth > fs.p.o.Depth-2 || !slotForce(fs, c.Depth) {
-							continue
+			}
+			if !fitted && debugScore {
+				// Classify the best failure stage reached across all chains:
+				// 0=no chains at all, 1=depth-infeasible everywhere,
+				// 2=gates never passed, 3=gates passed but displacement failed.
+				best := 0
+				for _, fs := range states {
+					if fs.p.threadBits == nil || r == fs.p.o {
+						continue
+					}
+					stage := 1
+					if r.Depth <= fs.p.o.Depth-2 {
+						stage = 2
+						bf := bloom.Deserialize(fs.p.threadBits, cfg.BloomM, cfg.BloomK)
+						ph := bridge.HexOf(r.ParentID)
+						rh := bridge.HexOf(r.SpanID)
+						if bf.Test(ph[:]) && bf.Test(rh[:]) {
+							stage = 3
 						}
-						hex := bridge.HexOf(c.SpanID)
-						if bf.Test(hex[:]) {
-							n++
-							next = c
-						}
 					}
-					if n != 1 {
-						break
-					}
-					path = append(path, next)
-					cur = next
-				}
-				// Clear every needed level (reservation slot + path levels).
-				ok := true
-				visited := make(map[lvlKey]bool)
-				if led[fs].occ[r.Depth-1] != nil && !displace(fs, r.Depth-1, visited) {
-					ok = false
-				}
-				for _, s := range path {
-					if !ok {
-						break
-					}
-					if led[fs].occ[s.Depth] != nil && !displace(fs, s.Depth, visited) {
-						ok = false
+					if stage > best {
+						best = stage
 					}
 				}
-				if !ok {
-					continue
-				}
-				commitFits(r, []*oFit{{fs: fs, path: path}}, true)
-				placedSet[r.SpanID] = true
-				ladder = true
-				break
+				fmt.Fprintf(os.Stderr, "STUCKORPHAN stage=%d root=%016x depth=%d chains=%d\n",
+					best, r.SpanID, r.Depth, len(states))
 			}
 		}
 		if ladder {
+			continue
+		}
+		// Escalation 3 (v7.3.5): window-local COMPLETE solver. Greedy
+		// displacement is approximate — order-dependent, local — and its
+		// deadlocks (A needs B's slot, B needs A's) require joint
+		// reassignment. Every constraint is window-local, so the global
+		// problem shatters into micro-CSPs small enough for exhaustive
+		// backtracking: variables = this window's unplaced orphans,
+		// unmatched open ends, already-placed orphans, and existing
+		// coverage writes; constraints = chain walls, level exclusivity,
+		// rigidity (whole-orphan options), spacing (root-1 reservations),
+		// and both invariants. The search is PURE (no ledger mutation);
+		// the first satisfying assignment is applied atomically. The
+		// mutual-success theorem guarantees satisfiability whenever the
+		// true receivers survive — a cap-out or unsat is counted, never
+		// papered over.
+		pathOn := func(r *Span, fs *fragState) []*Span {
+			if fs.p.threadBits == nil || r == fs.p.o {
+				return nil
+			}
+			if r.Depth > fs.p.o.Depth-2 || r.Depth <= fs.p.anchor.Depth+1 {
+				return nil
+			}
+			bf := bloom.Deserialize(fs.p.threadBits, cfg.BloomM, cfg.BloomK)
+			ph := bridge.HexOf(r.ParentID)
+			rh := bridge.HexOf(r.SpanID)
+			if !bf.Test(ph[:]) || !bf.Test(rh[:]) {
+				return nil
+			}
+			path := []*Span{r}
+			cur := r
+			for {
+				var next *Span
+				n := 0
+				for _, c := range children[cur.SpanID] {
+					if c.Depth > fs.p.o.Depth-2 {
+						continue
+					}
+					hex := bridge.HexOf(c.SpanID)
+					if bf.Test(hex[:]) {
+						n++
+						next = c
+					}
+				}
+				if n != 1 {
+					break
+				}
+				path = append(path, next)
+				cur = next
+			}
+			return path
+		}
+		type wOpt struct {
+			fs    *fragState
+			spans []*Span // occupancy levels (path for orphans, self for open ends)
+			rsvD  int     // reservation level (orphans), -1 for open ends
+		}
+		type wItem struct {
+			span     *Span
+			isOrphan bool
+			opts     []wOpt
+		}
+		solveWindow := func(w uint64, chains []*fragState, unmatchedEnds []*Span) bool {
+			inW := make(map[*fragState]bool, len(chains))
+			for _, fs := range chains {
+				inW[fs] = true
+			}
+			// Demands: unplaced orphans gated here, unmatched open ends
+			// gated here. Reassignables: placed-in-W orphans, existing C/D
+			// coverage writes on W's chains.
+			var items []wItem
+			demand := 0
+			seenOrphan := make(map[uint64]bool)
+			addOrphan := func(r *Span) {
+				if seenOrphan[r.SpanID] {
+					return
+				}
+				seenOrphan[r.SpanID] = true
+				var opts []wOpt
+				for _, fs := range chains {
+					if p := pathOn(r, fs); p != nil {
+						opts = append(opts, wOpt{fs: fs, spans: p, rsvD: r.Depth - 1})
+					}
+				}
+				if len(opts) > 0 {
+					items = append(items, wItem{span: r, isOrphan: true, opts: opts})
+				}
+			}
+			for _, r := range unplaced {
+				if placedSet[r.SpanID] {
+					continue
+				}
+				before := len(items)
+				addOrphan(r)
+				if len(items) > before {
+					demand++
+				}
+			}
+			for _, e := range unmatchedEnds {
+				var opts []wOpt
+				for _, fs := range chains {
+					if gate(e, fs) {
+						opts = append(opts, wOpt{fs: fs, spans: []*Span{e}, rsvD: -1})
+					}
+				}
+				if len(opts) > 0 {
+					items = append(items, wItem{span: e, isOrphan: false, opts: opts})
+					demand++
+				}
+			}
+			if demand == 0 {
+				return false
+			}
+			for _, fs := range chains {
+				for _, of := range occUpper[fs] {
+					addOrphan(of.path[0])
+				}
+				for d, p := range prov[fs] {
+					if p == 'C' || p == 'D' {
+						if s := led[fs].occ[d]; s != nil && isOpenEnd(s) {
+							var opts []wOpt
+							for _, fs2 := range chains {
+								if gate(s, fs2) {
+									opts = append(opts, wOpt{fs: fs2, spans: []*Span{s}, rsvD: -1})
+								}
+							}
+							if len(opts) > 0 {
+								items = append(items, wItem{span: s, isOrphan: false, opts: opts})
+							}
+						}
+					}
+				}
+			}
+			if len(items) > 24 {
+				return false // combinatorial guard (counted via debug)
+			}
+			sort.Slice(items, func(i, j int) bool { return len(items[i].opts) < len(items[j].opts) })
+			// Pure backtracking over joint assignments.
+			type lk struct {
+				fs *fragState
+				d  int
+			}
+			usedOcc := make(map[lk]bool)
+			usedRsv := make(map[lk]bool)
+			assign := make([]int, len(items))
+			budget := 20000
+			var bt func(i int) bool
+			bt = func(i int) bool {
+				if budget <= 0 {
+					return false
+				}
+				budget--
+				if i == len(items) {
+					return true
+				}
+				it := items[i]
+				for oi, opt := range it.opts {
+					ok := true
+					var occKeys []lk
+					var rsvKey *lk
+					for _, s := range opt.spans {
+						k := lk{opt.fs, s.Depth}
+						if usedOcc[k] || usedRsv[k] || led[opt.fs].rsv[s.Depth] && rsvOwner[opt.fs][s.Depth] == nil {
+							ok = false
+							break
+						}
+						occKeys = append(occKeys, k)
+					}
+					if ok && opt.rsvD >= 0 {
+						k := lk{opt.fs, opt.rsvD}
+						if usedOcc[k] {
+							ok = false
+						} else {
+							rsvKey = &k
+						}
+					}
+					if !ok {
+						continue
+					}
+					for _, k := range occKeys {
+						usedOcc[k] = true
+					}
+					if rsvKey != nil {
+						usedRsv[*rsvKey] = true
+					}
+					assign[i] = oi
+					if bt(i + 1) {
+						return true
+					}
+					for _, k := range occKeys {
+						delete(usedOcc, k)
+					}
+					if rsvKey != nil {
+						delete(usedRsv, *rsvKey)
+					}
+				}
+				return false
+			}
+			if !bt(0) {
+				if debugScore {
+					fmt.Fprintf(os.Stderr, "WSOLVER unsat/cap window=%016x items=%d budget=%d\n", w, len(items), budget)
+				}
+				return false
+			}
+			// Apply atomically: tear down the window's reassignable state,
+			// then write the satisfying assignment.
+			for _, it := range items {
+				if it.isOrphan && placedSet[it.span.SpanID] {
+					undoOrphan(it.span)
+					placedSet[it.span.SpanID] = false
+				}
+			}
+			for _, fs := range chains {
+				for d, p := range prov[fs] {
+					if p == 'C' || p == 'D' || p == 'A' {
+						led[fs].occ[d] = nil
+						delete(prov[fs], d)
+					}
+				}
+			}
+			for i, it := range items {
+				opt := it.opts[assign[i]]
+				if it.isOrphan {
+					commitFits(it.span, []*oFit{{fs: opt.fs, path: opt.spans}}, true)
+					placedSet[it.span.SpanID] = true
+				} else {
+					if s := led[opt.fs].occ[it.span.Depth]; s != nil {
+						led[opt.fs].occ[it.span.Depth] = nil
+						delete(prov[opt.fs], it.span.Depth)
+					}
+					write(opt.fs, it.span, 'D')
+					res.ForcedMatches++
+				}
+			}
+			return true
+		}
+		// Demand lists once per round; skip the solver entirely when both
+		// invariants are already satisfied (the overwhelmingly common case).
+		var unmatchedEnds []*Span
+		for i := range survivors {
+			e := &survivors[i]
+			if isOpenEnd(e) && appearances(e) == 0 {
+				unmatchedEnds = append(unmatchedEnds, e)
+			}
+		}
+		hasUnplaced := false
+		for _, r := range unplaced {
+			if !placedSet[r.SpanID] {
+				hasUnplaced = true
+				break
+			}
+		}
+		if len(unmatchedEnds) == 0 && !hasUnplaced {
+			break
+		}
+		solved := false
+		for w, chains := range chainsByW {
+			if solveWindow(w, chains, unmatchedEnds) {
+				solved = true
+			}
+		}
+		if solved {
 			continue
 		}
 		break

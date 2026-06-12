@@ -21,7 +21,9 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
 	"time"
 
 	"bridges/bridge"
@@ -46,6 +48,7 @@ type config struct {
 	prefixLen          int    // PCR truncated checkpoint-root ID length
 	classifyWrong      string // JSONL dump path for wrong-edge classification (pcr/pcrb)
 	stopOnGap          bool   // PCRB: stop threading at first zero-candidate level
+	workers            int    // reconstruction worker goroutines (0 = NumCPU)
 }
 
 func parseFlags() config {
@@ -66,6 +69,7 @@ func parseFlags() config {
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to process (0 = all). Corpus mode: first N of the corpus trace order; events of other traces are skipped during streaming")
 	flag.BoolVar(&c.requireClean, "require-clean", true, "Cleanliness filter (JSON mode only)")
 	flag.StringVar(&c.classifyWrong, "classify-wrong", "", "Write one JSONL record per wrong-edge bridge (anchor not a true ancestor) locating the divergence against truth")
+	flag.IntVar(&c.workers, "workers", 0, "Reconstruction worker goroutines (0 = NumCPU). Drop decisions stay serial, so results are bit-identical at any worker count")
 	gapPolicy := ""
 	flag.StringVar(&gapPolicy, "gap-policy", "continue", "PCRB threading at a zero-candidate level: continue (default) or stop (maximally FP-averse)")
 	flag.Usage = func() {
@@ -74,8 +78,8 @@ func parseFlags() config {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" {
-		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, or pcrb (got %q)\n", c.mode)
+	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" {
+		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, or pcrs (got %q)\n", c.mode)
 		os.Exit(2)
 	}
 	switch gapPolicy {
@@ -155,6 +159,20 @@ type harness struct {
 
 	cpd      int
 	wrongLog *os.File // non-nil: wrong-edge classification dump
+
+	// Per-trace reconstruction is embarrassingly parallel (no cross-trace
+	// state in pb/pcr/pcrb/pcrs). Drop decisions are made SERIALLY at
+	// dispatch (preserving the global RNG sequence, hence bit-identical
+	// results at any worker count); decode+reconstruct+score fan out.
+	jobs chan finishJob
+	wg   sync.WaitGroup
+	mu   sync.Mutex
+}
+
+type finishJob struct {
+	tid     uint64
+	spans   []collSpan
+	dropped map[uint64]struct{}
 }
 
 // wrongRec locates one wrong-edge bridge against the pre-drop truth.
@@ -182,7 +200,7 @@ func newHarness(c config) *harness {
 		ph.Capture = true
 		cfg.PrefixLen = c.prefixLen
 		h = ph
-	case "pcrb":
+	case "pcrb", "pcrs":
 		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		ph.Capture = true
 		// PCRB bloom geometry differs from PB's for the same --bloom-fp
@@ -208,7 +226,11 @@ func newHarness(c config) *harness {
 		}
 		wlog = f
 	}
-	return &harness{
+	workers := c.workers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	ha := &harness{
 		h:          h,
 		mode:       c.mode,
 		cpd:        c.checkpointDistance,
@@ -221,7 +243,24 @@ func newHarness(c config) *harness {
 		idxByKey:   make(map[spanKey]int),
 		openByTID:  make(map[uint64]int),
 		nextSeq:    make(map[uint64]map[uint64]int),
+		jobs:       make(chan finishJob, workers*2),
 	}
+	for i := 0; i < workers; i++ {
+		ha.wg.Add(1)
+		go func() {
+			defer ha.wg.Done()
+			for j := range ha.jobs {
+				ha.process(j)
+			}
+		}()
+	}
+	return ha
+}
+
+// drain closes the job channel and waits for in-flight reconstructions.
+func (ha *harness) drain() {
+	close(ha.jobs)
+	ha.wg.Wait()
 }
 
 func (ha *harness) beginTrace(tid uint64, spanCount int) {
@@ -265,8 +304,9 @@ func (ha *harness) onEvent(ts int64, kind bridge.Kind, tid, sid, pid uint64, ser
 	}
 }
 
-// finishTrace runs drop -> reconstruct -> score for one closed trace and
-// frees its collected state.
+// finishTrace frees the trace's collection state, makes the drop decisions
+// SERIALLY (global RNG order preserved -> bit-identical results regardless
+// of worker count), and hands reconstruction+scoring to the worker pool.
 func (ha *harness) finishTrace(tid uint64) {
 	spans := ha.spansByTID[tid]
 	delete(ha.spansByTID, tid)
@@ -286,6 +326,12 @@ func (ha *harness) finishTrace(tid uint64) {
 			dropped[s.spanID] = struct{}{}
 		}
 	}
+	ha.jobs <- finishJob{tid: tid, spans: spans, dropped: dropped}
+}
+
+// process is the per-trace parallel work: decode, reconstruct, score.
+func (ha *harness) process(j finishJob) {
+	tid, spans, dropped := j.tid, j.spans, j.dropped
 
 	truth := make([]recon.TruthSpan, len(spans))
 	for i, s := range spans {
@@ -308,7 +354,7 @@ func (ha *harness) finishTrace(tid uint64) {
 				sp.Depth = d
 				sp.CkptPrefix = prefix
 				sp.LeafCarrier = d%ha.cpd != 0
-			} else if ha.mode == "pcrb" {
+			} else if ha.mode == "pcrb" || ha.mode == "pcrs" {
 				d, prefix, bits, err := recon.DecodePCRBPayload(s.br, ha.cfg)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
@@ -339,6 +385,10 @@ func (ha *harness) finishTrace(tid uint64) {
 		res := recon.ReconstructPCRB(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
 		ha.classifyWrong(tid, res, truth, dropped)
+	} else if ha.mode == "pcrs" {
+		res := recon.ReconstructPCRS(survivors, ha.cfg)
+		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
+		ha.classifyWrong(tid, res, truth, dropped)
 	} else {
 		res := recon.ReconstructPB(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))
@@ -352,6 +402,8 @@ func (ha *harness) classifyWrong(tid uint64, res recon.Result, truth []recon.Tru
 	if ha.wrongLog == nil || len(res.Bridges) == 0 {
 		return
 	}
+	ha.mu.Lock()
+	defer ha.mu.Unlock()
 	parent := make(map[uint64]uint64, len(truth))
 	depth := make(map[uint64]int, len(truth))
 	for _, t := range truth {
@@ -416,6 +468,8 @@ func (ha *harness) classifyWrong(tid uint64, res recon.Result, truth []recon.Tru
 }
 
 func (ha *harness) scoresStore(tid uint64, sc recon.Score) {
+	ha.mu.Lock()
+	defer ha.mu.Unlock()
 	if ha.scores == nil {
 		ha.scores = make(map[uint64]recon.Score)
 	}
@@ -465,6 +519,7 @@ func main() {
 	} else {
 		traceOrder = runFromJSON(c, ha)
 	}
+	ha.drain() // wait for in-flight parallel reconstructions
 
 	orderName := "independent"
 	if c.bottomUp {
@@ -482,7 +537,7 @@ func main() {
 	switch c.mode {
 	case "pcr":
 		out.PrefixLen = c.prefixLen
-	case "pcrb":
+	case "pcrb", "pcrs":
 		out.PrefixLen = c.prefixLen
 		out.BloomFP = c.bloomFP
 	default:
@@ -502,7 +557,7 @@ func main() {
 		out.NumUnanchored = append(out.NumUnanchored, sc.Unanchored)
 		out.NumSynthetic = append(out.NumSynthetic, sc.Synthetic)
 		out.NumBorrowed = append(out.NumBorrowed, sc.Borrowed)
-		if c.mode == "pcr" || c.mode == "pcrb" {
+		if c.mode == "pcr" || c.mode == "pcrb" || c.mode == "pcrs" {
 			out.NumFragmentsLost = append(out.NumFragmentsLost, sc.FragmentsLost)
 			out.NumSpansLost = append(out.NumSpansLost, sc.SpansLost)
 			out.NumAncestorsSkip = append(out.NumAncestorsSkip, sc.AncestorsSkipped)
@@ -569,7 +624,7 @@ func main() {
 		agg.Misattached, agg.Unanchored, agg.Synthetic, agg.Borrowed)
 	fmt.Fprintf(os.Stderr, "ambiguous=%d (of which misattached=%d); non-ambiguous misattached=%d\n",
 		agg.Ambiguous, agg.AmbiguousBad, agg.Misattached-agg.AmbiguousBad)
-	if c.mode == "pcr" || c.mode == "pcrb" {
+	if c.mode == "pcr" || c.mode == "pcrb" || c.mode == "pcrs" {
 		fmt.Fprintf(os.Stderr, "fragments_lost=%d spans_lost=%d (%.2f%% of survivors thrown away)\n",
 			agg.FragmentsLost, agg.SpansLost, pct(agg.SpansLost, agg.Spans-agg.Dropped))
 		fmt.Fprintf(os.Stderr, "ancestors_skipped=%d spans_in_skipped_fragments=%d (%.2f%% of survivors)\n",

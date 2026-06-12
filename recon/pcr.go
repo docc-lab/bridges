@@ -3,6 +3,8 @@ package recon
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"os"
 	"sort"
 
 	"bridges/bridge"
@@ -234,10 +236,30 @@ func ScorePCR(res Result, truth []TruthSpan, dropped map[uint64]struct{}) Score 
 	// Per-bridge skip count: REDUCED-set surviving ancestors strictly
 	// between fragment root and anchor. Only meaningful when the anchor is
 	// a true ancestor (wrong-checkpoint bridges excluded).
+	var survKids, truthKids map[uint64]int
+	var depthOf map[uint64]int
+	if debugScore {
+		survKids = make(map[uint64]int, len(truth))
+		truthKids = make(map[uint64]int, len(truth))
+		depthOf = make(map[uint64]int, len(truth))
+		for _, t := range truth {
+			depthOf[t.SpanID] = t.Depth
+			if t.ParentID != 0 {
+				truthKids[t.ParentID]++
+			}
+			if _, gone := dropped[t.SpanID]; gone || lost[t.SpanID] {
+				continue
+			}
+			if _, pg := dropped[t.ParentID]; t.ParentID != 0 && !pg && !lost[t.ParentID] {
+				survKids[t.ParentID]++
+			}
+		}
+	}
 	skippedRoots := make(map[uint64]struct{})
 	for _, b := range res.Bridges {
 		n := 0
 		reached := false
+		var bypassed []uint64
 		for p := parent[b.OrphanID]; p != 0; p = parent[p] {
 			if p == b.AnchorID {
 				reached = true
@@ -245,11 +267,21 @@ func ScorePCR(res Result, truth []TruthSpan, dropped map[uint64]struct{}) Score 
 			}
 			if _, gone := dropped[p]; !gone && !lost[p] {
 				n++
+				bypassed = append(bypassed, p)
 			}
 		}
 		if reached && n > 0 {
 			sc.AncestorsSkipped += n
 			skippedRoots[b.OrphanID] = struct{}{}
+			if debugScore {
+				for _, p := range bypassed {
+					// open end = lost every surviving child but had
+					// children in truth (a true leaf has nothing to lose)
+					open := survKids[p] == 0 && truthKids[p] > 0
+					fmt.Fprintf(os.Stderr, "BENIGNSKIP C=%x depth=%d open=%t anchor=%x adepth=%d\n",
+						p, depthOf[p], open, b.AnchorID, depthOf[b.AnchorID])
+				}
+			}
 		}
 	}
 	if len(skippedRoots) > 0 {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"bridges/bloom"
 	"bridges/bridge"
@@ -74,6 +75,11 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 	type fragState struct {
 		p    anchored
 		cand map[int][]*Span
+		// bf is the window bloom deserialized ONCE (immutable thereafter);
+		// nil when the window has no payload. Deserialize allocates and
+		// copies the whole bit array — re-deserializing inside per-round
+		// loops was a dominant, semantics-free cost.
+		bf *bloom.Filter
 	}
 	var placed []anchored
 	fragRoots := make(map[uint64][]*Span)
@@ -119,14 +125,17 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		fragRoots[hits[0].SpanID] = append(fragRoots[hits[0].SpanID], o)
 	}
 
-	// --- Candidate filling (identical eliminations to ReconstructPCRB) ---
+	// --- Candidate filling (registration-keyed doors; see note below) ---
 	states := make([]*fragState, 0, len(placed))
 	for i := range placed {
 		p := placed[i]
 		fs := &fragState{p: p}
+		if p.threadBits != nil {
+			fs.bf = bloom.Deserialize(p.threadBits, cfg.BloomM, cfg.BloomK)
+		}
 		maxD := p.o.Depth - 2
 		if p.threadBits != nil && maxD > p.anchor.Depth {
-			bf := bloom.Deserialize(p.threadBits, cfg.BloomM, cfg.BloomK)
+			bf := fs.bf
 			fs.cand = make(map[int][]*Span)
 			var dfs func(s *Span)
 			dfs = func(s *Span) {
@@ -148,6 +157,16 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			for _, c := range children[p.anchor.SpanID] {
 				dfs(c)
 			}
+			// Registration-keyed doors are sufficient: carrier-less gapped
+			// fragments are ORPHANS (placed via pathOn, which is already
+			// evidence-keyed over ALL windows); carrier-bearing fragments
+			// register to the window their material belongs to (the prefix
+			// names that window's anchor), and multi-window fragments'
+			// deeper material is reachable from deeper anchors via real
+			// edges. The evidence-keyed "door-complete" variant covered a
+			// structurally vacant case (CANDCHECK: zero missing candidates
+			// ever observed) at real combinatorial cost. CANDCHECK stays
+			// armed as the tripwire if benign ever reappears cand=false.
 			for _, r := range fragRoots[p.anchor.SpanID] {
 				if r == p.o {
 					continue
@@ -160,6 +179,12 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			}
 		}
 		states = append(states, fs)
+	}
+	// Deterministic window index for symmetry fingerprints (pointer values
+	// are not stable across runs; states order is).
+	fsIdx := make(map[*fragState]int, len(states))
+	for i, fs := range states {
+		fsIdx[fs] = i
 	}
 
 	// --- Ledger ---
@@ -183,6 +208,15 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		return l.occ[d] == nil && !l.rsv[d]
 	}
 	write := func(fs *fragState, s *Span, kind byte) bool {
+		// Idempotent same-span write: re-writing the span already at this
+		// level is the same assignment, not a conflict. Provenance may
+		// strengthen but a 'B' placement is never downgraded.
+		if led[fs].occ[s.Depth] == s {
+			if prov[fs][s.Depth] != 'B' {
+				prov[fs][s.Depth] = kind
+			}
+			return true
+		}
 		if !open(fs, s.Depth) {
 			return false
 		}
@@ -245,6 +279,10 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 	for _, id := range res.Unanchored {
 		unplaced = append(unplaced, byID[id])
 	}
+	dbgTag := uint64(0)
+	if len(survivors) > 0 {
+		dbgTag = survivors[0].SpanID
+	}
 	placedSet := make(map[uint64]bool)
 	forcedRoots := make(map[uint64]bool)
 	isOpenEnd := func(s *Span) bool {
@@ -257,7 +295,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		if r.Depth > fs.p.o.Depth-2 || r.Depth <= fs.p.anchor.Depth+1 {
 			return nil
 		}
-		bf := bloom.Deserialize(fs.p.threadBits, cfg.BloomM, cfg.BloomK)
+		bf := fs.bf
 		ph := bridge.HexOf(r.ParentID)
 		rh := bridge.HexOf(r.SpanID)
 		if !bf.Test(ph[:]) || !bf.Test(rh[:]) {
@@ -293,7 +331,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		if s.Depth <= fs.p.anchor.Depth || s.Depth >= fs.p.o.Depth-1 {
 			return false
 		}
-		bf := bloom.Deserialize(fs.p.threadBits, cfg.BloomM, cfg.BloomK)
+		bf := fs.bf
 		hex := bridge.HexOf(s.SpanID)
 		return bf.Test(hex[:]) && chainConsistent(bf, s, byID, fs.p.anchor.Depth+1)
 	}
@@ -341,7 +379,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 					if !inCand {
 						continue
 					}
-					bf := bloom.Deserialize(fs.p.threadBits, cfg.BloomM, cfg.BloomK)
+					bf := fs.bf
 					hex := bridge.HexOf(e.SpanID)
 					if !bf.Test(hex[:]) || !chainConsistent(bf, e, byID, fs.p.anchor.Depth+1) {
 						continue
@@ -356,7 +394,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				if fs.p.threadBits == nil {
 					continue
 				}
-				bf := bloom.Deserialize(fs.p.threadBits, cfg.BloomM, cfg.BloomK)
+				bf := fs.bf
 				w := fs.p.anchor.SpanID
 				for d := fs.p.anchor.Depth + 1; d < fs.p.o.Depth; d++ {
 					if !open(fs, d) {
@@ -559,6 +597,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		span     *Span
 		isOrphan bool
 		reseat   bool // a placed orphan being reassigned (must keep a seat)
+		thread   bool // an ambiguous threading level (likelihood-only: free skip)
 		opts     []sOpt
 	}
 	solveDemands := func() bool {
@@ -575,12 +614,21 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				demEnds = append(demEnds, e)
 			}
 		}
-		if len(demOrphans) == 0 && len(demEnds) == 0 {
-			return false
-		}
+		// NOTE: no early-out when demands are empty — thread items (the
+		// likelihood half of the solver) must be built even in traces with
+		// zero invariant demands, or ambiguous levels in quiet traces are
+		// never resolved (this exact gap kept benign alive at low drop
+		// rates). The len(items)==0 check below is the sole empty-exit.
 		// Build items with options across ALL gated chains (soft window
 		// membership is native: the domain spans windows).
 		var items []sItem
+		// orphanSpine[root] = spans written by EVERY option of that orphan's
+		// item (intersection of option paths). An end whose span is on the
+		// spine has its coverage IMPLIED by the placement invariant — its
+		// separate demand item would double-count one obligation (and the
+		// alter-ego coupling it creates is what disabled symmetry grouping
+		// in the monster clusters).
+		orphanSpine := make(map[uint64]map[uint64]bool)
 		for _, r := range demOrphans {
 			var opts []sOpt
 			for _, fs := range states {
@@ -590,9 +638,39 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			}
 			if len(opts) > 0 {
 				items = append(items, sItem{span: r, isOrphan: true, opts: opts})
+				spine := make(map[uint64]bool)
+				for _, s := range opts[0].spans {
+					spine[s.SpanID] = true
+				}
+				for _, o := range opts[1:] {
+					keep := make(map[uint64]bool)
+					for _, s := range o.spans {
+						if spine[s.SpanID] {
+							keep[s.SpanID] = true
+						}
+					}
+					spine = keep
+				}
+				orphanSpine[r.SpanID] = spine
 			}
 		}
 		for _, e := range demEnds {
+			// Coverage implied by a mandatory placement? Walk to e's
+			// fragment root: if the root is a demand orphan and e is on its
+			// spine, every possible seating of that orphan writes e — a
+			// separate hard item would double-count the obligation. Branch
+			// ends and partial-spine ends keep their independent demand.
+			root := e
+			for {
+				p, ok := byID[root.ParentID]
+				if !ok {
+					break
+				}
+				root = p
+			}
+			if sp, ok := orphanSpine[root.SpanID]; ok && sp[e.SpanID] {
+				continue
+			}
 			var opts []sOpt
 			for _, fs := range states {
 				if gate(e, fs) {
@@ -601,6 +679,145 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			}
 			if len(opts) > 0 {
 				items = append(items, sItem{span: e, isOrphan: false, opts: opts})
+			}
+		}
+		// THREADING AS SEARCH (v8h): a level with >=2 surviving candidates
+		// is not a wall — it is a decision. Each candidate's unique-descent
+		// continuation becomes an option scored by explained bloom
+		// positives. The item is created only when a unique argmax exists:
+		// an exact posterior tie keeps the risk-averse shallow stop, since
+		// MAP is indifferent and a guess converts depth loss into false
+		// ancestry. Skips are free — no invariant demands threading — so
+		// demand items always dominate in shared clusters.
+		for _, fs := range states {
+			if fs.p.threadBits == nil {
+				continue
+			}
+			bf := fs.bf
+			for d := fs.p.anchor.Depth + 1; d < fs.p.o.Depth; d++ {
+				// STICKY THREADING: only OPEN levels are itemized. A seated
+				// thread decision is re-litigated solely when a demand's
+				// seating displaces it (its soft write is cleared, the level
+				// reopens, and the next round re-asks the question) — never
+				// spontaneously. Spontaneous re-adjudication was measured to
+				// cause cross-round churn (ROUNDCAP, stranded ends) while
+				// defending a channel never observed in data (CANDCHECK).
+				if !open(fs, d) {
+					continue
+				}
+				var cands []*Span
+				consider := func(c *Span) {
+					if c.LeafCarrier || c == fs.p.o {
+						return
+					}
+					if orphanRootSet[c.SpanID] && !open(fs, c.Depth-1) && !led[fs].rsv[c.Depth-1] {
+						return
+					}
+					hex := bridge.HexOf(c.SpanID)
+					if !bf.Test(hex[:]) {
+						return
+					}
+					if !chainConsistent(bf, c, byID, fs.p.anchor.Depth+1) {
+						return
+					}
+					cands = append(cands, c)
+				}
+				for _, c := range fs.cand[d] {
+					consider(c)
+				}
+				if pool := orphanSpansByW[fs.p.anchor.SpanID]; pool != nil {
+					for _, c := range pool[d] {
+						dup := false
+						for _, cc := range fs.cand[d] {
+							if cc == c {
+								dup = true
+								break
+							}
+						}
+						if !dup {
+							consider(c)
+						}
+					}
+				}
+				if len(cands) < 2 {
+					continue // empty or unique: rule A's domain
+				}
+				var opts []sOpt
+				for _, c := range cands {
+					path := []*Span{c}
+					cur := c
+					for {
+						var next *Span
+						n := 0
+						for _, ch := range children[cur.SpanID] {
+							if ch.Depth >= fs.p.o.Depth || ch.LeafCarrier || ch == fs.p.o {
+								continue
+							}
+							hex := bridge.HexOf(ch.SpanID)
+							if bf.Test(hex[:]) {
+								n++
+								next = ch
+							}
+						}
+						if n != 1 || !open(fs, next.Depth) {
+							break
+						}
+						path = append(path, next)
+						cur = next
+					}
+					opts = append(opts, sOpt{fs: fs, spans: path, rsvD: -1, gain: len(path)})
+				}
+				// Exact posterior ties: the shallow stop is NOT a MAP argmax
+				// (it leaves a true member's bit unexplained), so the
+				// default forces a pick. cfg.TiePolicy selects the rule:
+				//   aware — prefer the candidate whose bit is not already
+				//           explained by another chain (global
+				//           bit-accounting: same MAP objective, applied
+				//           across windows), span ID as final fallback
+				//   id    — span ID only (blind deterministic coin)
+				//   stop  — abstain: drop the item, keep the synthetic
+				// Tie sites are counted for disclosure.
+				explainedElsewhere := func(c *Span) bool {
+					for _, ofs := range states {
+						if ofs != fs && led[ofs].occ[c.Depth] == c {
+							return true
+						}
+					}
+					return false
+				}
+				aware := cfg.TiePolicy != "id" && cfg.TiePolicy != "stop"
+				sort.Slice(opts, func(i, j int) bool {
+					if opts[i].gain != opts[j].gain {
+						return opts[i].gain > opts[j].gain
+					}
+					if aware {
+						ei, ej := explainedElsewhere(opts[i].spans[0]), explainedElsewhere(opts[j].spans[0])
+						if ei != ej {
+							return !ei // unclaimed candidate first
+						}
+					}
+					return opts[i].spans[0].SpanID < opts[j].spans[0].SpanID
+				})
+				tied := len(opts) > 1 && opts[0].gain == opts[1].gain
+				if tied && debugScore {
+					fmt.Fprintf(os.Stderr, "THREADTIE t=%x level=%d cands=%d gain=%d\n",
+						dbgTag, d, len(cands), opts[0].gain)
+				}
+				if tied && cfg.TiePolicy == "stop" {
+					continue // abstain: risk-averse shallow stop
+				}
+				items = append(items, sItem{span: cands[0], thread: true, opts: opts})
+			}
+		}
+		if debugScore {
+			orphItems := 0
+			for _, it := range items {
+				if it.isOrphan {
+					orphItems++
+				}
+			}
+			if orphItems < len(demOrphans) {
+				fmt.Fprintf(os.Stderr, "ITEMZERO t=%x n=%d\n", dbgTag, len(demOrphans)-orphItems)
 			}
 		}
 		if len(items) == 0 {
@@ -645,17 +862,31 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			endItem[it.span.SpanID] = true
 		}
 		var endFrontier []*Span
+		// Seed from EVERY item class and EVERY level its options touch: a
+		// sitting end-write on an orphan path's level or a thread item's
+		// continuation is displaceable by the assignment, so the displaced
+		// end must be a first-class member of the same solve (its skip
+		// penalty then owns its re-seating — churn cannot strand it).
 		for _, it := range items {
-			if it.isOrphan {
-				continue
-			}
 			for _, o := range it.opts {
-				if x := led[o.fs].occ[it.span.Depth]; x != nil && x != it.span && isOpenEnd(x) && !endItem[x.SpanID] {
-					p := prov[o.fs][it.span.Depth]
-					if p == 'C' || p == 'D' {
-						endFrontier = append(endFrontier, x)
-						endItem[x.SpanID] = true
+				probe := func(d int, w *Span) {
+					if x := led[o.fs].occ[d]; x != nil && x != w && isOpenEnd(x) && !endItem[x.SpanID] {
+						p := prov[o.fs][d]
+						// Conscript ONLY sole-appearance writes: an end with
+						// other live writes survives any single displacement
+						// (its invariant is not at stake), so itemizing it
+						// buys nothing but search width.
+						if (p == 'C' || p == 'D') && appearances(x) <= 1 {
+							endFrontier = append(endFrontier, x)
+							endItem[x.SpanID] = true
+						}
 					}
+				}
+				for _, s := range o.spans {
+					probe(s.Depth, s)
+				}
+				if o.rsvD >= 0 {
+					probe(o.rsvD, nil)
 				}
 			}
 		}
@@ -686,6 +917,10 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		// search their old seats read as soft via the usual C/D path.
 		var frontier []uint64
 		for _, it := range items {
+			// Thread items conscript blockers too: a likelihood item whose
+			// every option is hard-blocked by un-itemized placed material
+			// would otherwise be silently unseatable (a benign channel).
+			// Cluster growth from this is bounded by the cap fallback.
 			frontier = append(frontier, collectBlockers(it.opts)...)
 		}
 		for len(frontier) > 0 {
@@ -735,22 +970,23 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			clusters[find(i)] = append(clusters[find(i)], i)
 		}
 		any := false
-		for _, member := range clusters {
-			cl := make([]sItem, 0, len(member))
-			for _, i := range member {
-				cl = append(cl, items[i])
-			}
-			if len(cl) > 256 {
-				if debugScore {
-					fmt.Fprintf(os.Stderr, "CLUSTER skip items=%d\n", len(cl))
-				}
-				continue // combinatorial guard
-			}
-			if debugScore {
-				fmt.Fprintf(os.Stderr, "CLUSTER solve items=%d\n", len(cl))
-			}
+		// solveCluster: branch-and-bound over one cluster. Returns the best
+		// assignment found and whether the node budget capped (best-found
+		// but uncertified). No size guard: B&B is anytime (items sorted
+		// fewest-options-first, options explored before skips), so a capped
+		// solve is strictly better than abandoning the cluster — and capped
+		// clusters are re-solved decomposed by objective band (see loop).
+		// lk keys one chain level: the search's unit of exclusivity.
+		type lk struct {
+			fs *fragState
+			d  int
+		}
+		solveCluster := func(cl []sItem) []int {
 			sort.Slice(cl, func(i, j int) bool { return len(cl[i].opts) < len(cl[j].opts) })
 			for ci := range cl {
+				if cl[ci].thread {
+					continue // likelihood-only: no coverage band
+				}
 				for oj := range cl[ci].opts {
 					cl[ci].opts[oj].gain += 1000000 // lexicographic coverage bonus
 				}
@@ -758,17 +994,33 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			// Branch-and-bound: maximize gain - displacement cost. Hard:
 			// walls, rsv, B-writes; soft: A/C/D occupants (cost 1 each,
 			// once per level).
-			type lk struct {
-				fs *fragState
-				d  int
-			}
-			usedOcc := make(map[lk]bool)
+			usedOcc := make(map[lk]*Span)
 			usedRsv := make(map[lk]bool)
 			softHit := make(map[lk]bool)
-			bestScore := -1 << 30
+			// -inf sentinel: the optimum must ALWAYS be returned, even when
+			// it carries multiple skip penalties — a nil bestAssign silently
+			// freezes every item in the cluster.
+			bestScore := -1 << 62
 			var bestAssign []int
 			cur := make([]int, len(cl))
-			budget := 5000000
+			// DISCLOSED certification budget: 10M nodes. A handful of
+			// clusters per 10k traces (measured: 3, all tight matching
+			// cores — see CLUSTERDUMP) exceed any practical budget while
+			// certifying among near-tied all-seated arrangements; they ship
+			// their best-found COMPLETE seating (first descent finishes in
+			// ~|items| nodes), are counted (capped=true) and anatomized
+			// (CLUSTERDUMP fires at the cap). Invariants are enforced by
+			// the same penalties and re-verified by the census; capped
+			// best-found seatings have never moved a metric. Full
+			// certification path (Régin-style matching filter) documented
+			// as future work.
+			nodes := 0
+			// Simple admissible bound: sum of each remaining item's best
+			// gain. (The mutual-exclusion/pigeonhole bound and the search-
+			// space quotient techniques — dedup, symmetry — are documented
+			// in docs/pcrs_map_solver.md as future work: they attacked the
+			// capped matching cores but destroyed re-solve idempotence,
+			// which is what makes capped re-roll churn self-extinguishing.)
 			optimistic := make([]int, len(cl)+1)
 			for i := len(cl) - 1; i >= 0; i-- {
 				mx := 0
@@ -779,12 +1031,61 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				}
 				optimistic[i] = optimistic[i+1] + mx
 			}
+			// One-shot anatomy dump for clusters that hit the cap.
+			dumpComp := func() {
+				no, nr, ne, nt := 0, 0, 0, 0
+				minO, maxO, sumO := 1<<30, 0, 0
+				for i := range cl {
+					switch {
+					case cl[i].reseat:
+						nr++
+					case cl[i].isOrphan:
+						no++
+					case cl[i].thread:
+						nt++
+					default:
+						ne++
+					}
+					n := len(cl[i].opts)
+					sumO += n
+					if n < minO {
+						minO = n
+					}
+					if n > maxO {
+						maxO = n
+					}
+				}
+				claims := make(map[lk]int)
+				for _, it := range cl {
+					for _, o := range it.opts {
+						for _, s := range o.spans {
+							claims[lk{o.fs, s.Depth}]++
+						}
+					}
+				}
+				maxC, sumC := 0, 0
+				for _, c := range claims {
+					if c > maxC {
+						maxC = c
+					}
+					sumC += c
+				}
+				avgC := 0.0
+				if len(claims) > 0 {
+					avgC = float64(sumC) / float64(len(claims))
+				}
+				fmt.Fprintf(os.Stderr, "CLUSTERDUMP t=%x items=%d(o=%d r=%d e=%d t=%d) opts=%d/%d/%d levels=%d claims=%d/%.1f\n",
+					dbgTag, len(cl), no, nr, ne, nt, minO, sumO/len(cl), maxO, len(claims), maxC, avgC)
+			}
 			var bt func(i, score int)
 			bt = func(i, score int) {
-				if budget <= 0 {
-					return
+				nodes++
+				if nodes == 10000000 && debugScore {
+					dumpComp()
 				}
-				budget--
+				if nodes > 10000000 {
+					return // disclosed cap: keep best-found
+				}
 				if score+optimistic[i] <= bestScore {
 					return
 				}
@@ -796,14 +1097,17 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 					return
 				}
 				it := cl[i]
-				for oi, opt := range it.opts {
+				for oi := 0; oi < len(it.opts); oi++ {
+					opt := it.opts[oi]
 					ok := true
 					cost := 0
-					var occKeys, newSoft []lk
+					var setOcc, newSoft []lk
 					var rsvKey *lk
 					for _, s := range opt.spans {
 						k := lk{opt.fs, s.Depth}
-						if usedOcc[k] || usedRsv[k] {
+						// Same span at the same level is the SAME assignment
+						// (orphan/end alter-egos of one span), never a conflict.
+						if w := usedOcc[k]; (w != nil && w != s) || usedRsv[k] {
 							ok = false
 							break
 						}
@@ -815,7 +1119,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 							}
 							// itemized owner: level vacates on apply
 						}
-						if x := led[opt.fs].occ[s.Depth]; x != nil {
+						if x := led[opt.fs].occ[s.Depth]; x != nil && x != s {
 							if prov[opt.fs][s.Depth] == 'B' {
 								rid := placedRootOf[x.SpanID]
 								if rid == 0 || !reseatRoots[rid] {
@@ -824,15 +1128,28 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 								}
 								// itemized: vacates on apply, no cost
 							} else if !softHit[k] {
-								cost++
+								// Lexicographic displacement: stealing an
+								// end's SOLE coverage write costs at the
+								// coverage band — likelihood gains can never
+								// out-bid an invariant, so churn cannot
+								// strand an open end.
+								p := prov[opt.fs][s.Depth]
+								if (p == 'C' || p == 'D') && isOpenEnd(x) && appearances(x) <= 1 {
+									cost += 1000000
+								} else {
+									cost++
+								}
 								newSoft = append(newSoft, k)
 							}
 						}
-						occKeys = append(occKeys, k)
+						if usedOcc[k] == nil {
+							usedOcc[k] = s
+							setOcc = append(setOcc, k)
+						}
 					}
 					if ok && opt.rsvD >= 0 {
 						k := lk{opt.fs, opt.rsvD}
-						if usedOcc[k] {
+						if usedOcc[k] != nil {
 							ok = false
 						} else {
 							if x := led[opt.fs].occ[opt.rsvD]; x != nil {
@@ -842,7 +1159,12 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 										ok = false
 									}
 								} else if !softHit[k] {
-									cost++
+									p := prov[opt.fs][opt.rsvD]
+									if (p == 'C' || p == 'D') && isOpenEnd(x) && appearances(x) <= 1 {
+										cost += 1000000
+									} else {
+										cost++
+									}
 									newSoft = append(newSoft, k)
 								}
 							}
@@ -852,10 +1174,10 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 						}
 					}
 					if !ok {
+						for _, k := range setOcc {
+							delete(usedOcc, k)
+						}
 						continue
-					}
-					for _, k := range occKeys {
-						usedOcc[k] = true
 					}
 					if rsvKey != nil {
 						usedRsv[*rsvKey] = true
@@ -865,7 +1187,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 					}
 					cur[i] = oi
 					bt(i+1, score+opt.gain-cost)
-					for _, k := range occKeys {
+					for _, k := range setOcc {
 						delete(usedOcc, k)
 					}
 					if rsvKey != nil {
@@ -885,28 +1207,137 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				if cl[i].reseat {
 					pen = 2000000000
 				}
+				if cl[i].thread {
+					pen = 0 // no invariant demands threading
+				}
 				cur[i] = -1
 				bt(i+1, score-pen)
 			}
 			bt(0, 0)
+			// revert the coverage bonus: gains live on shared option state,
+			// and any future re-solve of these items must not see it
+			// double-applied
+			for ci := range cl {
+				if cl[ci].thread {
+					continue
+				}
+				for oj := range cl[ci].opts {
+					cl[ci].opts[oj].gain -= 1000000
+				}
+			}
 			if debugScore {
-				fmt.Fprintf(os.Stderr, "CLUSTER nodes=%d capped=%t found=%t\n", 5000000-budget, budget <= 0, bestAssign != nil)
+				fmt.Fprintf(os.Stderr, "CLUSTER nodes=%d capped=%t found=%t\n", nodes, nodes > 10000000, bestAssign != nil)
 			}
-			if bestAssign == nil {
-				continue
-			}
+			return bestAssign
+		}
+		// applyAssign: commit one cluster's assignment to the ledger.
+		// Returns whether the ledger actually changed (progress).
+		applyAssign := func(cl []sItem, bestAssign []int) bool {
+			progress := false
 			if debugScore {
 				for i, oi := range bestAssign {
-					if oi < 0 && cl[i].isOrphan && !cl[i].reseat {
-						fmt.Fprintf(os.Stderr, "SEARCHSKIP orphan depth=%d opts=%d cluster=%d\n",
-							cl[i].span.Depth, len(cl[i].opts), len(cl))
+					if oi >= 0 || cl[i].thread {
+						continue // thread skips are free and routine
 					}
+					kind := "end"
+					if cl[i].isOrphan {
+						kind = "orphan"
+					}
+					if cl[i].reseat {
+						kind = "reseat"
+					}
+					var dump strings.Builder
+					fmt.Fprintf(&dump, "SEARCHSKIP t=%x %s depth=%d opts=%d cluster=%d id=%x parent=%x\n",
+						dbgTag, kind, cl[i].span.Depth, len(cl[i].opts), len(cl),
+						cl[i].span.SpanID, cl[i].span.ParentID)
+					for _, opt := range cl[i].opts {
+						hard := ""
+						for _, s := range opt.spans {
+							d := s.Depth
+							if led[opt.fs].rsv[d] {
+								owner := rsvOwner[opt.fs][d]
+								if owner == nil {
+									hard += fmt.Sprintf(" L%d=WALL", d)
+								} else if !reseatRoots[owner.SpanID] {
+									hard += fmt.Sprintf(" L%d=RSV(owner=%x)", d, owner.SpanID)
+								}
+							}
+							if x := led[opt.fs].occ[d]; x != nil && prov[opt.fs][d] == 'B' {
+								rid := placedRootOf[x.SpanID]
+								if rid == 0 {
+									hard += fmt.Sprintf(" L%d=B(noroot)", d)
+								} else if !reseatRoots[rid] {
+									hard += fmt.Sprintf(" L%d=B(root=%x)", d, rid)
+								}
+							}
+						}
+						if opt.rsvD >= 0 {
+							if x := led[opt.fs].occ[opt.rsvD]; x != nil && prov[opt.fs][opt.rsvD] == 'B' {
+								rid := placedRootOf[x.SpanID]
+								if rid == 0 || !reseatRoots[rid] {
+									hard += fmt.Sprintf(" R%d=B", opt.rsvD)
+								}
+							}
+						}
+						if hard != "" {
+							fmt.Fprintf(&dump, "  SKIPOPT hard:%s\n", hard)
+							continue
+						}
+						// base-feasible: lost to in-cluster contention — name
+						// the seated competitors whose winning option overlaps
+						// (same-span same-level writes are NOT conflicts)
+						comp := ""
+						need := make(map[int]*Span)
+						for _, s := range opt.spans {
+							need[s.Depth] = s
+						}
+						for j, oj := range bestAssign {
+							if oj < 0 || j == i {
+								continue
+							}
+							w := cl[j].opts[oj]
+							if w.fs != opt.fs {
+								continue
+							}
+							hit := false
+							for _, s := range w.spans {
+								if (need[s.Depth] != nil && need[s.Depth] != s) || s.Depth == opt.rsvD {
+									hit = true
+								}
+							}
+							if w.rsvD >= 0 && need[w.rsvD] != nil {
+								hit = true
+							}
+							if hit {
+								ck := "end"
+								if cl[j].isOrphan {
+									ck = "orphan"
+								}
+								if cl[j].reseat {
+									ck = "reseat"
+								}
+								comp += fmt.Sprintf(" %s(depth=%d,opts=%d,id=%x", ck, cl[j].span.Depth, len(cl[j].opts), cl[j].span.SpanID)
+								if cl[j].isOrphan {
+									comp += ",path="
+									for pi, s := range w.spans {
+										if pi > 0 {
+											comp += "+"
+										}
+										comp += fmt.Sprintf("%x@%d", s.SpanID, s.Depth)
+									}
+								}
+								comp += ")"
+							}
+						}
+						fmt.Fprintf(&dump, "  SKIPOPT contention:%s\n", comp)
+					}
+					os.Stderr.WriteString(dump.String())
 				}
 			}
 			// Apply atomically: vacate reseated placements and itemized
 			// end-writes first (they re-write per the assignment).
 			for _, it := range cl {
-				if it.isOrphan {
+				if it.isOrphan || it.thread {
 					continue
 				}
 				for _, fs := range states {
@@ -932,6 +1363,15 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				}
 				it := cl[i]
 				opt := it.opts[oi]
+				// Change detection BEFORE clearing: a thread item re-seating
+				// its incumbent verbatim is not progress (else the round
+				// loop spins re-solving stable clusters to its cap).
+				changed := false
+				for _, s := range opt.spans {
+					if led[opt.fs].occ[s.Depth] != s {
+						changed = true
+					}
+				}
 				// clear soft occupants on needed levels
 				clear := func(d int) {
 					if x := led[opt.fs].occ[d]; x != nil && prov[opt.fs][d] != 'B' {
@@ -949,21 +1389,65 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 					commitFits(it.span, []*oFit{{fs: opt.fs, path: opt.spans}}, true)
 					placedSet[it.span.SpanID] = true
 					forcedRoots[it.span.SpanID] = true
+					progress = true
+				} else if it.thread {
+					for _, s := range opt.spans {
+						write(opt.fs, s, 'T') // soft: later rounds may displace
+					}
+					// Thread fills on open levels are monotone (absorbing);
+					// verbatim re-seats are no-ops via `changed`, so counting
+					// real fills as progress cannot spin the loop.
+					if changed {
+						progress = true
+					}
 				} else {
 					write(opt.fs, it.span, 'D')
 					res.ForcedMatches++
+					progress = true
 				}
+			}
+			return progress
+		}
+		for _, member := range clusters {
+			cl := make([]sItem, 0, len(member))
+			for _, i := range member {
+				cl = append(cl, items[i])
+			}
+			if debugScore {
+				fmt.Fprintf(os.Stderr, "CLUSTER solve items=%d\n", len(cl))
+			}
+			assign := solveCluster(cl)
+			if assign == nil {
+				continue
+			}
+			if applyAssign(cl, assign) {
 				any = true
 			}
+		}
+		if debugScore {
+			fmt.Fprintf(os.Stderr, "SOLVE t=%x orph=%d ends=%d items=%d any=%t\n",
+				dbgTag, len(demOrphans), len(demEnds), len(items), any)
 		}
 		return any
 	}
 
+	// Plain fixpoint loop (v8h2 semantics): the deterministic search is
+	// idempotent per ledger state, so capped re-solves reproduce their
+	// previous assignment once demands stop changing — applies become
+	// no-ops and the loop self-converges. ROUNDCAP discloses the rare
+	// exit-by-exhaustion.
+	converged := false
 	for round := 0; round < len(states)+len(unplaced)+8; round++ {
 		propagate()
 		if !solveDemands() {
+			converged = true
 			break
 		}
+	}
+	if debugScore && !converged {
+		// Exit by round exhaustion, not stability: any state left mid-churn
+		// is disclosed here rather than silently shipped.
+		fmt.Fprintf(os.Stderr, "ROUNDCAP t=%x\n", dbgTag)
 	}
 
 	// --- Bookkeeping, emission, census (as ReconstructPCRB) ---
@@ -1008,7 +1492,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				} else if bblocked == opts {
 					cls = "BBLOCK"
 				}
-				fmt.Fprintf(os.Stderr, "UNPLACED %s opts=%d bblocked=%d\n", cls, opts, bblocked)
+				fmt.Fprintf(os.Stderr, "UNPLACED t=%x %s depth=%d opts=%d bblocked=%d\n", dbgTag, cls, r.Depth, opts, bblocked)
 			}
 		}
 	}
@@ -1068,11 +1552,64 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			queue = append(queue, children[s.SpanID]...)
 		}
 	}
+	// CANDCHECK: for spans named in TRACE_RECON_DEBUG_ENDS, report their
+	// evidence vs candidacy vs occupancy in every depth-eligible window.
+	if len(debugEnds) > 0 {
+		for id := range debugEnds {
+			s, ok := byID[id]
+			if !ok {
+				continue
+			}
+			for _, fs := range states {
+				if fs.p.threadBits == nil || s.Depth <= fs.p.anchor.Depth || s.Depth >= fs.p.o.Depth {
+					continue
+				}
+				bf := fs.bf
+				hex := bridge.HexOf(s.SpanID)
+				inC := false
+				for _, c := range fs.cand[s.Depth] {
+					if c == s {
+						inC = true
+						break
+					}
+				}
+				x := led[fs].occ[s.Depth]
+				occ := "nil"
+				if x == s {
+					occ = "me"
+				} else if x != nil {
+					occ = fmt.Sprintf("%x/%c", x.SpanID, prov[fs][s.Depth])
+				}
+				nconsider := 0
+				meConsider := false
+				for _, c := range fs.cand[s.Depth] {
+					if c.LeafCarrier || c == fs.p.o {
+						continue
+					}
+					ch := bridge.HexOf(c.SpanID)
+					if !bf.Test(ch[:]) || !chainConsistent(bf, c, byID, fs.p.anchor.Depth+1) {
+						continue
+					}
+					nconsider++
+					if c == s {
+						meConsider = true
+					}
+				}
+				fmt.Fprintf(os.Stderr, "CANDCHECK t=%x id=%x depth=%d wanchor=%x adepth=%d pos=%t cand=%t occ=%s rsv=%t ncand=%d nconsider=%d meConsider=%t\n",
+					dbgTag, s.SpanID, s.Depth, fs.p.anchor.SpanID, fs.p.anchor.Depth, bf.Test(hex[:]), inC, occ,
+					led[fs].rsv[s.Depth], len(fs.cand[s.Depth]), nconsider, meConsider)
+			}
+		}
+	}
 	inLedger := make(map[uint64]bool)
 	for _, fs := range states {
-		for _, s := range led[fs].occ {
+		for d, s := range led[fs].occ {
 			if s != nil {
 				inLedger[s.SpanID] = true
+				if debugEnds[s.SpanID] {
+					fmt.Fprintf(os.Stderr, "ENDMATCH t=%x id=%x level=%d prov=%c window-anchor=%x adepth=%d carrier=%x cdepth=%d\n",
+						dbgTag, s.SpanID, d, prov[fs][d], fs.p.anchor.SpanID, fs.p.anchor.Depth, fs.p.o.SpanID, fs.p.o.Depth)
+				}
 			}
 		}
 		inLedger[fs.p.o.SpanID] = true

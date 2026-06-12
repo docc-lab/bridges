@@ -48,6 +48,7 @@ type config struct {
 	prefixLen          int    // PCR truncated checkpoint-root ID length
 	classifyWrong      string // JSONL dump path for wrong-edge classification (pcr/pcrb)
 	stopOnGap          bool   // PCRB: stop threading at first zero-candidate level
+	tiePolicy          string // PCRS: thread-item tie resolution (aware|id|stop)
 	workers            int    // reconstruction worker goroutines (0 = NumCPU)
 }
 
@@ -72,6 +73,7 @@ func parseFlags() config {
 	flag.IntVar(&c.workers, "workers", 0, "Reconstruction worker goroutines (0 = NumCPU). Drop decisions stay serial, so results are bit-identical at any worker count")
 	gapPolicy := ""
 	flag.StringVar(&gapPolicy, "gap-policy", "continue", "PCRB threading at a zero-candidate level: continue (default) or stop (maximally FP-averse)")
+	flag.StringVar(&c.tiePolicy, "tie-policy", "aware", "PCRS threading tie resolution: aware (global bit-accounting, default), id (span-ID coin), or stop (abstain)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <input_dir>\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "       %s --corpus <corpus_dir> [flags]\n", os.Args[0])
@@ -167,6 +169,13 @@ type harness struct {
 	jobs chan finishJob
 	wg   sync.WaitGroup
 	mu   sync.Mutex
+
+	// prog: cumulative counters for the PROGRESS row printed every 10k
+	// traces (guarded by mu; trace-completion order, not corpus order).
+	prog struct {
+		start                                           time.Time
+		spans, c, a, w, oe, oem, lost, placed, affected int
+	}
 }
 
 type finishJob struct {
@@ -178,9 +187,9 @@ type finishJob struct {
 // wrongRec locates one wrong-edge bridge against the pre-drop truth.
 type wrongRec struct {
 	Trace     string `json:"trace"`
-	Root      string `json:"root"`       // fragment root span
+	Root      string `json:"root"` // fragment root span
 	RootDepth int    `json:"root_depth"`
-	Anchor    string `json:"anchor"`     // chosen (wrong) anchor
+	Anchor    string `json:"anchor"` // chosen (wrong) anchor
 	AnchDepth int    `json:"anchor_depth"`
 	WDepth    int    `json:"w_depth"`    // window checkpoint depth
 	DivDepth  int    `json:"div_depth"`  // depth where anchor's chain meets the root's true window path; -1 = never (wrong window)
@@ -209,6 +218,7 @@ func newHarness(c config) *harness {
 		pcrbCfg := recon.NewPCRBConfig(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		pcrbCfg.BottomUp, pcrbCfg.ChainCheck = cfg.BottomUp, cfg.ChainCheck
 		pcrbCfg.StopOnGap = c.stopOnGap
+		pcrbCfg.TiePolicy = c.tiePolicy
 		cfg = pcrbCfg
 		h = ph
 	default: // pb
@@ -245,6 +255,7 @@ func newHarness(c config) *harness {
 		nextSeq:    make(map[uint64]map[uint64]int),
 		jobs:       make(chan finishJob, workers*2),
 	}
+	ha.prog.start = time.Now()
 	for i := 0; i < workers; i++ {
 		ha.wg.Add(1)
 		go func() {
@@ -474,6 +485,33 @@ func (ha *harness) scoresStore(tid uint64, sc recon.Score) {
 		ha.scores = make(map[uint64]recon.Score)
 	}
 	ha.scores[tid] = sc
+	// Cumulative progress row every 10k traces (stderr, monitor-friendly).
+	ha.prog.spans += sc.Spans
+	ha.prog.c += sc.AnchorCorrect
+	ha.prog.a += sc.AnchorAncestor
+	ha.prog.w += sc.Misattached
+	ha.prog.oe += sc.OpenEnds
+	ha.prog.oem += sc.OpenEndsMatched
+	ha.prog.lost += sc.SpansLost
+	ha.prog.placed += sc.OrphansPlaced
+	if sc.Misattached > 0 {
+		ha.prog.affected++
+	}
+	n := len(ha.scores)
+	if n%10000 == 0 {
+		p := &ha.prog
+		r := p.c + p.w
+		den := func(x, y int) float64 {
+			if y == 0 {
+				return 100
+			}
+			return 100 * float64(x) / float64(y)
+		}
+		fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds exact=%.2f%% benign=%.2f%% wrong=%.4f%% tr=%.2f%% oe=%.4f%% lost=%.3f%% placed=%d\n",
+			n, int(time.Since(ha.prog.start).Seconds()),
+			den(p.c, r), den(p.a-p.c, r), den(p.w, r), den(p.affected, n),
+			den(p.oem, p.oe), den(p.lost, p.spans), p.placed)
+	}
 }
 
 // output is the per-trace score arrays, in trace load order.
@@ -498,8 +536,8 @@ type output struct {
 	NumUnanchored      []int   `json:"num_unanchored"`
 	NumSynthetic       []int   `json:"num_synthetic"`
 	NumBorrowed        []int   `json:"num_borrowed_bloom"`
-	NumFragmentsLost   []int   `json:"num_fragments_lost,omitempty"`   // PCR only
-	NumSpansLost       []int   `json:"num_spans_lost,omitempty"`       // PCR only
+	NumFragmentsLost   []int   `json:"num_fragments_lost,omitempty"`    // PCR only
+	NumSpansLost       []int   `json:"num_spans_lost,omitempty"`        // PCR only
 	NumAncestorsSkip   []int   `json:"num_ancestors_skipped,omitempty"` // PCR only
 	NumSpansInSkipped  []int   `json:"num_spans_in_skipped,omitempty"`  // PCR only
 	NumOpenEnds        []int   `json:"num_open_ends,omitempty"`         // PCRB only

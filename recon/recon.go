@@ -29,12 +29,28 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"bridges/bloom"
 	"bridges/bridge"
 )
 
 var debugScore = os.Getenv("TRACE_RECON_DEBUG") == "1"
+
+// debugEnds: comma-separated hex span IDs (TRACE_RECON_DEBUG_ENDS) whose
+// ledger placements are logged at census time (ENDMATCH lines).
+var debugEnds = func() map[uint64]bool {
+	m := make(map[uint64]bool)
+	for _, h := range strings.Split(os.Getenv("TRACE_RECON_DEBUG_ENDS"), ",") {
+		if h == "" {
+			continue
+		}
+		var id uint64
+		fmt.Sscanf(h, "%x", &id)
+		m[id] = true
+	}
+	return m
+}()
 
 // Span is one surviving span as the reconstructor sees it: the standard
 // record fields plus the decoded bridge attributes. Depth comes from either
@@ -77,6 +93,15 @@ type Config struct {
 	// FP-averse: refuses to stitch across unnameable dropped levels, at the
 	// cost of benign skips wherever the surviving chain is interrupted.
 	StopOnGap bool
+
+	// TiePolicy (PCRS thread items) selects how an exact posterior tie
+	// between threading candidates is resolved:
+	//   "stop"  — abstain (synthetic level; benign-shallow attachment)
+	//   "id"    — force deterministically by span ID
+	//   "aware" — force, preferring the candidate whose bit is not already
+	//             explained by another chain (global bit-accounting), span
+	//             ID as final fallback. Default.
+	TiePolicy string
 
 	// BottomUp processes orphans deepest-first and lets shallower orphans
 	// discover descendant carriers by walking across already-reconstructed
@@ -495,11 +520,11 @@ type Score struct {
 	AnchorAncestor int
 	GapCorrect     int // synthetic count == true dropped spans in between
 	Misattached    int // reconnected but anchor wrong (bloom FP / ambiguity)
-	Unanchored    int
-	Synthetic     int // total synthetic spans created
-	Borrowed      int // bridges built via the membership-based bloom fallback
-	Ambiguous     int // bridges where >1 candidate tested positive at the anchor depth
-	AmbiguousBad  int // ... of which the anchor was wrong
+	Unanchored     int
+	Synthetic      int // total synthetic spans created
+	Borrowed       int // bridges built via the membership-based bloom fallback
+	Ambiguous      int // bridges where >1 candidate tested positive at the anchor depth
+	AmbiguousBad   int // ... of which the anchor was wrong
 
 	// PCR fragment accounting (ScorePCR only; zero under ScorePB). A
 	// carrier-less fragment — an unanchored orphan plus every survivor

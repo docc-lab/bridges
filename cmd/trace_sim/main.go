@@ -35,6 +35,8 @@ type config struct {
 	logDee             bool
 	deeLogBytes        int
 	emitDepth          bool
+	prefixLen          int
+	bloomFP            float64
 }
 
 func parseFlags() config {
@@ -42,7 +44,7 @@ func parseFlags() config {
 	flag.StringVar(&c.outputPath, "o", "", "Output JSON file (required)")
 	flag.StringVar(&c.outputPath, "output", "", "Output JSON file (required)")
 	flag.StringVar(&c.corpusDir, "corpus", "", "Read events.bin + meta.bin from this corpus dir (skips JSON parse)")
-	flag.StringVar(&c.mode, "mode", "vanilla", "Bridge mode: vanilla, pb, cgpb, sbridge")
+	flag.StringVar(&c.mode, "mode", "vanilla", "Bridge mode: vanilla, pb, cgpb, sbridge, pcr, pcrb")
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
 	flag.BoolVar(&c.bagsize, "bagsize", false, "Output per-trace bagsize metrics")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
@@ -50,6 +52,8 @@ func parseFlags() config {
 	flag.BoolVar(&c.emitDepth, "emit-depth", false, "Emit absolute depth: varint(depth) replaces varint(depthMod) in _br payloads, and interior non-checkpoint spans carry a _d attribute (see docs/depth_emission.md)")
 	flag.BoolVar(&c.logDee, "log-dee", false, "S-bridge: log DEE pickup/queue events to stderr")
 	flag.IntVar(&c.deeLogBytes, "dee-log-bytes", 10000, "Threshold for --log-dee")
+	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
+	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "PCRB mode: target bloom false-positive rate (pb/cgpb keep the legacy default)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <input_dir>\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "       %s --corpus <corpus_dir> [flags]\n", os.Args[0])
@@ -79,6 +83,10 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 	switch c.mode {
 	case "vanilla":
 		return bridge.NewVanillaHandler()
+	case "pcr":
+		return bridge.NewPCRBridgeHandler(c.checkpointDistance, c.prefixLen)
+	case "pcrb":
+		return bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 	case "pb":
 		h := bridge.NewPathBridgeHandler(c.checkpointDistance, bridge.DefaultBloomFPRate)
 		h.EmitDepth = c.emitDepth

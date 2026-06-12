@@ -38,6 +38,56 @@ for reconstruction.
 
 ## Algorithm
 
+The algorithm box (paper form; the prose steps below expand each piece,
+and the comments in `recon/recon.go` cite these line numbers as
+`[alg. N]`):
+
+```
+ 1: procedure reconnect_orphans(S)                ▷ S: surviving spans
+ 2:   orphans ← {o ∈ S : parent(o) ∉ S}           ▷ each orphan roots one fragment
+ 3:   sort orphans by depth, deepest first
+ 4:   for o ∈ orphans do
+ 5:     bf ← covering_bloom(o)
+ 6:     anchor ← find_anchor(o, bf)
+ 7:     g ← depth(o) − depth(anchor) − 1          ▷ exact hole size from _d/_br depths
+ 8:     insert g synthetic spans between anchor and o, connect with bridge edges
+ 9:     children(anchor) ← children(anchor) ∪ {o} ▷ bridge is walkable for later orphans
+10:   end for
+11: end procedure
+
+12: function covering_bloom(o)
+13:   if o carries _br then return bloom(o)
+14:   band ← cpd · (⌊depth(o)/cpd⌋ + 1)           ▷ first checkpoint level below o
+15:   for carrier c below o, nearest level first, walking surviving edges
+        and bridge edges, pruning at depth(c) > band do
+16:     if path to c crossed no bridge edge then return bloom(c)
+17:     else if id(o) ∈ bloom(c) then return bloom(c)   ▷ bridges are guesses: verify
+18:   end for
+19:   for carrier c ∈ S with depth(o) < depth(c) ≤ band, shallowest first do
+20:     if id(o) ∈ bloom(c) then return bloom(c)   ▷ safety net: membership scan
+21:   end for
+22: end function
+
+23: function find_anchor(o, bf)
+24:   lo ← cpd · ⌊(depth(o) − 1)/cpd⌋              ▷ last protected checkpoint above o
+25:   for d ← depth(o) − 2 down to lo do           ▷ k−1 holds only the dropped parent's
+26:     H ← {c ∈ S : depth(c) = d ∧ id(c) ∈ bf       siblings — never the true anchor
+            ∧ chain_consistent(c, bf, lo)}
+27:     if H ≠ ∅ then return any c ∈ H             ▷ |H| > 1: flag ambiguous
+28:   end for
+29: end function
+
+30: function chain_consistent(c, bf, lo)
+31:   while depth(c) > lo do
+32:     p ← parent_id(c)                           ▷ recorded on c even if p was dropped
+33:     if p ∉ bf then return false
+34:     if p ∉ S then return true                  ▷ disconnection: nothing more nameable
+35:     c ← p
+36:   end while
+37:   return true                                  ▷ floor reached: parent legitimately absent
+38: end function
+```
+
 Orphans are processed **deepest-first** (`--order bottom-up`, the
 default). Each orphan `o` at depth `d`:
 
@@ -61,9 +111,19 @@ default). Each orphan `o` at depth `d`:
    (`ViaCarrier`, reported as `num_borrowed_bloom`).
 
 2. **Candidate window.** Candidates are surviving spans at depths
-   `[c, d−1]`, where `c = cpd · floor((d−1)/cpd)` is the last protected
+   `[c, d−2]`, where `c = cpd · floor((d−1)/cpd)` is the last protected
    checkpoint level strictly above `o`. The true nearest surviving
-   ancestor provably lies in this window (checkpoints never drop).
+   ancestor provably lies in this window (checkpoints never drop, and
+   `o`'s depth-(d−1) ancestor is by definition its dropped parent, so it
+   cannot be shallower than `c` or deeper than `d−2`). Depth `d−1` is
+   deliberately excluded: it can never hold the true anchor, but it does
+   hold the dropped parent's surviving siblings — which pass the chain
+   check structurally (their ancestry above `d−2` *is* the orphan's
+   ancestry), need only a single membership false positive to test in,
+   and then outrank the true anchor on depth. Scanning `d−1` is pure
+   misattachment surface. The window floor never collides with the
+   ceiling for a real orphan: a checkpoint-depth parent cannot drop, so
+   `(d−1) mod cpd ≠ 0` and `c ≤ d−2`.
 
 3. **Anchor selection.** Test each candidate's span ID against the
    covering bloom, deepest depth first. Candidates passing the ID test

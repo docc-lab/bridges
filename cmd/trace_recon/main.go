@@ -34,6 +34,7 @@ type config struct {
 	inputDir           string
 	corpusDir          string
 	outputPath         string
+	mode               string // "pb" or "pcr"
 	checkpointDistance int
 	dropRate           float64
 	seed               int64
@@ -42,15 +43,18 @@ type config struct {
 	bottomUp           bool
 	bloomFP            float64
 	chainCheck         bool
+	prefixLen          int    // PCR truncated checkpoint-root ID length
+	classifyWrong      string // JSONL dump path for wrong-edge classification (pcr/pcrb)
+	stopOnGap          bool   // PCRB: stop threading at first zero-candidate level
 }
 
 func parseFlags() config {
 	var c config
-	mode := ""
 	flag.StringVar(&c.outputPath, "o", "", "Output JSON file (required)")
 	flag.StringVar(&c.outputPath, "output", "", "Output JSON file (required)")
 	flag.StringVar(&c.corpusDir, "corpus", "", "Read events.bin + meta.bin from this corpus dir")
-	flag.StringVar(&mode, "mode", "pb", "Bridge mode (only pb supported)")
+	flag.StringVar(&c.mode, "mode", "pb", "Bridge mode: pb (bloom membership), pcr (truncated checkpoint-root ID), or pcrb (checkpoint root + window bloom for in-window threading)")
+	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides)")
 	flag.Float64Var(&c.dropRate, "drop-rate", 1.0, "Probability of dropping each non-checkpoint span (1.0 = drop all)")
@@ -61,14 +65,29 @@ func parseFlags() config {
 	flag.Int64Var(&c.seed, "seed", 42, "RNG seed for the drop policy")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to process (0 = all). Corpus mode: first N of the corpus trace order; events of other traces are skipped during streaming")
 	flag.BoolVar(&c.requireClean, "require-clean", true, "Cleanliness filter (JSON mode only)")
+	flag.StringVar(&c.classifyWrong, "classify-wrong", "", "Write one JSONL record per wrong-edge bridge (anchor not a true ancestor) locating the divergence against truth")
+	gapPolicy := ""
+	flag.StringVar(&gapPolicy, "gap-policy", "continue", "PCRB threading at a zero-candidate level: continue (default) or stop (maximally FP-averse)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <input_dir>\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "       %s --corpus <corpus_dir> [flags]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if mode != "pb" {
-		fmt.Fprintf(os.Stderr, "error: only -mode pb is supported (got %q)\n", mode)
+	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" {
+		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, or pcrb (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	switch gapPolicy {
+	case "continue":
+	case "stop":
+		c.stopOnGap = true
+	default:
+		fmt.Fprintf(os.Stderr, "error: -gap-policy must be continue or stop (got %q)\n", gapPolicy)
+		os.Exit(2)
+	}
+	if c.prefixLen < 1 || c.prefixLen > 8 {
+		fmt.Fprintln(os.Stderr, "error: --prefix-len must be in [1,8]")
 		os.Exit(2)
 	}
 	switch order {
@@ -117,7 +136,8 @@ type collSpan struct {
 
 // harness drives the per-trace collect -> drop -> reconstruct -> score loop.
 type harness struct {
-	h       *bridge.PathBridgeHandler
+	h       bridge.Handler
+	mode    string // "pb" or "pcr": selects payload decode + reconstruction
 	cfg     recon.Config
 	rng     *rand.Rand
 	dropAll bool
@@ -132,19 +152,67 @@ type harness struct {
 	nextSeq map[uint64]map[uint64]int
 
 	scores map[uint64]recon.Score
+
+	cpd      int
+	wrongLog *os.File // non-nil: wrong-edge classification dump
+}
+
+// wrongRec locates one wrong-edge bridge against the pre-drop truth.
+type wrongRec struct {
+	Trace     string `json:"trace"`
+	Root      string `json:"root"`       // fragment root span
+	RootDepth int    `json:"root_depth"`
+	Anchor    string `json:"anchor"`     // chosen (wrong) anchor
+	AnchDepth int    `json:"anchor_depth"`
+	WDepth    int    `json:"w_depth"`    // window checkpoint depth
+	DivDepth  int    `json:"div_depth"`  // depth where anchor's chain meets the root's true window path; -1 = never (wrong window)
+	TrueDepth int    `json:"true_depth"` // depth of true nearest surviving ancestor
 }
 
 type spanKey struct{ traceID, spanID uint64 }
 
 func newHarness(c config) *harness {
-	h := bridge.NewPathBridgeHandler(c.checkpointDistance, c.bloomFP)
-	h.EmitDepth = true
-	h.Capture = true
+	var h bridge.Handler
 	cfg := recon.NewConfig(c.checkpointDistance, c.bloomFP)
 	cfg.BottomUp = c.bottomUp
 	cfg.ChainCheck = c.chainCheck
+	switch c.mode {
+	case "pcr":
+		ph := bridge.NewPCRBridgeHandler(c.checkpointDistance, c.prefixLen)
+		ph.Capture = true
+		cfg.PrefixLen = c.prefixLen
+		h = ph
+	case "pcrb":
+		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
+		ph.Capture = true
+		// PCRB bloom geometry differs from PB's for the same --bloom-fp
+		// (sized for cpd-1; see bridge.PCRBBloomCapacity) — rebuild the
+		// config with the matching constructor.
+		pcrbCfg := recon.NewPCRBConfig(c.checkpointDistance, c.prefixLen, c.bloomFP)
+		pcrbCfg.BottomUp, pcrbCfg.ChainCheck = cfg.BottomUp, cfg.ChainCheck
+		pcrbCfg.StopOnGap = c.stopOnGap
+		cfg = pcrbCfg
+		h = ph
+	default: // pb
+		pb := bridge.NewPathBridgeHandler(c.checkpointDistance, c.bloomFP)
+		pb.EmitDepth = true
+		pb.Capture = true
+		h = pb
+	}
+	var wlog *os.File
+	if c.classifyWrong != "" {
+		f, err := os.Create(c.classifyWrong)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "classify-wrong: %v\n", err)
+			os.Exit(1)
+		}
+		wlog = f
+	}
 	return &harness{
 		h:          h,
+		mode:       c.mode,
+		cpd:        c.checkpointDistance,
+		wrongLog:   wlog,
 		cfg:        cfg,
 		rng:        rand.New(rand.NewSource(c.seed)),
 		dropAll:    c.dropRate >= 1.0,
@@ -231,19 +299,120 @@ func (ha *harness) finishTrace(tid uint64) {
 		}
 		sp := recon.Span{SpanID: s.spanID, ParentID: s.parentID, Depth: s.depth}
 		if s.br != nil {
-			d, bits, err := recon.DecodePBPayload(s.br, ha.cfg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
-				os.Exit(1)
+			if ha.mode == "pcr" {
+				d, prefix, err := recon.DecodePCRPayload(s.br, ha.cfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
+					os.Exit(1)
+				}
+				sp.Depth = d
+				sp.CkptPrefix = prefix
+				sp.LeafCarrier = d%ha.cpd != 0
+			} else if ha.mode == "pcrb" {
+				d, prefix, bits, err := recon.DecodePCRBPayload(s.br, ha.cfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
+					os.Exit(1)
+				}
+				sp.Depth = d
+				sp.CkptPrefix = prefix
+				sp.BloomBits = bits
+				sp.LeafCarrier = d%ha.cpd != 0
+			} else {
+				d, bits, err := recon.DecodePBPayload(s.br, ha.cfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
+					os.Exit(1)
+				}
+				sp.Depth = d
+				sp.BloomBits = bits
 			}
-			sp.Depth = d
-			sp.BloomBits = bits
 		}
 		survivors = append(survivors, sp)
 	}
 
-	res := recon.ReconstructPB(survivors, ha.cfg)
-	ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))
+	if ha.mode == "pcr" {
+		res := recon.ReconstructPCR(survivors, ha.cfg)
+		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
+		ha.classifyWrong(tid, res, truth, dropped)
+	} else if ha.mode == "pcrb" {
+		res := recon.ReconstructPCRB(survivors, ha.cfg)
+		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
+		ha.classifyWrong(tid, res, truth, dropped)
+	} else {
+		res := recon.ReconstructPB(survivors, ha.cfg)
+		ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))
+	}
+}
+
+// classifyWrong writes one JSONL record per bridge whose anchor is not a
+// true ancestor of the fragment root, locating where the chosen anchor's
+// real ancestry diverges from the fragment's true window path.
+func (ha *harness) classifyWrong(tid uint64, res recon.Result, truth []recon.TruthSpan, dropped map[uint64]struct{}) {
+	if ha.wrongLog == nil || len(res.Bridges) == 0 {
+		return
+	}
+	parent := make(map[uint64]uint64, len(truth))
+	depth := make(map[uint64]int, len(truth))
+	for _, t := range truth {
+		parent[t.SpanID] = t.ParentID
+		depth[t.SpanID] = t.Depth
+	}
+	enc := json.NewEncoder(ha.wrongLog)
+	for _, b := range res.Bridges {
+		// True nearest surviving ancestor + ancestor test (as in ScorePB).
+		isAncestor := false
+		trueDepth := -1
+		for p := parent[b.OrphanID]; p != 0; p = parent[p] {
+			if p == b.AnchorID {
+				isAncestor = true
+				break
+			}
+			if trueDepth < 0 {
+				if _, gone := dropped[p]; !gone {
+					trueDepth = depth[p]
+				}
+			}
+		}
+		if isAncestor {
+			continue
+		}
+		// Window path: the fragment root's true ancestors down to the window
+		// checkpoint level, inclusive.
+		wDepth := ((depth[b.OrphanID] - 1) / ha.cpd) * ha.cpd
+		onPath := make(map[uint64]struct{})
+		for p := parent[b.OrphanID]; p != 0; p = parent[p] {
+			onPath[p] = struct{}{}
+			if depth[p] <= wDepth {
+				break
+			}
+		}
+		// Walk the anchor's own chain upward to the divergence point.
+		divDepth := -1
+		if _, ok := onPath[b.AnchorID]; ok {
+			divDepth = depth[b.AnchorID] // defensive; cannot happen (isAncestor)
+		} else {
+			for p := parent[b.AnchorID]; p != 0; p = parent[p] {
+				if _, ok := onPath[p]; ok {
+					divDepth = depth[p]
+					break
+				}
+				if depth[p] < wDepth {
+					break // left the window without meeting the path: wrong window
+				}
+			}
+		}
+		enc.Encode(wrongRec{
+			Trace:     fmt.Sprintf("%016x", tid),
+			Root:      fmt.Sprintf("%016x", b.OrphanID),
+			RootDepth: depth[b.OrphanID],
+			Anchor:    fmt.Sprintf("%016x", b.AnchorID),
+			AnchDepth: depth[b.AnchorID],
+			WDepth:    wDepth,
+			DivDepth:  divDepth,
+			TrueDepth: trueDepth,
+		})
+	}
 }
 
 func (ha *harness) scoresStore(tid uint64, sc recon.Score) {
@@ -255,9 +424,11 @@ func (ha *harness) scoresStore(tid uint64, sc recon.Score) {
 
 // output is the per-trace score arrays, in trace load order.
 type output struct {
+	Mode               string  `json:"mode"`
 	CheckpointDistance int     `json:"checkpoint_distance"`
 	DropRate           float64 `json:"drop_rate"`
-	BloomFP            float64 `json:"bloom_fp"`
+	BloomFP            float64 `json:"bloom_fp,omitempty"`
+	PrefixLen          int     `json:"prefix_len,omitempty"`
 	Order              string  `json:"order"`
 	Consistency        string  `json:"consistency"`
 	Seed               int64   `json:"seed"`
@@ -267,11 +438,21 @@ type output struct {
 	NumOrphans         []int   `json:"num_orphans"`
 	NumReconnected     []int   `json:"num_reconnected"`
 	NumAnchorCorrect   []int   `json:"num_anchor_correct"`
+	NumAnchorAncestor  []int   `json:"num_anchor_ancestor"`
 	NumGapCorrect      []int   `json:"num_gap_correct"`
 	NumMisattached     []int   `json:"num_misattached"`
 	NumUnanchored      []int   `json:"num_unanchored"`
 	NumSynthetic       []int   `json:"num_synthetic"`
 	NumBorrowed        []int   `json:"num_borrowed_bloom"`
+	NumFragmentsLost   []int   `json:"num_fragments_lost,omitempty"`   // PCR only
+	NumSpansLost       []int   `json:"num_spans_lost,omitempty"`       // PCR only
+	NumAncestorsSkip   []int   `json:"num_ancestors_skipped,omitempty"` // PCR only
+	NumSpansInSkipped  []int   `json:"num_spans_in_skipped,omitempty"`  // PCR only
+	NumOpenEnds        []int   `json:"num_open_ends,omitempty"`         // PCRB only
+	NumOpenEndsMatched []int   `json:"num_open_ends_matched,omitempty"` // PCRB only
+	NumForcedMatches   []int   `json:"num_forced_matches,omitempty"`    // PCRB only
+	NumOrphansPlaced   []int   `json:"num_orphans_placed,omitempty"`    // PCRB only
+	NumOrphanOpenEnds  []int   `json:"num_orphan_open_ends,omitempty"`  // PCRB only
 }
 
 func main() {
@@ -290,13 +471,22 @@ func main() {
 		orderName = "bottom-up"
 	}
 	out := output{
+		Mode:               c.mode,
 		CheckpointDistance: c.checkpointDistance,
 		DropRate:           c.dropRate,
-		BloomFP:            c.bloomFP,
 		Order:              orderName,
 		Consistency:        map[bool]string{true: "chain", false: "none"}[c.chainCheck],
 		Seed:               c.seed,
 		NumTraces:          len(traceOrder),
+	}
+	switch c.mode {
+	case "pcr":
+		out.PrefixLen = c.prefixLen
+	case "pcrb":
+		out.PrefixLen = c.prefixLen
+		out.BloomFP = c.bloomFP
+	default:
+		out.BloomFP = c.bloomFP
 	}
 	var agg recon.Score
 	for _, tid := range traceOrder {
@@ -306,21 +496,43 @@ func main() {
 		out.NumOrphans = append(out.NumOrphans, sc.Orphans)
 		out.NumReconnected = append(out.NumReconnected, sc.Reconnected)
 		out.NumAnchorCorrect = append(out.NumAnchorCorrect, sc.AnchorCorrect)
+		out.NumAnchorAncestor = append(out.NumAnchorAncestor, sc.AnchorAncestor)
 		out.NumGapCorrect = append(out.NumGapCorrect, sc.GapCorrect)
 		out.NumMisattached = append(out.NumMisattached, sc.Misattached)
 		out.NumUnanchored = append(out.NumUnanchored, sc.Unanchored)
 		out.NumSynthetic = append(out.NumSynthetic, sc.Synthetic)
 		out.NumBorrowed = append(out.NumBorrowed, sc.Borrowed)
+		if c.mode == "pcr" || c.mode == "pcrb" {
+			out.NumFragmentsLost = append(out.NumFragmentsLost, sc.FragmentsLost)
+			out.NumSpansLost = append(out.NumSpansLost, sc.SpansLost)
+			out.NumAncestorsSkip = append(out.NumAncestorsSkip, sc.AncestorsSkipped)
+			out.NumSpansInSkipped = append(out.NumSpansInSkipped, sc.SpansInSkipped)
+			out.NumOpenEnds = append(out.NumOpenEnds, sc.OpenEnds)
+			out.NumOpenEndsMatched = append(out.NumOpenEndsMatched, sc.OpenEndsMatched)
+			out.NumForcedMatches = append(out.NumForcedMatches, sc.ForcedMatches)
+			out.NumOrphansPlaced = append(out.NumOrphansPlaced, sc.OrphansPlaced)
+			out.NumOrphanOpenEnds = append(out.NumOrphanOpenEnds, sc.OrphanOpenEnds)
+		}
 		agg.Spans += sc.Spans
 		agg.Dropped += sc.Dropped
 		agg.Orphans += sc.Orphans
 		agg.Reconnected += sc.Reconnected
 		agg.AnchorCorrect += sc.AnchorCorrect
+		agg.AnchorAncestor += sc.AnchorAncestor
 		agg.GapCorrect += sc.GapCorrect
 		agg.Misattached += sc.Misattached
 		agg.Unanchored += sc.Unanchored
 		agg.Synthetic += sc.Synthetic
 		agg.Borrowed += sc.Borrowed
+		agg.FragmentsLost += sc.FragmentsLost
+		agg.SpansLost += sc.SpansLost
+		agg.AncestorsSkipped += sc.AncestorsSkipped
+		agg.SpansInSkipped += sc.SpansInSkipped
+		agg.OpenEnds += sc.OpenEnds
+		agg.OpenEndsMatched += sc.OpenEndsMatched
+		agg.ForcedMatches += sc.ForcedMatches
+		agg.OrphansPlaced += sc.OrphansPlaced
+		agg.OrphanOpenEnds += sc.OrphanOpenEnds
 	}
 
 	f, err := os.Create(c.outputPath)
@@ -344,14 +556,29 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "traces=%d spans=%d dropped=%d orphans=%d\n",
 		len(traceOrder), agg.Spans, agg.Dropped, agg.Orphans)
-	fmt.Fprintf(os.Stderr, "reconnected=%d (%.2f%%) anchor_correct=%d (%.2f%%) gap_correct=%d (%.2f%%)\n",
+	fmt.Fprintf(os.Stderr, "reconnected=%d (%.2f%%) anchor_correct=%d (%.2f%%) anchor_ancestor=%d (%.2f%%) gap_correct=%d (%.2f%%)\n",
 		agg.Reconnected, pct(agg.Reconnected, agg.Orphans),
 		agg.AnchorCorrect, pct(agg.AnchorCorrect, agg.Orphans),
+		agg.AnchorAncestor, pct(agg.AnchorAncestor, agg.Orphans),
 		agg.GapCorrect, pct(agg.GapCorrect, agg.Orphans))
-	fmt.Fprintf(os.Stderr, "misattached=%d unanchored=%d synthetic=%d borrowed_bloom=%d\n",
+	// "via_carrier": PB = bloom borrowed across reconstructed structure or
+	// by membership scan (a verified guess); PCR = exact inheritance from a
+	// real-edge in-fragment descendant carrier (not an error channel). The
+	// JSON field keeps its legacy name num_borrowed_bloom for script compat.
+	fmt.Fprintf(os.Stderr, "misattached=%d unanchored=%d synthetic=%d via_carrier=%d\n",
 		agg.Misattached, agg.Unanchored, agg.Synthetic, agg.Borrowed)
 	fmt.Fprintf(os.Stderr, "ambiguous=%d (of which misattached=%d); non-ambiguous misattached=%d\n",
 		agg.Ambiguous, agg.AmbiguousBad, agg.Misattached-agg.AmbiguousBad)
+	if c.mode == "pcr" || c.mode == "pcrb" {
+		fmt.Fprintf(os.Stderr, "fragments_lost=%d spans_lost=%d (%.2f%% of survivors thrown away)\n",
+			agg.FragmentsLost, agg.SpansLost, pct(agg.SpansLost, agg.Spans-agg.Dropped))
+		fmt.Fprintf(os.Stderr, "ancestors_skipped=%d spans_in_skipped_fragments=%d (%.2f%% of survivors)\n",
+			agg.AncestorsSkipped, agg.SpansInSkipped, pct(agg.SpansInSkipped, agg.Spans-agg.Dropped))
+		fmt.Fprintf(os.Stderr, "open_ends=%d matched=%d (%.2f%%) forced=%d\n",
+			agg.OpenEnds, agg.OpenEndsMatched, pct(agg.OpenEndsMatched, agg.OpenEnds), agg.ForcedMatches)
+		fmt.Fprintf(os.Stderr, "orphans_placed=%d orphan_open_ends_pending=%d\n",
+			agg.OrphansPlaced, agg.OrphanOpenEnds)
+	}
 	fmt.Fprintf(os.Stderr, "Wrote %d traces to %s\n", len(traceOrder), c.outputPath)
 }
 

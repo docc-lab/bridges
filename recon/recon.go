@@ -2,6 +2,25 @@
 // bridge payloads. v1 implements the Path Bridge (P-Bridge) only; it requires
 // payloads produced in EmitDepth mode (absolute depth in _br, _d on interior
 // non-checkpoint spans). See docs/depth_emission.md for the wire formats.
+//
+// The algorithm and its rationale are specified in
+// docs/pb_reconstruction.md. Comments below cite the numbered algorithm box
+// there as [alg. N]; the function decomposition matches it one-to-one:
+//
+//	ReconstructPB   = reconnect_orphans  [alg. 1-11]
+//	coveringBloom   = covering_bloom     [alg. 12-22]
+//	findAnchor      = find_anchor        [alg. 23-29]
+//	chainConsistent = chain_consistent   [alg. 30-38]
+//
+// Conceptual flow: every dropped span leaves behind orphans — surviving
+// spans whose parent is gone. Each orphan roots a detached fragment. To
+// reattach a fragment we need (a) a bloom filter whose window covers the
+// hole above the orphan (coveringBloom), (b) the surviving ancestor to
+// attach to, found by testing candidate IDs against that bloom
+// (findAnchor), and (c) the exact number of synthetic spans to chain in
+// between, which absolute depths give us for free. Reconstruction errors
+// are misattachments — picking a wrong anchor via bloom false positives or
+// same-depth ambiguity — never failures to reconnect.
 package recon
 
 import (
@@ -28,6 +47,17 @@ type Span struct {
 	// BloomBits is the raw bloom bit array from the _br payload, nil for
 	// spans that carried only _d.
 	BloomBits []byte
+
+	// CkptPrefix is the truncated checkpoint-root span ID from a PCR _br
+	// payload (see recon/pcr.go), nil for spans that carried only _d.
+	// Mutually exclusive with BloomBits — a corpus is run in one mode.
+	CkptPrefix []byte
+
+	// LeafCarrier marks a span provably a leaf: it carries a _br payload at
+	// a non-checkpoint depth, and only leaves emit there. A leaf has no
+	// descendants, so it can never be a threading candidate — any bloom
+	// positive on it is a structurally impossible attachment.
+	LeafCarrier bool
 }
 
 // Config is the global knowledge a real reconstruction module would have:
@@ -37,6 +67,16 @@ type Config struct {
 	CPD    int
 	BloomM uint32
 	BloomK uint32
+
+	// PrefixLen is the truncated checkpoint-root ID length for PCR mode
+	// (unused by PB).
+	PrefixLen int
+
+	// StopOnGap (PCRB threading): stop the level walk at the first level
+	// with zero candidates instead of continuing past it. Maximally
+	// FP-averse: refuses to stitch across unnameable dropped levels, at the
+	// cost of benign skips wherever the surviving chain is interrupted.
+	StopOnGap bool
 
 	// BottomUp processes orphans deepest-first and lets shallower orphans
 	// discover descendant carriers by walking across already-reconstructed
@@ -92,10 +132,24 @@ type Bridge struct {
 	Synthetic int    // synthetic spans inserted between anchor and orphan
 	Ambiguous bool   // >1 candidate tested positive at the anchor depth
 
-	// ViaCarrier is the span whose bloom was borrowed through the
-	// membership-based fallback (0 when the orphan's own bloom or an
-	// in-fragment descendant's bloom was used).
+	// ViaCarrier is the span whose payload was used in place of the orphan's
+	// own. The semantics differ by mode:
+	//   PB:  a bloom reached through reconstructed structure or the
+	//        membership scan — a verified GUESS (own bloom and real-edge
+	//        in-fragment carriers leave this 0).
+	//   PCR: any in-fragment descendant carrier, reached through real
+	//        surviving edges only, band-bounded — exact inheritance, never
+	//        a guess (PCR cannot cross bridges or scan: it has no
+	//        membership test). Tracked for visibility, not as an error
+	//        channel.
 	ViaCarrier uint64
+
+	// Forced marks an open-end attachment made by the forced-resolution
+	// tier: the sound fixpoint left the open end unsatisfied, and total
+	// coverage is an invariant, so the most-plausible claimant (fewest
+	// deeper candidates) was committed deterministically. Flagged because
+	// the evidence did not single it out.
+	Forced bool
 }
 
 // Result is the outcome of reconstructing one trace.
@@ -104,31 +158,60 @@ type Result struct {
 	Reconnected int
 	Bridges     []Bridge
 	Unanchored  []uint64 // orphan IDs with no positive bloom candidate
+
+	// Open-end census (PCRB): surviving non-carrier spans with zero
+	// surviving children (provably lost ALL children), and how many of
+	// them received >=1 bridge. See Score.OpenEnds.
+	OpenEnds        int
+	OpenEndsMatched int
+	ForcedMatches   int // open-end attachments committed by the forced tier
+
+	// Orphan placement (v7): orphan fragments fitted into synthetic slots
+	// using descendant-fragment bloom testimony, exact depths, and spacing
+	// constraints. OrphanOpenEnds counts open ends INSIDE placed orphans —
+	// coverage for those requires orphans as threading material (v7.1) and
+	// is reported separately from the main census.
+	OrphansPlaced  int
+	OrphanOpenEnds int
 }
 
-// ReconstructPB reattaches orphaned spans using P-Bridge payloads.
+// ReconstructPB reattaches orphaned spans using P-Bridge payloads. This is
+// reconnect_orphans [alg. 1-11], the top-level driver.
 //
 // For each orphan (surviving span whose parent is not in the surviving set):
 //
-//  1. Locate the covering bloom: the orphan's own _br if present, else the
-//     nearest _br-carrying descendant within the orphan's surviving fragment.
-//     Blooms reset at checkpoints, so the nearest carrier's window is
-//     guaranteed to span the hole above the orphan (any intermediate
-//     checkpoint would itself be a nearer carrier).
-//  2. Test surviving spans at depths [lastCkptDepth, orphan.depth-1] against
-//     the bloom; the deepest positive is the anchor. The window lower bound
-//     is config-derivable: the last protected checkpoint strictly above the
-//     orphan, at depth cpd*floor((d-1)/cpd).
-//  3. The depth difference fixes the synthetic chain length exactly:
-//     orphan.depth - anchor.depth - 1.
+//  1. Locate the covering bloom [alg. 5, coveringBloom]: the orphan's own
+//     _br if present, else the nearest _br-carrying descendant within the
+//     orphan's surviving fragment. Blooms reset at checkpoints, so the
+//     nearest carrier's window is guaranteed to span the hole above the
+//     orphan (any intermediate checkpoint would itself be a nearer carrier).
+//  2. Test surviving spans at depths [lastCkptDepth, orphan.depth-2] against
+//     the bloom [alg. 6, findAnchor]; the deepest positive is the anchor.
+//     The window lower bound is config-derivable: the last protected
+//     checkpoint strictly above the orphan, at depth cpd*floor((d-1)/cpd).
+//     The upper bound excludes depth d-1 — the orphan's parent at d-1 is
+//     dropped by definition, so that level holds only its siblings, which
+//     pass the chain check structurally and would steal the anchor on a
+//     single membership FP.
+//  3. The depth difference fixes the synthetic chain length exactly
+//     [alg. 7-8]: orphan.depth - anchor.depth - 1. This is what EmitDepth
+//     mode's per-span absolute depth pays for — the hole size is computed,
+//     never inferred.
 //
 // Per the paper (§3.4), P-Bridge does NOT merge synthetic parents: siblings
 // of a lost parent each get their own synthetic chain.
 func ReconstructPB(survivors []Span, cfg Config) Result {
+	// --- Index building (implementation detail; the algorithm box treats
+	// these as set membership tests over S) ---
+
+	// byID: is this span in the surviving set? Used for orphan detection
+	// [alg. 2] and for naming surviving ancestors in the chain check.
 	byID := make(map[uint64]*Span, len(survivors))
 	for i := range survivors {
 		byID[survivors[i].SpanID] = &survivors[i]
 	}
+	// children: the real surviving edges — the fragments. coveringBloom
+	// walks these downward [alg. 15].
 	children := make(map[uint64][]*Span, len(survivors))
 	for i := range survivors {
 		s := &survivors[i]
@@ -138,13 +221,17 @@ func ReconstructPB(survivors []Span, cfg Config) Result {
 			}
 		}
 	}
-	// Candidate index: surviving spans grouped by depth.
+	// byDepth: anchor-candidate index. findAnchor scans one depth level at a
+	// time, deepest first [alg. 25-26].
 	byDepth := make(map[int][]*Span)
 	for i := range survivors {
 		s := &survivors[i]
 		byDepth[s.Depth] = append(byDepth[s.Depth], s)
 	}
-	// All _br carriers, shallowest first (for the membership fallback).
+	// carriers: every _br-carrying span, sorted shallowest-first for the
+	// membership-scan fallback [alg. 19-21] (shallowest claimant = nearest
+	// descendant by depth = safest borrow, and the sort allows early exit at
+	// the band edge).
 	var carriers []*Span
 	for i := range survivors {
 		if survivors[i].BloomBits != nil {
@@ -192,9 +279,17 @@ func ReconstructPB(survivors []Span, cfg Config) Result {
 		}
 		bf := bloom.Deserialize(bits, cfg.BloomM, cfg.BloomK)
 
-		// Window: [last checkpoint strictly above orphan, orphan.depth-1].
+		// Window: [last checkpoint strictly above orphan, orphan.depth-2].
+		// Depth o.Depth-1 is excluded: the orphan's depth-(k-1) ancestor is
+		// by definition its dropped parent, so no span at that depth can be
+		// the true anchor — while the dropped parent's surviving siblings
+		// live there and pass the chain check for free (their chain above
+		// k-2 is the orphan's own ancestry). Scanning k-1 is pure
+		// misattachment surface. The floor never collides: under the v1
+		// drop policy a checkpoint-depth parent cannot drop, so for any
+		// orphan (k-1) % cpd != 0 and lo <= k-2.
 		lo := ((o.Depth - 1) / cfg.CPD) * cfg.CPD
-		anchor, ambiguous := findAnchor(bf, byDepth, byID, lo, o.Depth-1, cfg)
+		anchor, ambiguous := findAnchor(bf, byDepth, byID, lo, o.Depth-2, cfg)
 		if anchor == nil {
 			res.Unanchored = append(res.Unanchored, o.SpanID)
 			continue
@@ -390,19 +485,61 @@ type Score struct {
 	Orphans       int
 	Reconnected   int
 	AnchorCorrect int // anchor == true nearest surviving ancestor
-	GapCorrect    int // synthetic count == true dropped spans in between
-	Misattached   int // reconnected but anchor wrong (bloom FP / ambiguity)
+	// AnchorAncestor counts bridges whose anchor is a TRUE ancestor of the
+	// orphan, even if not the nearest surviving one. For PB the two
+	// essentially coincide (the deepest-first scan cannot pass the nearest
+	// survivor by). For PCR — which structurally anchors at the checkpoint —
+	// this is the operative correctness metric: AnchorAncestor failures are
+	// genuinely wrong attachments (prefix collisions), while
+	// AnchorCorrect-but-not-nearest gaps measure structural coarseness.
+	AnchorAncestor int
+	GapCorrect     int // synthetic count == true dropped spans in between
+	Misattached    int // reconnected but anchor wrong (bloom FP / ambiguity)
 	Unanchored    int
 	Synthetic     int // total synthetic spans created
 	Borrowed      int // bridges built via the membership-based bloom fallback
 	Ambiguous     int // bridges where >1 candidate tested positive at the anchor depth
 	AmbiguousBad  int // ... of which the anchor was wrong
+
+	// PCR fragment accounting (ScorePCR only; zero under ScorePB). A
+	// carrier-less fragment — an unanchored orphan plus every survivor
+	// connected below it — cannot be placed and is recorded as thrown away.
+	FragmentsLost int // unanchored fragments discarded
+	SpansLost     int // surviving spans inside those fragments (incl. the roots)
+
+	// Open-end accounting (ScorePCR only). An open end is a surviving
+	// non-carrier span with zero surviving children: non-carriers are
+	// interior by construction (leaves always carry _br), so all its
+	// children were dropped — and because true leaves and checkpoints
+	// always survive, at least one fragment provably belongs below it.
+	// Unmatched open ends are a completeness deficit, not an error.
+	OpenEnds        int // provably-dangling chain ends
+	OpenEndsMatched int // ... that received >=1 bridge attachment
+	ForcedMatches   int // ... matched by forced resolution (flagged, not evidence-unique)
+	OrphansPlaced   int // orphan fragments fitted into synthetic slots (v7)
+	OrphanOpenEnds  int // open ends inside placed orphans, coverage pending v7.1
+
+	// Window-skip impact, span-weighted (ScorePCR only). A bridge "skips"
+	// when >=1 surviving same-window ancestor sits strictly between the
+	// anchor and the orphan (Misattached counts those bridges; no spans are
+	// lost — only the intra-window nesting between co-window fragments).
+	AncestorsSkipped int // total surviving ancestors skipped, summed over bridges
+	SpansInSkipped   int // surviving spans in fragments whose bridge skipped
 }
 
 // ScorePB computes per-trace reconstruction accuracy. truth holds every span
 // of the original trace; dropped is the set of span IDs removed by the drop
 // policy.
 func ScorePB(res Result, truth []TruthSpan, dropped map[uint64]struct{}) Score {
+	return scorePB(res, truth, dropped, nil)
+}
+
+// scorePB is ScorePB with an optional `absent` set: spans that physically
+// survived but are NOT part of the reconstruction (discarded fragments under
+// the PCR fragment model). For nearest-surviving-ancestor and gap purposes
+// they count like dropped spans — attaching past one is correct in the
+// reduced survivor set, and its window slot is legitimately synthetic.
+func scorePB(res Result, truth []TruthSpan, dropped map[uint64]struct{}, absent map[uint64]bool) Score {
 	parent := make(map[uint64]uint64, len(truth))
 	depth := make(map[uint64]int, len(truth))
 	for _, t := range truth {
@@ -427,15 +564,28 @@ func ScorePB(res Result, truth []TruthSpan, dropped map[uint64]struct{}) Score {
 		}
 
 		// True nearest surviving ancestor: walk the real parent chain upward
-		// past dropped spans.
+		// past dropped spans. The same walk (continued) answers whether the
+		// chosen anchor is a true ancestor at all.
 		trueAnchor := uint64(0)
 		gap := 0
+		isAncestor := false
 		for p := parent[b.OrphanID]; p != 0; p = parent[p] {
-			if _, isDropped := dropped[p]; !isDropped {
-				trueAnchor = p
-				break
+			if p == b.AnchorID {
+				isAncestor = true
 			}
-			gap++
+			if trueAnchor == 0 {
+				_, isDropped := dropped[p]
+				if !isDropped && !absent[p] {
+					trueAnchor = p
+				} else {
+					gap++
+				}
+			} else if isAncestor {
+				break // both questions answered
+			}
+		}
+		if isAncestor {
+			sc.AnchorAncestor++
 		}
 		if b.AnchorID == trueAnchor {
 			sc.AnchorCorrect++

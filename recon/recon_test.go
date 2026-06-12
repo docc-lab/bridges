@@ -103,7 +103,7 @@ func TestPBDropAll(t *testing.T) {
 
 	want := Score{
 		Spans: 63, Dropped: 22, Orphans: 40, Reconnected: 40,
-		AnchorCorrect: 40, GapCorrect: 40, Misattached: 0, Unanchored: 0,
+		AnchorCorrect: 40, AnchorAncestor: 40, GapCorrect: 40, Misattached: 0, Unanchored: 0,
 		Synthetic: 48,
 	}
 	if sc != want {
@@ -146,7 +146,7 @@ func TestPBPartialDrop(t *testing.T) {
 
 	want := Score{
 		Spans: 63, Dropped: 4, Orphans: 8, Reconnected: 8,
-		AnchorCorrect: 8, GapCorrect: 8, Misattached: 0, Unanchored: 0,
+		AnchorCorrect: 8, AnchorAncestor: 8, GapCorrect: 8, Misattached: 0, Unanchored: 0,
 		Synthetic: 8,
 	}
 	if sc != want {
@@ -222,7 +222,7 @@ func TestPBChainBorrowedBloom(t *testing.T) {
 
 	want := Score{
 		Spans: 5, Dropped: 2, Orphans: 2, Reconnected: 2,
-		AnchorCorrect: 2, GapCorrect: 2, Misattached: 0, Unanchored: 0,
+		AnchorCorrect: 2, AnchorAncestor: 2, GapCorrect: 2, Misattached: 0, Unanchored: 0,
 		Synthetic: 2, Borrowed: 1,
 	}
 	if sc != want {

@@ -1,14 +1,13 @@
-# PCRS: pure-solver reconstruction as MAP inference (`recon/pcrs.go`)
+# PCRS: solver-based reconstruction as MAP inference (`recon/pcrs.go`)
 
 PCRS (`--mode pcrs`) reconstructs trace topology from PCRB wire payloads
 (truncated checkpoint-root prefix + inherited window bloom; see
 `bridge/pcrb.go`) by treating reconstruction as **maximum a posteriori
 (MAP) estimation** under an explicit generative model. Everything the
-engine does is one of three things: a *count*, a *theorem*, or an
-*order*. There are no tuned thresholds, no greedy tie-breaks, and no
-heuristic scores — this document states the model, derives the objective
-from it, and discloses the engineering guards and their measured
-behavior.
+engine does is a *count*, a *theorem*, or an *order*: there are no tuned
+thresholds and no heuristic scores. This document states the model,
+derives the objective, describes the engine as it ships, and discloses
+its bounded approximations and their measured behavior.
 
 ## The generative model
 
@@ -16,211 +15,240 @@ behavior.
   mod cpd) always survive as carriers of `_br` payloads.
 - A carrier's payload contains (a) an **exact** truncated span-ID prefix
   of its nearest checkpoint ancestor and (b) a **window bloom** over the
-  spans strictly between that checkpoint and itself (the carrier's
-  *window*), with bloom geometry derived from a target false-positive
-  rate ε.
-- Blooms have **no false negatives**: a true window member always tests
-  positive. A non-member tests positive independently with probability
-  ≈ ε.
+  spans strictly between that checkpoint and itself, geometry derived
+  from a target false-positive rate ε.
+- Blooms have **no false negatives**; non-members test positive
+  independently with probability ≈ ε.
 
-Reconstruction = find the placement of all surviving material that
-maximizes `P(configuration | observations)`. By Bayes this is
-`P(observations | configuration) · P(configuration)`, and each factor
-maps onto a solver component below.
+Reconstruction = maximize `P(configuration | observations)` =
+`P(observations | configuration) · P(configuration)`.
 
 ## Terminology
 
-- **Fragment**: a connected component of survivors. Its root's parent
-  was dropped.
-- **Orphan**: a fragment with no carrier — under PCR-family anchoring it
-  has no exact prefix to attach by, and must be *placed* by inference.
-- **Open end**: a survivor, not itself a carrier, all of whose children
-  dropped. It provably lost descendants.
-- **Window / chain**: each carrier's payload defines a window between
-  its anchor checkpoint and itself; the reconstructor models it as a
-  *chain* — one slot (level) per depth, since a window is a single
-  root-path in truth.
+- **Fragment**: a connected component of survivors (root's parent
+  dropped). **Orphan**: a fragment with no carrier — placed by
+  inference. **Open end**: a surviving non-carrier with zero surviving
+  children (provably lost all children). **Window / chain**: each
+  carrier's payload defines a window between its anchor checkpoint and
+  itself, modeled as a chain of one slot per depth.
 
-## Invariants are prior structure, not preferences
+## Invariants are prior structure
 
-`P(configuration)` is zero for any assignment violating:
-
-1. **Tree structure**, one span per chain level.
-2. **Walls**: the slot directly above a fragment root on its own chain
-   holds a dropped span (that is what *made* it a fragment root); no
-   surviving span may be written there.
-3. **Spacing**: the slot above every fragment/orphan root stays
-   synthetic — orphan roots cannot be direct children of placed spans.
-4. **Total coverage**: every open end receives at least one window
-   match. *Theorem*: an open end inside a surviving window range is a
-   true member of some window whose bloom must contain it (no false
-   negatives), so the truth satisfies this.
-5. **Total placement**: every orphan is placed. *Recoverability
-   theorem*: every orphan's spans appear in the bloom of its true
-   window's carrier, so its true seat is always in its candidate domain.
-
-Because the truth itself satisfies 4 and 5 with certainty, restricting
-the hypothesis space to configurations that satisfy them can never
-exclude the true configuration. The engine treats them as rules: a
-violated invariant in the final state indicates a wrong commitment
-upstream (or a model violation), and is surfaced by diagnostics — never
-silently accepted.
+`P(configuration) = 0` for: non-tree output; two spans on one chain
+level; writes onto walls (the slot above a fragment root on its own
+chain holds that root's dropped parent); spacing violations (the slot
+above every fragment/orphan root stays synthetic); an uncovered open
+end; an unplaced orphan. The last two are enforceable because the truth
+itself satisfies them with certainty (no-false-negative recoverability:
+every orphan's true seat is in its candidate domain; every open end's
+true window gates it), so restricting search to invariant-satisfying
+configurations never excludes the truth.
 
 ## The likelihood: explained bloom positives
 
-Fix a candidate configuration. Every positive bloom test it *explains*
-(a placed true member) has likelihood 1; every positive it leaves
-*unexplained* must be a false positive, contributing a factor ε. Hence
+A placement that says "span s is in window W" explains s's positive
+bits with probability 1; every positive left unexplained costs a factor
+ε. Hence `log P(obs | config) = const − (#unexplained) · log(1/ε)`, and
+maximizing likelihood is exactly **maximizing the count of explained
+bloom positives**. Option gains are literal counts (an orphan path of
+length L explains L+1 positives; an end write explains 1; displacing a
+soft write un-explains 1). The lexicographic bands (reseat 2·10⁹ ≻
+demand skip 10⁹ ≻ coverage 10⁶ ≻ likelihood units) encode the prior ≻
+likelihood order; correctness requires only the separation inequality
+(each band exceeds the maximum attainable sum of lower bands), so the
+constants are representatives of an order, not tuning.
 
-```
-log P(obs | config) = const − (# unexplained positives) · log(1/ε)
-```
+## Architecture
 
-and maximizing the likelihood is **exactly maximizing the count of
-explained bloom positives**. This is the entire objective:
+### Propagation: arc consistency, ties never broken
 
-- an orphan-placement option's gain is `len(path) + 1` — the number of
-  positives that placement explains;
-- an end-coverage write's gain is 1 — the one positive it explains;
-- displacing a soft (rule-A/C/D) write costs 1 — the one positive it
-  un-explains.
+- **Rule C** (obligation before discretion): an open end gated by a
+  window (bloom-positive, in depth range, chain-consistent) is written
+  into every chain that gates it; surplus writes are soft.
+- **Rule A**: a level with exactly one eligible candidate takes it.
+- **Rule B**: orphan unification commits only when single-window,
+  single-chain, and sole-claimant on every level (eager variants were
+  measured to open false-positive channels).
 
-Unit-for-unit counting in a single currency (`log(1/ε)` per bit). No
-coefficient was fit to data, and the objective has a one-line
-definition: *the most probable reconstruction under the stated
-drop-and-bloom model*.
+### Candidate walk and doors
 
-## Architecture: propagate, then search
+Per window, candidates are gathered by descending from the anchor
+through surviving edges while bloom tests stay positive (a true member
+can never sit below a true negative on a survivor path), re-entering
+across drop gaps via fragment roots registered to this window's anchor
+by their carriers' prefixes. Registration-keyed doors are sufficient:
+carrier-less gapped fragments are orphans (whose placement domain,
+`pathOn`, is already evidence-keyed over **all** windows), and
+carrier-bearing fragments register to the window their material belongs
+to. An evidence-keyed "door-complete" variant was built and reverted:
+the case it covers is structurally vacant (the CANDCHECK probe found
+zero missing candidates, ever) at real combinatorial cost. CANDCHECK
+remains armed as the tripwire.
 
-### Propagation = arc consistency (deductive, zero discretion)
+### Threading as search, sticky
 
-Rules run to fixpoint and commit **only facts that hold in every
-nonzero-prior configuration**:
+A chain level with ≥ 2 eligible candidates is a solver decision, not a
+wall: each candidate contributes its unique-descent continuation as an
+option, scored by explained bits ("thread items": free skip, no
+coverage band — no invariant demands threading, so demand items always
+dominate them in shared clusters). Exact posterior ties are **forced**
+(`--tie-policy aware`, default: prefer the candidate not already
+explained by another chain — the same likelihood applied across
+windows; span-ID order as final fallback; `stop` and `id` retained for
+ablation). Thread decisions are **sticky**: re-litigated only when a
+demand's seating displaces them. Spontaneous re-adjudication was built
+and reverted — it defended a channel never observed while causing
+measured churn. The solver runs even in traces with zero invariant
+demands (its earlier absence in quiet traces was the entire residual
+shallow-attachment rate at low drop).
 
-- **Rule C** (before A — obligation precedes discretion): an open end
-  gated by a window (bloom-positive, depth in range, chain-consistent)
-  is written into *every* chain that gates it. Multi-writes are sound
-  because coverage is a must, and surplus writes are soft (displaceable
-  by search).
-- **Rule A**: unique-claimant collapse — a level with exactly one
-  possible occupant takes it.
-- **Rule B** (demoted to true arc consistency): an orphan unifies into
-  a chain only when it has a single gated window, a single chain, and
-  every needed level is claimed by no other orphan. Anything weaker is
-  a *choice* and belongs to search. (Eager rule-B variants were
-  measured to open three false-positive channels: wrong-window commits,
-  commit-order lotteries, contamination cascades.)
+### Demand model
 
-Propagation never breaks ties. If a fact isn't forced, it isn't
-committed.
+- A span that is both an unplaced orphan root and an uncovered open end
+  is ONE assignment per level (identity-aware writes), not a collision.
+- **Implied-end suppression**: an end on its orphan's *common spine*
+  (spans present in every option path) never becomes a separate demand
+  item — its coverage is implied by the placement invariant, and a
+  separate item double-counted one obligation. Branch ends keep full
+  independent demands.
+- **Scoped end-coverage closure**: a sitting C/D write that is an end's
+  sole appearance joins any cluster whose options touch its level, so
+  displacement and re-seating are decided in one joint assignment.
+- **Lexicographic displacement pricing**: displacing an end's sole
+  coverage write costs at the coverage band (10⁶) — likelihood gains
+  can never out-bid an invariant.
 
-### Search = exact per-cluster branch-and-bound (owns every choice)
+### Search: plain deterministic branch-and-bound, disclosed cap
 
-Demand items (unplaced orphans, unmatched ends) plus **closure
-conscripts** — everything feasibility depends on — are clustered by
-shared chains (union-find) and each cluster is solved exactly:
+Items cluster by shared chains (union-find); clusters are independent
+sub-problems (per-cluster optimality composes). Each cluster is solved
+by branch-and-bound with the simple admissible bound (sum of remaining
+items' best gains) and a **disclosed certification budget of 10M
+nodes**: a handful of clusters per corpus run (tight assignment cores
+up to ~800 items) exceed any practical budget while certifying among
+near-tied all-seated arrangements; they ship their best-found COMPLETE
+seating (the first descent finishes within ~|items| nodes), are counted
+(`capped=N`) and anatomized (CLUSTERDUMP). Capped best-found seatings
+have never measurably changed any metric, and all invariants are
+re-verified by the census regardless.
 
-- **Blocker closure**: a placed orphan occupying levels a demand needs
-  becomes a reassignable item (whole-fragment move), recursively.
-- **End-coverage closure**: a sitting end-write contending for a
-  demanded level joins as an item (its full gate-set as options),
-  recursively — same-depth contention is assigned jointly, never by
-  displacement roulette.
-- Items in different clusters share no chains, hence no constraints:
-  per-cluster optimality composes to global optimality.
+The deliberately plain search preserves **re-solve idempotence**: on an
+unchanged ledger a re-solve reproduces its previous assignment, so the
+propagate/solve rounds reach a fixpoint. Three search-space reduction
+layers — option deduplication, symmetry breaking, a mutual-exclusion
+(per-level value cap + pigeonhole) bound — were built, measured, and
+**removed**: their kept-sets and canonical orders depended on the
+mutating ledger, so each round's re-solve returned a *different*
+equally-scored optimum, and the resulting churn (capped re-solves ×
+unbounded rounds) cost far more than the techniques saved. Recorded as
+future work below.
 
-Within a cluster, branch-and-bound with an admissible optimistic bound
-enumerates assignments. Conflict semantics are span-identity-aware:
-writing the same span to the same level twice (an orphan/end "alter
-ego" of one span) is one assignment, not a collision.
+## Verification
 
-### The objective constants encode an order, not thresholds
+Three pillars, all reproducible from the shipped tooling:
 
-The full objective is **lexicographic**:
+1. **Analytic sanity anchor**: at `--drop-rate 1.0` reconstruction
+   degenerates to pure prefix anchoring with a closed-form prediction
+   of perfection. Measured at full corpus: 167.9M bridges across cpd 3
+   and 6, zero errors, zero residual diagnostics.
+2. **Scorer non-leniency** (`--score-audit`,
+   `cmd/trace_recon/audit.go`): the dangerous failure direction for the
+   scorer is leniency (over-crediting reports better-than-actual
+   results). Fault injection corrupts a copy of each trace's
+   reconstruction and requires `ScorePCR` to move by exactly the
+   penalty predicted by an independent ancestry implementation. Five
+   single-fault classes (lateral / same-depth / shallow / descendant
+   anchor corruption; silent fragment deletion) plus random multi-fault
+   cocktails of 1–8 interacting faults graded by full score-vector
+   agreement (deletions change the reduced set and other bridges'
+   correct grades, so cocktail expectations are derived globally).
+   Measured at full corpus: **2.3M injected faults, 100.0000% detected
+   with exact penalties, zero misclassifications.**
+3. **Adversarial definitional tests** (`recon/score_traps_test.go`):
+   descendant anchors, same-depth siblings, shallow ancestors, and both
+   directions of reduced-set loss billing (losses must be billed;
+   surviving nearer ancestors must not be skippable).
 
-```
-keep reseated placements ≻ satisfy demands ≻ cover broadly ≻ MAP likelihood
-   (reseat-skip 2·10⁹)      (skip 10⁹)       (bonus 10⁶)     (gain/cost 1)
-```
-
-Correctness requires only the *separation inequality*: each band
-exceeds the maximum attainable sum of all lower bands (bounded by
-cluster size × window depth × max gain ≪ 10⁶). Any constants satisfying
-it produce bit-identical optima — replacing 10⁹ with 10¹² changes
-nothing. The numbers are representatives of an order. The sentinel for
-"no assignment yet" is −2⁶², i.e. −∞: the optimum is always returned
-and applied, however many skip penalties it carries (a finite sentinel
-was observed to silently freeze clusters whose optimum held ≥ 2 skips).
-
-### Guards (present, never binding, verified per run)
-
-Two completeness escapes exist for pathological inputs: cluster-size
-cap 256 items and node budget 5·10⁶ per cluster. On the full evaluation
-grid both counters are **zero** (measured maxima: 22 items, ~2.1·10⁴
-nodes), so all reported numbers are exact cluster optima. Both are
-asserted observable via diagnostics (below) — they are disclosures, not
-knobs.
+Cross-checks: the scorer's shallow-bridge counters match the
+independently-logged BENIGNSKIP event stream exactly in every measured
+cell; worker-count and seed determinism verified byte-identical.
 
 ## Scoring (`recon/pcr.go: ScorePCR`)
 
-Every metric is a count against the information-theoretic ceiling:
+- **exact**: anchored to the nearest *surviving* true ancestor — the
+  information-theoretic ceiling given who survived.
+- **wrong** (reported including the shallow sub-class, per project
+  ruling): anchor is not the nearest surviving ancestor. The shallow
+  sub-class (true ancestor, too high) is broken out diagnostically; it
+  measures 0.00% in all twelve corpus cells (literal zero in nine; a
+  parts-per-million residue of bloom-FP "end thefts" in the rest, each
+  event logged with span IDs).
+- **Reduced-set semantics**: discarded fragments are billed to `lost%`
+  and treated as absent by accuracy metrics — accuracy and coverage
+  cannot launder each other (`tr%` = traces containing ≥1 wrong
+  bridge).
+- Field algebra (validated against reference runs): with
+  `R = num_reconnected = C + W`: exact `= C/R`, shallow `= (A−C)/R`,
+  wrong `= W/R`. Canonical table: `scripts/results_table.py`.
 
-- **exact**: bridge anchored to the *nearest surviving* true ancestor —
-  the best any method can do, since the intervening spans no longer
-  exist.
-- **benign**: anchored to a true ancestor, but shallower. Lineage
-  correct, no false ancestry introduced; only depth resolution lost.
-  Measured composition at cpd6 r0.5: 97.9% of bypassed
-  nearest-ancestors are interior spans correctly anchored by their own
-  fragments.
-- **wrong**: anchored to a non-ancestor — a false edge. `tr%` = share
-  of traces containing at least one truly-wrong bridge.
-- **Reduced-set semantics**: discarded fragments are reported as
-  `lost%` and treated as absent by the accuracy metrics — accuracy and
-  coverage cannot launder each other.
-- **Invariant audits**: `oe match` (end coverage), `placed`
-  (orphans), `forced` (search-decided assignments, flagged because the
-  evidence under-determined them). These are audits, not quality
-  scores.
+## Results (Uber corpus, 451,466 traces/cell, K=4, fp 1e-4)
 
-Field algebra (verified against reference runs): `num_anchor_ancestor`
-includes the exact cases and `num_misattached` includes the benign
-ones; with `R = num_reconnected = C + W`:
-`exact = C/R`, `benign = (A−C)/R`, `wrong = (W−(A−C))/R`. The canonical
-table generator is `scripts/results_table.py`.
+Per-bridge wrong% / traces-affected%, by non-checkpoint loss rate:
 
-## Honest caveats
+```
+            5%        25%        50%        75%        95%       100%
+cpd3   0.0070/0.07  0.0197/0.58  0.0285/1.16  0.0239/1.20  0.0068/0.45  0/0
+cpd6   0.1633/0.84  0.2560/3.32  0.3429/5.91  0.3228/6.12  0.1090/2.58  0/0
+```
 
-1. **MAP is conditional on the model** (independent drops, independent
-   bloom FPs — the standard idealization).
-2. **Ties** between equal-posterior optima break deterministically by
-   enumeration order; tie frequency is measurable if needed.
-3. **Same-span alter-ego writes double-count gain** (both items score
-   their shared bit). Affects only tie regions; feasibility and
-   invariants are unaffected.
-4. **False-positive absorption**: with ≈10⁵ open ends tested against
-   many windows at ε = 10⁻⁴, a handful of ends are absorbed into a
-   *wrong* chain via an FP gate (measured: 3 of 121,643 ends at cpd6
-   r0.5, i.e. 0.0025% — the magnitude the model predicts). These are
-   detectable in principle (two windows claiming overlapping material)
-   and surface as benign-shallow attachments of their true descendants,
-   never as silent loss.
+Per-bridge error peaks at 50% loss; traces-affected peaks at 75% loss
+(bridges-per-trace keeps growing after the per-bridge rate turns down).
+Open-end coverage 100.0000% and span loss 0.000% in all cells; 6.2M
+orphans placed at the heaviest cell.
+
+## Known residue and future work
+
+1. **ε-floor end thefts**: an open end absorbed into a wrong chain by a
+   bloom false positive; its true descendants then anchor shallow
+   (parts-per-million, individually logged, repeat victims across drop
+   rates confirm deterministic bloom collisions). Open question: the
+   stolen end should also hold its true seat via rule-C multi-write —
+   which guard blocks it is undiagnosed (CANDCHECK forensics queued).
+2. **Work-unit cap**: the 10M cap counts recursions, not work; clusters
+   with very fat option lists take minutes to reach it. A budget in
+   option-checks (~5·10⁸) would bound wall time uniformly. Designed,
+   not yet applied.
+3. **Full certification of capped cores**: Régin-style dynamic matching
+   feasibility filtering is the principled route (static matching
+   bounds buy nothing — the cores admit perfect matchings; the
+   explosion is near-tie certification). Any reintroduced quotient
+   technique (dedup/symmetry) must be keyed to a round-frozen ledger
+   snapshot, or seed re-solves with the previous assignment, to
+   preserve idempotence.
+4. **Standalone structural verifier** (`cmd/recon_verify`, certifying-
+   algorithm pattern): re-derive tree-ness, span conservation, and
+   per-bridge evidence (prefix bytes, bloom bits) from raw payloads,
+   independent of the engine. Design agreed; artifact-vs-in-memory
+   interface open.
 
 ## Diagnostics (`TRACE_RECON_DEBUG=1`)
 
 | line | meaning |
 |---|---|
-| `SOLVE t=… orph= ends= items= any=` | per-round demand/seating census |
-| `SEARCHSKIP t=… kind depth opts cluster id parent` | item left unseated by a cluster optimum |
-| `SKIPOPT hard:…` / `contention:…` | per-option autopsy: illegal on the base ledger (and why) vs lost to a named in-cluster competitor |
-| `ITEMZERO t=… n=` | demand orphans with empty domains (theorem violation alarm) |
-| `UNPLACED t=… class depth opts bblocked` | census-time unplaced classification (`ZEROOPT`/`BBLOCK`/`OTHER`) |
+| `PROGRESS traces=…` | cumulative metrics every 10k traces (always on) |
+| `SOLVE t=…` | per-round demand/seating census |
+| `ROUNDCAP t=…` | round loop exited by exhaustion, not convergence |
+| `SEARCHSKIP …` + `SKIPOPT …` | item left unseated by a cluster optimum, with per-option autopsy |
+| `ITEMZERO t=…` | demand orphan with empty domain (theorem-violation alarm) |
+| `UNPLACED t=… class` | census-time unplaced classification |
 | `DRYEND …` | census-time unmatched-end forensics |
-| `CLUSTER solve/skip/nodes` | cluster sizes, guard hits, budget use, `found=` |
-| `BENIGNSKIP C= depth open= anchor=` | scorer-side: each surviving ancestor bypassed by a benign bridge, open-end-or-interior |
-| `ENDMATCH t=… id level prov window-anchor …` | targeted (`TRACE_RECON_DEBUG_ENDS=hexid,…`): where a specific end's coverage landed |
+| `CLUSTER solve/nodes/capped` | cluster sizes, node counts, budget hits |
+| `CLUSTERDUMP t=…` | anatomy of any cluster crossing the cap |
+| `THREADTIE t=…` | forced posterior ties (disclosure counter) |
+| `BENIGNSKIP C=…` | scorer-side: surviving ancestor bypassed by a shallow bridge |
+| `CANDCHECK t=…` / `ENDMATCH t=…` | targeted probes via `TRACE_RECON_DEBUG_ENDS=hexids` |
 
-The accounting discipline these enforce: *silence is a bug*. Every
-unplaced orphan, unmatched end, skipped item, and guard hit is named
-and classified; a residual that doesn't appear in a diagnostic class is
+The accounting discipline: *silence is a bug* — every unplaced orphan,
+unmatched end, skipped item, capped cluster, and forced tie is named,
+classified, and counted; a residual outside every diagnostic class is
 itself the finding.

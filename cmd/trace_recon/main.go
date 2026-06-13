@@ -50,6 +50,7 @@ type config struct {
 	stopOnGap          bool   // PCRB: stop threading at first zero-candidate level
 	tiePolicy          string // PCRS: thread-item tie resolution (aware|id|stop)
 	workers            int    // reconstruction worker goroutines (0 = NumCPU)
+	scoreAudit         bool   // fault-injection sensitivity audit of the scorer
 }
 
 func parseFlags() config {
@@ -74,6 +75,7 @@ func parseFlags() config {
 	gapPolicy := ""
 	flag.StringVar(&gapPolicy, "gap-policy", "continue", "PCRB threading at a zero-candidate level: continue (default) or stop (maximally FP-averse)")
 	flag.StringVar(&c.tiePolicy, "tie-policy", "aware", "PCRS threading tie resolution: aware (global bit-accounting, default), id (span-ID coin), or stop (abstain)")
+	flag.BoolVar(&c.scoreAudit, "score-audit", false, "Fault-injection sensitivity audit: per trace, inject known scoring errors into a copy of the reconstruction and require ScorePCR to detect each with the exact predicted counter delta (report on stderr)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <input_dir>\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "       %s --corpus <corpus_dir> [flags]\n", os.Args[0])
@@ -176,6 +178,10 @@ type harness struct {
 		start                                           time.Time
 		spans, c, a, w, oe, oem, lost, placed, affected int
 	}
+
+	// audit: fault-injection sensitivity accumulator (guarded by mu;
+	// nil unless --score-audit).
+	audit *auditStats
 }
 
 type finishJob struct {
@@ -256,6 +262,9 @@ func newHarness(c config) *harness {
 		jobs:       make(chan finishJob, workers*2),
 	}
 	ha.prog.start = time.Now()
+	if c.scoreAudit {
+		ha.audit = newAuditStats()
+	}
 	for i := 0; i < workers; i++ {
 		ha.wg.Add(1)
 		go func() {
@@ -272,6 +281,9 @@ func newHarness(c config) *harness {
 func (ha *harness) drain() {
 	close(ha.jobs)
 	ha.wg.Wait()
+	if ha.audit != nil {
+		ha.audit.report()
+	}
 }
 
 func (ha *harness) beginTrace(tid uint64, spanCount int) {
@@ -400,6 +412,12 @@ func (ha *harness) process(j finishJob) {
 		res := recon.ReconstructPCRS(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
 		ha.classifyWrong(tid, res, truth, dropped)
+		if ha.audit != nil {
+			st := auditScores(res, truth, dropped, int64(tid))
+			ha.mu.Lock()
+			ha.audit.add(st)
+			ha.mu.Unlock()
+		}
 	} else {
 		res := recon.ReconstructPB(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))

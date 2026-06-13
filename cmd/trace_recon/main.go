@@ -30,6 +30,7 @@ import (
 	"bridges/corpus"
 	"bridges/loader"
 	"bridges/recon"
+	"bridges/verify"
 )
 
 type config struct {
@@ -51,6 +52,8 @@ type config struct {
 	tiePolicy          string // PCRS: thread-item tie resolution (aware|id|stop)
 	workers            int    // reconstruction worker goroutines (0 = NumCPU)
 	scoreAudit         bool   // fault-injection sensitivity audit of the scorer
+	dumpRecon          string // serialize per-trace reconstruction artifacts (JSONL.gz) for recon_verify
+	verifyInline       bool   // run the independent checker in-process after every reconstruction
 }
 
 func parseFlags() config {
@@ -76,6 +79,8 @@ func parseFlags() config {
 	flag.StringVar(&gapPolicy, "gap-policy", "continue", "PCRB threading at a zero-candidate level: continue (default) or stop (maximally FP-averse)")
 	flag.StringVar(&c.tiePolicy, "tie-policy", "aware", "PCRS threading tie resolution: aware (global bit-accounting, default), id (span-ID coin), or stop (abstain)")
 	flag.BoolVar(&c.scoreAudit, "score-audit", false, "Fault-injection sensitivity audit: per trace, inject known scoring errors into a copy of the reconstruction and require ScorePCR to detect each with the exact predicted counter delta (report on stderr)")
+	flag.StringVar(&c.dumpRecon, "dump-recon", "", "Write per-trace reconstruction artifacts (JSONL.gz) for standalone auditing by recon_verify")
+	flag.BoolVar(&c.verifyInline, "verify", false, "Run the independent structural/evidence checker (package verify) in-process after every reconstruction; violations reported at exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <input_dir>\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "       %s --corpus <corpus_dir> [flags]\n", os.Args[0])
@@ -182,6 +187,13 @@ type harness struct {
 	// audit: fault-injection sensitivity accumulator (guarded by mu;
 	// nil unless --score-audit).
 	audit *auditStats
+
+	// dumper/verify: artifact emission and in-process checking (package
+	// verify); violations guarded by mu.
+	dumper     *reconDumper
+	verifyOn   bool
+	verifyCfg  verify.Config
+	violations int
 }
 
 type finishJob struct {
@@ -265,6 +277,18 @@ func newHarness(c config) *harness {
 	if c.scoreAudit {
 		ha.audit = newAuditStats()
 	}
+	if c.dumpRecon != "" {
+		d, err := newReconDumper(c.dumpRecon)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		ha.dumper = d
+	}
+	if c.verifyInline {
+		ha.verifyOn = true
+		ha.verifyCfg = verify.Config{PrefixLen: cfg.PrefixLen, BloomM: cfg.BloomM, BloomK: cfg.BloomK, PCRBTypeByte: byte(bridge.PCRBBridgeTypeID), CPD: cfg.CPD}
+	}
 	for i := 0; i < workers; i++ {
 		ha.wg.Add(1)
 		go func() {
@@ -283,6 +307,15 @@ func (ha *harness) drain() {
 	ha.wg.Wait()
 	if ha.audit != nil {
 		ha.audit.report()
+	}
+	if ha.dumper != nil {
+		ha.dumper.close()
+	}
+	if ha.verifyOn {
+		fmt.Fprintf(os.Stderr, "VERIFY violations=%d\n", ha.violations)
+	}
+	if ha.mode == "pcrs" && os.Getenv("TRACE_RECON_DEBUG") == "1" {
+		recon.DumpPCRSAmbiguity()
 	}
 }
 
@@ -417,6 +450,30 @@ func (ha *harness) process(j finishJob) {
 			ha.mu.Lock()
 			ha.audit.add(st)
 			ha.mu.Unlock()
+		}
+		if ha.dumper != nil || ha.verifyOn {
+			brOf := make(map[uint64][]byte)
+			for _, s := range spans {
+				if s.br != nil {
+					if _, gone := dropped[s.spanID]; !gone {
+						brOf[s.spanID] = s.br
+					}
+				}
+			}
+			if ha.dumper != nil {
+				ha.dumper.emit(buildArtifact(tid, survivors, brOf, res))
+			}
+			if ha.verifyOn {
+				vs := verify.Check(toVerifyTrace(tid, survivors, brOf, res), ha.verifyCfg)
+				if len(vs) > 0 {
+					ha.mu.Lock()
+					ha.violations += len(vs)
+					ha.mu.Unlock()
+					for _, v := range vs {
+						fmt.Fprintln(os.Stderr, v)
+					}
+				}
+			}
 		}
 	} else {
 		res := recon.ReconstructPB(survivors, ha.cfg)

@@ -5,10 +5,51 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"bridges/bloom"
 	"bridges/bridge"
 )
+
+// Ambiguity instrumentation (TRACE_RECON_DEBUG=1): process-global tallies
+// of the actual reconstruction decision points, to measure the real
+// error-source rate per cpd rather than infer it from static structure.
+//   - thread decisions = interior window levels with >=1 bloom-positive
+//     candidate; AMBIGUOUS = those with >=2 (same-depth multiplicity the
+//     threading walk must resolve, the genuine threading-error source).
+//   - orphan placements = demand orphans; MULTI-WINDOW = those gated in
+//     >1 window (the genuine placement-error source).
+//
+// Counted once per trace at candidate-fill / pre-solve, so rounds never
+// double-count. DumpPCRSAmbiguity prints rates at drain.
+var (
+	ambigThreadLevels int64
+	ambigThreadCands  int64
+	ambigThreadGe2    int64
+	ambigOrphans      int64
+	ambigOrphanMultiW int64
+)
+
+// DumpPCRSAmbiguity writes the accumulated ambiguity rates and resets.
+func DumpPCRSAmbiguity() {
+	lv := atomic.LoadInt64(&ambigThreadLevels)
+	ge2 := atomic.LoadInt64(&ambigThreadGe2)
+	cs := atomic.LoadInt64(&ambigThreadCands)
+	orph := atomic.LoadInt64(&ambigOrphans)
+	mw := atomic.LoadInt64(&ambigOrphanMultiW)
+	pct := func(a, b int64) float64 {
+		if b == 0 {
+			return 0
+		}
+		return 100 * float64(a) / float64(b)
+	}
+	mean := 0.0
+	if lv > 0 {
+		mean = float64(cs) / float64(lv)
+	}
+	fmt.Fprintf(os.Stderr, "AMBIG thread_levels=%d ambiguous_ge2=%d (%.4f%%) mean_cands=%.4f | orphans=%d multi_window=%d (%.4f%%)\n",
+		lv, ge2, pct(ge2, lv), mean, orph, mw, pct(mw, orph))
+}
 
 // ReconstructPCRS is the v8 "pure solver" engine for PCRB payloads: the same
 // wire format and pass-1 prefix anchoring as ReconstructPCRB, but resolution
@@ -176,6 +217,20 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 					continue
 				}
 				dfs(r)
+			}
+			if debugScore {
+				// one-shot threading-ambiguity tally: bloom-positive
+				// candidate multiplicity per interior window level
+				for d := p.anchor.Depth + 1; d <= maxD; d++ {
+					n := int64(len(fs.cand[d]))
+					if n >= 1 {
+						atomic.AddInt64(&ambigThreadLevels, 1)
+						atomic.AddInt64(&ambigThreadCands, n)
+						if n >= 2 {
+							atomic.AddInt64(&ambigThreadGe2, 1)
+						}
+					}
+				}
 			}
 		}
 		states = append(states, fs)
@@ -1431,6 +1486,29 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		return any
 	}
 
+	if debugScore {
+		// one-shot orphan placement-ambiguity tally: viable windows per
+		// unplaced orphan (gated in >1 window = placement the search must
+		// disambiguate)
+		for _, r := range unplaced {
+			if placedSet[r.SpanID] {
+				continue
+			}
+			wins := 0
+			for _, fs := range states {
+				if pathOn(r, fs) != nil {
+					wins++
+				}
+			}
+			if wins >= 1 {
+				atomic.AddInt64(&ambigOrphans, 1)
+				if wins >= 2 {
+					atomic.AddInt64(&ambigOrphanMultiW, 1)
+				}
+			}
+		}
+	}
+
 	// Plain fixpoint loop (v8h2 semantics): the deterministic search is
 	// idempotent per ledger state, so capped re-solves reproduce their
 	// previous assignment once demands stop changing — applies become
@@ -1533,11 +1611,19 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				break
 			}
 		}
+		// Evidence pointer for the independent verifier: the placement
+		// window's payload owner (its inherited carrier, else the
+		// window-defining root itself).
+		via := primary.fs.p.viaCarrier
+		if via == 0 {
+			via = primary.fs.p.o.SpanID
+		}
 		res.Bridges = append(res.Bridges, Bridge{
-			OrphanID:  r.SpanID,
-			AnchorID:  top.SpanID,
-			Synthetic: r.Depth - top.Depth - 1,
-			Forced:    forcedRoots[r.SpanID],
+			OrphanID:   r.SpanID,
+			AnchorID:   top.SpanID,
+			Synthetic:  r.Depth - top.Depth - 1,
+			Forced:     forcedRoots[r.SpanID],
+			ViaCarrier: via,
 		})
 		res.Reconnected++
 	}

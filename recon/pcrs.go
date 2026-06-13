@@ -2,6 +2,7 @@ package recon
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -1037,7 +1038,92 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			d  int
 		}
 		solveCluster := func(cl []sItem) []int {
-			sort.Slice(cl, func(i, j int) bool { return len(cl[i].opts) < len(cl[j].opts) })
+			// Symmetry breaking pays off only on large clusters (where the
+			// interchangeable plateaus live); small clusters skip the
+			// signature/sort overhead entirely.
+			symOn := len(cl) >= 32
+			// Canonically order each item's options by an IMMUTABLE key
+			// (window index, reservation depth, path depths) so "option i"
+			// denotes the same target across every member of a symmetry
+			// group.
+			for ci := range cl {
+				ops := cl[ci].opts
+				sort.Slice(ops, func(a, b int) bool {
+					if fsIdx[ops[a].fs] != fsIdx[ops[b].fs] {
+						return fsIdx[ops[a].fs] < fsIdx[ops[b].fs]
+					}
+					if ops[a].rsvD != ops[b].rsvD {
+						return ops[a].rsvD < ops[b].rsvD
+					}
+					sa, sb := ops[a].spans, ops[b].spans
+					for k := 0; k < len(sa) && k < len(sb); k++ {
+						if sa[k].Depth != sb[k].Depth {
+							return sa[k].Depth < sb[k].Depth
+						}
+					}
+					return len(sa) < len(sb)
+				})
+			}
+			// IMMUTABLE OPTION DEDUP: a single item gated in many windows
+			// (measured: one orphan with 1,076 options at cluster contention
+			// ~1.1) is the dominant monster cost — a huge feasible, score-
+			// flat branch neither the bound nor conflict-pruning can cut.
+			// Two of its options are interchangeable in EVERY completion when
+			// they have equal gain and touch only levels that (a) no other
+			// item's options contend (structural) and (b) are currently open
+			// (cost 0): placing the item in either scores identically and
+			// affects no one else. Keep one canonical representative per gain
+			// among such "free" options. Deterministic in (structural
+			// contention, ledger), so an unchanged-ledger re-solve reproduces
+			// it — idempotent, like the symmetry fix. Contested or costed
+			// options are all kept.
+			{
+				touch := make(map[lk]int)
+				for ci := range cl {
+					seen := make(map[lk]bool)
+					mark := func(k lk) {
+						if !seen[k] {
+							seen[k] = true
+							touch[k]++
+						}
+					}
+					for _, o := range cl[ci].opts {
+						for _, s := range o.spans {
+							mark(lk{o.fs, s.Depth})
+						}
+						if o.rsvD >= 0 {
+							mark(lk{o.fs, o.rsvD})
+						}
+					}
+				}
+				for ci := range cl {
+					ops := cl[ci].opts
+					out := ops[:0]
+					keptGain := make(map[int]bool)
+					for _, o := range ops {
+						free := true
+						for _, s := range o.spans {
+							if touch[lk{o.fs, s.Depth}] != 1 || !open(o.fs, s.Depth) {
+								free = false
+								break
+							}
+						}
+						if free && o.rsvD >= 0 {
+							if touch[lk{o.fs, o.rsvD}] != 1 || !open(o.fs, o.rsvD) {
+								free = false
+							}
+						}
+						if free {
+							if keptGain[o.gain] {
+								continue // interchangeable with a kept option
+							}
+							keptGain[o.gain] = true
+						}
+						out = append(out, o)
+					}
+					cl[ci].opts = out
+				}
+			}
 			for ci := range cl {
 				if cl[ci].thread {
 					continue // likelihood-only: no coverage band
@@ -1046,12 +1132,148 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 					cl[ci].opts[oj].gain += 1000000 // lexicographic coverage bonus
 				}
 			}
+			// IMMUTABLE SYMMETRY BREAKING: items with an identical option
+			// signature are interchangeable — placing either in a given
+			// window is score- AND cost-neutral (same targets, depths,
+			// gains; displacement cost depends only on the levels, not which
+			// item lands there). The search need explore one canonical
+			// (non-decreasing option-index) representative per group,
+			// collapsing the k! tie plateaus that make monster clusters cap.
+			// The signature is built ONLY from structural data (window
+			// indices, depths, gains) and span ID — never the ledger — so a
+			// re-solve picks the SAME representative regardless of changes
+			// elsewhere, preserving the round-loop idempotence that an
+			// earlier ledger-keyed attempt destroyed.
+			grp := make([]bool, len(cl)) // grp[i]: same symmetry group as cl[i-1]
+			if symOn {
+				sig := make([]string, len(cl))
+				for ci := range cl {
+					it := cl[ci]
+					if it.reseat || it.thread {
+						sig[ci] = fmt.Sprintf("!%x", it.span.SpanID) // never groups
+						continue
+					}
+					var b strings.Builder
+					if it.isOrphan {
+						b.WriteByte('O')
+					} else {
+						b.WriteByte('E')
+					}
+					for _, o := range it.opts {
+						fmt.Fprintf(&b, "|%d,%d,%d", fsIdx[o.fs], o.rsvD, o.gain)
+						for _, s := range o.spans {
+							fmt.Fprintf(&b, ".%d", s.Depth)
+						}
+					}
+					sig[ci] = b.String()
+				}
+				idx := make([]int, len(cl))
+				for i := range idx {
+					idx[i] = i
+				}
+				sort.Slice(idx, func(a, b int) bool {
+					ia, ib := idx[a], idx[b]
+					if len(cl[ia].opts) != len(cl[ib].opts) {
+						return len(cl[ia].opts) < len(cl[ib].opts)
+					}
+					if sig[ia] != sig[ib] {
+						return sig[ia] < sig[ib]
+					}
+					return cl[ia].span.SpanID < cl[ib].span.SpanID
+				})
+				scl := make([]sItem, len(cl))
+				ssig := make([]string, len(cl))
+				for a, i := range idx {
+					scl[a] = cl[i]
+					ssig[a] = sig[i]
+				}
+				copy(cl, scl)
+				for i := 1; i < len(cl); i++ {
+					grp[i] = ssig[i] == ssig[i-1] && ssig[i][0] != '!'
+				}
+			}
 			// Branch-and-bound: maximize gain - displacement cost. Hard:
 			// walls, rsv, B-writes; soft: A/C/D occupants (cost 1 each,
 			// once per level).
-			usedOcc := make(map[lk]*Span)
-			usedRsv := make(map[lk]bool)
-			softHit := make(map[lk]bool)
+			//
+			// ARRAY-IFIED HOT PATH: the feasibility check ran on map[lk]
+			// lookups (struct-key hashing) with per-node slice allocation,
+			// which dominated wall time (map/alloc-bound, ~200k checks/sec).
+			// Compile each distinct (fs,depth) the cluster touches to a
+			// dense int id, precompute the READ-ONLY ledger facts per level
+			// (constant during the solve), and run the search on flat arrays
+			// with an alloc-free undo trail. Pure data-structure change,
+			// identical semantics.
+			levelID := make(map[lk]int)
+			idOf := func(fs *fragState, d int) int {
+				k := lk{fs, d}
+				id, ok := levelID[k]
+				if !ok {
+					id = len(levelID)
+					levelID[k] = id
+				}
+				return id
+			}
+			type optLv struct {
+				spanIDs  []int32
+				spanPtrs []*Span
+				rsvID    int32
+			}
+			optLvls := make([][]optLv, len(cl))
+			for i := range cl {
+				optLvls[i] = make([]optLv, len(cl[i].opts))
+				for oi := range cl[i].opts {
+					o := cl[i].opts[oi]
+					ol := optLv{rsvID: -1}
+					for _, s := range o.spans {
+						ol.spanIDs = append(ol.spanIDs, int32(idOf(o.fs, s.Depth)))
+						ol.spanPtrs = append(ol.spanPtrs, s)
+					}
+					if o.rsvD >= 0 {
+						ol.rsvID = int32(idOf(o.fs, o.rsvD))
+					}
+					optLvls[i][oi] = ol
+				}
+			}
+			nL := len(levelID)
+			// per-level read-only ledger facts
+			occSpanArr := make([]*Span, nL) // ledger occupant (for x != s test)
+			occBlock := make([]bool, nL)    // hard 'B'/non-reseatable => infeasible
+			occSoftCost := make([]int, nL)  // displaceable soft occupant cost (0 = none)
+			rsvBlock := make([]bool, nL)    // reservation wall (non-itemized)
+			for k, id := range levelID {
+				fs, d := k.fs, k.d
+				if led[fs].rsv[d] {
+					owner := rsvOwner[fs][d]
+					if owner == nil || !reseatRoots[owner.SpanID] {
+						rsvBlock[id] = true
+					}
+				}
+				if x := led[fs].occ[d]; x != nil {
+					occSpanArr[id] = x
+					if prov[fs][d] == 'B' {
+						rid := placedRootOf[x.SpanID]
+						if rid == 0 || !reseatRoots[rid] {
+							occBlock[id] = true
+						}
+						// else itemized-B: vacates on apply, passable, no cost
+					} else {
+						p := prov[fs][d]
+						if (p == 'C' || p == 'D') && isOpenEnd(x) && appearances(x) <= 1 {
+							occSoftCost[id] = 1000000
+						} else {
+							occSoftCost[id] = 1
+						}
+					}
+				}
+			}
+			// search-local mutable state (flat; bt undoes every set via the
+			// trail, so these stay zero between top-level calls)
+			usedOccA := make([]*Span, nL)
+			usedRsvA := make([]bool, nL)
+			softHitA := make([]bool, nL)
+			occTrail := make([]int32, 0, 256)
+			softTrail := make([]int32, 0, 256)
 			// -inf sentinel: the optimum must ALWAYS be returned, even when
 			// it carries multiple skip penalties — a nil bestAssign silently
 			// freezes every item in the cluster.
@@ -1070,6 +1292,19 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			// certification path (Régin-style matching filter) documented
 			// as future work.
 			nodes := 0
+			// DISCLOSED WORK CAP: budget is counted in innermost feasibility
+			// checks (span-level lookups), not recursion nodes — because the
+			// two monster profiles have different per-node cost (fat option
+			// lists vs heavy per-node feasibility), and span-checks track
+			// actual wall-time work across both while staying deterministic
+			// (a wall-clock cap would make results machine-dependent). A
+			// cluster exceeding the budget ships its best-found COMPLETE
+			// seating (first descent finishes far under budget), is counted
+			// (capped) and anatomized (CLUSTERDUMP). Invariant-safe: the
+			// round loop recovers any skips in a capped seating.
+			const workBudget = 1000000000
+			work := 0
+			capDumped := false
 			// Simple admissible bound: sum of each remaining item's best
 			// gain. (The mutual-exclusion/pigeonhole bound and the search-
 			// space quotient techniques — dedup, symmetry — are documented
@@ -1086,6 +1321,17 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				}
 				optimistic[i] = optimistic[i+1] + mx
 			}
+			// NOTE: a static matching/pigeonhole bound was tried here to
+			// tighten the forced-skip gap on high-contention cores, with two
+			// representative choices (reservation slot, most-contended path
+			// level). Both were admissible but ineffective: the contention
+			// is set-packing (an option needs its WHOLE level-set free), and
+			// a one-representative-per-item relaxation is always satisfiable
+			// (each item finds a private rep) so it never detects the forced
+			// skips. The genuine fix is dynamic flow-feasibility filtering
+			// (Regin alldifferent) over the real multi-level structure,
+			// incremental during search — documented as future work. For now
+			// these cores are bounded by the disclosed WORK cap below.
 			// One-shot anatomy dump for clusters that hit the cap.
 			dumpComp := func() {
 				no, nr, ne, nt := 0, 0, 0, 0
@@ -1129,17 +1375,45 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				if len(claims) > 0 {
 					avgC = float64(sumC) / float64(len(claims))
 				}
-				fmt.Fprintf(os.Stderr, "CLUSTERDUMP t=%x items=%d(o=%d r=%d e=%d t=%d) opts=%d/%d/%d levels=%d claims=%d/%.1f\n",
-					dbgTag, len(cl), no, nr, ne, nt, minO, sumO/len(cl), maxO, len(claims), maxC, avgC)
+				// COMPLEXITY ATTRIBUTION: how much of the search tree is
+				// (a) symmetric redundancy — interchangeable-item groups,
+				//     symBits = log2 of total permutation count (if this
+				//     approaches log2(nodes)~23 at the 10M cap, symmetry is
+				//     the cost); and (b) loose bound — boundGap = root
+				//     optimistic minus best-found-so-far (large => the
+				//     pruning bound rarely fires => genuine matching-core /
+				//     near-tie-plateau combinatorics, the Regin-bound target).
+				symBits, nGroups, maxGrp := 0.0, 0, 1
+				run := 1
+				for i := 1; i <= len(cl); i++ {
+					if i < len(cl) && grp[i] {
+						run++
+						continue
+					}
+					if run >= 2 {
+						nGroups++
+						if run > maxGrp {
+							maxGrp = run
+						}
+						for j := 2; j <= run; j++ {
+							symBits += math.Log2(float64(j))
+						}
+					}
+					run = 1
+				}
+				boundGap := optimistic[0] - bestScore
+				fmt.Fprintf(os.Stderr, "CLUSTERDUMP t=%x items=%d(o=%d r=%d e=%d t=%d) opts=%d/%d/%d levels=%d claims=%d/%.1f symGroups=%d maxGrp=%d symBits=%.0f boundGap=%d bestScore=%d\n",
+					dbgTag, len(cl), no, nr, ne, nt, minO, sumO/len(cl), maxO, len(claims), maxC, avgC, nGroups, maxGrp, symBits, boundGap, bestScore)
 			}
 			var bt func(i, score int)
 			bt = func(i, score int) {
 				nodes++
-				if nodes == 10000000 && debugScore {
-					dumpComp()
-				}
-				if nodes > 10000000 {
-					return // disclosed cap: keep best-found
+				if work > workBudget {
+					if debugScore && !capDumped {
+						capDumped = true
+						dumpComp()
+					}
+					return // disclosed work cap: keep best-found
 				}
 				if score+optimistic[i] <= bestScore {
 					return
@@ -1152,105 +1426,105 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 					return
 				}
 				it := cl[i]
-				for oi := 0; oi < len(it.opts); oi++ {
+				startOi := 0
+				if grp[i] {
+					// canonical (non-decreasing) option index within a
+					// symmetry group; a skipped predecessor forces skip
+					if cur[i-1] == -1 {
+						startOi = len(it.opts)
+					} else {
+						startOi = cur[i-1]
+					}
+				}
+				ol := optLvls[i]
+				for oi := startOi; oi < len(it.opts); oi++ {
 					opt := it.opts[oi]
+					o := ol[oi]
 					ok := true
 					cost := 0
-					var setOcc, newSoft []lk
-					var rsvKey *lk
-					for _, s := range opt.spans {
-						k := lk{opt.fs, s.Depth}
+					occMark := len(occTrail)
+					softMark := len(softTrail)
+					rsvSet := int32(-1)
+					for si := range o.spanIDs {
+						work++ // innermost feasibility check = unit of work
+						L := o.spanIDs[si]
+						s := o.spanPtrs[si]
 						// Same span at the same level is the SAME assignment
 						// (orphan/end alter-egos of one span), never a conflict.
-						if w := usedOcc[k]; (w != nil && w != s) || usedRsv[k] {
+						if uw := usedOccA[L]; (uw != nil && uw != s) || usedRsvA[L] {
 							ok = false
 							break
 						}
-						if led[opt.fs].rsv[s.Depth] {
-							owner := rsvOwner[opt.fs][s.Depth]
-							if owner == nil || !reseatRoots[owner.SpanID] {
-								ok = false // wall, or non-itemized reservation
+						if rsvBlock[L] { // wall, or non-itemized reservation
+							ok = false
+							break
+						}
+						if x := occSpanArr[L]; x != nil && x != s {
+							if occBlock[L] {
+								ok = false
 								break
 							}
-							// itemized owner: level vacates on apply
-						}
-						if x := led[opt.fs].occ[s.Depth]; x != nil && x != s {
-							if prov[opt.fs][s.Depth] == 'B' {
-								rid := placedRootOf[x.SpanID]
-								if rid == 0 || !reseatRoots[rid] {
-									ok = false
-									break
-								}
-								// itemized: vacates on apply, no cost
-							} else if !softHit[k] {
-								// Lexicographic displacement: stealing an
-								// end's SOLE coverage write costs at the
-								// coverage band — likelihood gains can never
-								// out-bid an invariant, so churn cannot
-								// strand an open end.
-								p := prov[opt.fs][s.Depth]
-								if (p == 'C' || p == 'D') && isOpenEnd(x) && appearances(x) <= 1 {
-									cost += 1000000
-								} else {
-									cost++
-								}
-								newSoft = append(newSoft, k)
+							// Lexicographic displacement: stealing an end's
+							// SOLE coverage write costs at the coverage band
+							// (occSoftCost precomputed 1e6 vs 1) — likelihood
+							// gains can never out-bid an invariant.
+							if occSoftCost[L] > 0 && !softHitA[L] {
+								cost += occSoftCost[L]
+								softHitA[L] = true
+								softTrail = append(softTrail, L)
 							}
 						}
-						if usedOcc[k] == nil {
-							usedOcc[k] = s
-							setOcc = append(setOcc, k)
+						if usedOccA[L] == nil {
+							usedOccA[L] = s
+							occTrail = append(occTrail, L)
 						}
 					}
-					if ok && opt.rsvD >= 0 {
-						k := lk{opt.fs, opt.rsvD}
-						if usedOcc[k] != nil {
+					if ok && o.rsvID >= 0 {
+						R := o.rsvID
+						if usedOccA[R] != nil {
 							ok = false
 						} else {
-							if x := led[opt.fs].occ[opt.rsvD]; x != nil {
-								if prov[opt.fs][opt.rsvD] == 'B' {
-									rid := placedRootOf[x.SpanID]
-									if rid == 0 || !reseatRoots[rid] {
-										ok = false
-									}
-								} else if !softHit[k] {
-									p := prov[opt.fs][opt.rsvD]
-									if (p == 'C' || p == 'D') && isOpenEnd(x) && appearances(x) <= 1 {
-										cost += 1000000
-									} else {
-										cost++
-									}
-									newSoft = append(newSoft, k)
+							if x := occSpanArr[R]; x != nil {
+								if occBlock[R] {
+									ok = false
+								} else if occSoftCost[R] > 0 && !softHitA[R] {
+									cost += occSoftCost[R]
+									softHitA[R] = true
+									softTrail = append(softTrail, R)
 								}
 							}
 							if ok {
-								rsvKey = &k
+								rsvSet = R
 							}
 						}
 					}
 					if !ok {
-						for _, k := range setOcc {
-							delete(usedOcc, k)
+						for j := len(softTrail) - 1; j >= softMark; j-- {
+							softHitA[softTrail[j]] = false
 						}
+						softTrail = softTrail[:softMark]
+						for j := len(occTrail) - 1; j >= occMark; j-- {
+							usedOccA[occTrail[j]] = nil
+						}
+						occTrail = occTrail[:occMark]
 						continue
 					}
-					if rsvKey != nil {
-						usedRsv[*rsvKey] = true
-					}
-					for _, k := range newSoft {
-						softHit[k] = true
+					if rsvSet >= 0 {
+						usedRsvA[rsvSet] = true
 					}
 					cur[i] = oi
 					bt(i+1, score+opt.gain-cost)
-					for _, k := range setOcc {
-						delete(usedOcc, k)
+					if rsvSet >= 0 {
+						usedRsvA[rsvSet] = false
 					}
-					if rsvKey != nil {
-						delete(usedRsv, *rsvKey)
+					for j := len(softTrail) - 1; j >= softMark; j-- {
+						softHitA[softTrail[j]] = false
 					}
-					for _, k := range newSoft {
-						delete(softHit, k)
+					softTrail = softTrail[:softMark]
+					for j := len(occTrail) - 1; j >= occMark; j-- {
+						usedOccA[occTrail[j]] = nil
 					}
+					occTrail = occTrail[:occMark]
 				}
 				// Skip is explored last with a heavy penalty; reseated
 				// placements must keep a seat (placement invariant), so
@@ -1281,7 +1555,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				}
 			}
 			if debugScore {
-				fmt.Fprintf(os.Stderr, "CLUSTER nodes=%d capped=%t found=%t\n", nodes, nodes > 10000000, bestAssign != nil)
+				fmt.Fprintf(os.Stderr, "CLUSTER nodes=%d work=%d capped=%t found=%t\n", nodes, work, work > workBudget, bestAssign != nil)
 			}
 			return bestAssign
 		}

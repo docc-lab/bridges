@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -43,6 +44,8 @@ type config struct {
 	mode               string // "pb" or "pcr"
 	cgrp               bool   // pcrs + HA: run the PCRS solver on CGPRB (HA-bearing) payloads, with named dropped fan-outs as constraints
 	fullsatPB          bool   // pcrs: solve each cluster as a general declarative CP-SAT model (full-SAT parity baseline; no HA)
+	fullsatCGPB        bool   // pcrs + HA: full-SAT model with named-synthetic identities (CGP) injected into the cluster occupancy
+	timingPath         string // non-empty: write per-trace reconstruction timing CSV here
 	checkpointDistance int
 	dropRate           float64
 	seed               int64
@@ -75,6 +78,8 @@ func parseFlags() config {
 	flag.StringVar(&c.mode, "mode", "pb", "Bridge mode: pb (bloom membership), pcr (truncated checkpoint-root ID), or pcrb (checkpoint root + window bloom for in-window threading)")
 	flag.BoolVar(&c.cgrp, "cgrp", false, "PCRS+CGP: run the PCRS solver on CGPRB (HA-bearing) payloads, ingesting the hash array so named dropped fan-outs become constraints (carriers hard, bloom-confirmers soft). Requires --mode pcrs.")
 	flag.BoolVar(&c.fullsatPB, "fullsat-pb", false, "PCRS: solve each cluster as a general declarative CP-SAT model (docs/fullsat_shim.md) instead of the Go B&B — the full-SAT parity baseline (no HA). Requires --mode pcrs and the cpsat build tag.")
+	flag.StringVar(&c.timingPath, "timing", "", "Write a per-trace reconstruction-timing CSV here (tid,survivors,spans,dropped,recon_ns) and print a TIMING summary. (TRACE_RECON_TIMING=1 prints the summary without the CSV.)")
+	flag.BoolVar(&c.fullsatCGPB, "fullsat-cgpb", false, "PCRS + HA: the --fullsat-pb model plus named-synthetic identities from the hash array (CGP) injected into the cluster occupancy — hard fan-out coalescing + exclusivity. Requires --mode pcrs and the cpsat build tag.")
 	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
 	flag.StringVar(&c.onlyTraces, "only-traces", "", "Diagnostic: comma-separated hex trace IDs to reconstruct ONLY (corpus still streams and drop RNG still advances for all traces, so survivors are bit-identical to a full run). Lets you repro a single slow trace in seconds.")
 	flag.StringVar(&c.dumpSurvivors, "dump-survivors", "", "Gob-dump each reconstructed trace's decoded survivors+truth+dropped+cfg to this file. Pair with --only-traces to capture one trace from a single corpus walk, then replay it offline with cmd/recon_one (no corpus walk).")
@@ -114,8 +119,15 @@ func parseFlags() config {
 		fmt.Fprintf(os.Stderr, "error: --fullsat-pb requires --mode pcrs (got %q)\n", c.mode)
 		os.Exit(2)
 	}
-	if c.fullsatPB {
+	if c.fullsatCGPB && c.mode != "pcrs" {
+		fmt.Fprintf(os.Stderr, "error: --fullsat-cgpb requires --mode pcrs (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	if c.fullsatPB || c.fullsatCGPB {
 		recon.EnableFullsatPB(c.seed, 0) // fixed seed for machine-independent results
+	}
+	if c.fullsatCGPB {
+		recon.EnableFullsatCGPB() // inject named-synthetic identities into the cluster occupancy
 	}
 	switch gapPolicy {
 	case "continue":
@@ -207,6 +219,14 @@ type harness struct {
 	cpd      int
 	wrongLog *os.File // non-nil: wrong-edge classification dump
 
+	// Per-trace reconstruction timing (TRACE_RECON_TIMING=1, or --timing FILE
+	// for a per-trace CSV). Guarded by mu; recon_ns is measured around the
+	// ReconstructX call only (decode/score excluded). Buffered in memory and
+	// written/summarized at the end.
+	timingOn   bool
+	timingPath string
+	timingRecs []traceTiming
+
 	// Per-trace reconstruction is embarrassingly parallel (no cross-trace
 	// state in pb/pcr/pcrb/pcrs). Drop decisions are made SERIALLY at
 	// dispatch (preserving the global RNG sequence, hence bit-identical
@@ -297,7 +317,7 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		// --cgrp (pcrs only): emit the CGPRB payload so the PCRS solver gets
 		// the hash array. Same checkpoint-root + bloom geometry as PCRB, so it
 		// shares the PCRB config; the solver keys off cfg.CGRP.
-		if c.cgrp {
+		if c.cgrp || c.fullsatCGPB {
 			ch := bridge.NewCGPRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 			ch.Capture = true
 			pcrbCfg.CGRP = true
@@ -356,6 +376,8 @@ func newHarness(c config) *harness {
 		nextSeq:    make(map[uint64]map[uint64]int),
 		jobs:       make(chan finishJob, workers*2),
 	}
+	ha.timingPath = c.timingPath
+	ha.timingOn = c.timingPath != "" || os.Getenv("TRACE_RECON_TIMING") == "1"
 	ha.prog.start = time.Now()
 	if c.scoreAudit {
 		ha.audit = newAuditStats()
@@ -634,7 +656,9 @@ func (ha *harness) process(j finishJob) {
 		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
 		ha.classifyWrong(tid, res, truth, dropped)
 	} else if ha.mode == "pcrs" {
+		t0 := time.Now()
 		res := recon.ReconstructPCRS(survivors, ha.cfg)
+		ha.recRecon(tid, len(survivors), len(truth), len(dropped), time.Since(t0))
 		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
 		ha.classifyWrong(tid, res, truth, dropped)
 		if ha.topoOn {
@@ -671,15 +695,12 @@ func (ha *harness) process(j finishJob) {
 			}
 		}
 	} else if ha.mode == "cgprb" {
-		var t0 time.Time
-		if slowReconMS > 0 {
-			t0 = time.Now()
-		}
+		t0 := time.Now()
 		res := recon.ReconstructCGPRB(survivors, ha.cfg)
-		if slowReconMS > 0 {
-			if ms := time.Since(t0).Milliseconds(); ms >= slowReconMS {
-				fmt.Fprintf(os.Stderr, "SLOWRECON tid=%016x survivors=%d ms=%d\n", tid, len(survivors), ms)
-			}
+		d := time.Since(t0)
+		ha.recRecon(tid, len(survivors), len(truth), len(dropped), d)
+		if slowReconMS > 0 && d.Milliseconds() >= slowReconMS {
+			fmt.Fprintf(os.Stderr, "SLOWRECON tid=%016x survivors=%d ms=%d\n", tid, len(survivors), d.Milliseconds())
 		}
 		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
 		ha.classifyWrong(tid, res, truth, dropped)
@@ -690,6 +711,23 @@ func (ha *harness) process(j finishJob) {
 		res := recon.ReconstructPB(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))
 	}
+}
+
+// traceTiming is one trace's reconstruction wall-time and size, for --timing.
+type traceTiming struct {
+	tid                 uint64
+	nsurv, nspan, ndrop int
+	ns                  int64
+}
+
+// recRecon records one trace's reconstruction time (no-op unless timing is on).
+func (ha *harness) recRecon(tid uint64, nsurv, nspan, ndrop int, d time.Duration) {
+	if !ha.timingOn {
+		return
+	}
+	ha.mu.Lock()
+	ha.timingRecs = append(ha.timingRecs, traceTiming{tid, nsurv, nspan, ndrop, d.Nanoseconds()})
+	ha.mu.Unlock()
 }
 
 // addTopo accumulates one trace's call-graph-topology verdict (guarded by mu).
@@ -1039,7 +1077,49 @@ func main() {
 		fmt.Fprintf(os.Stderr, "orphans_placed=%d orphan_open_ends_pending=%d\n",
 			agg.OrphansPlaced, agg.OrphanOpenEnds)
 	}
+	if ha.timingOn && len(ha.timingRecs) > 0 {
+		reportTiming(ha, c.timingPath)
+	}
 	fmt.Fprintf(os.Stderr, "Wrote %d traces to %s\n", len(traceOrder), c.outputPath)
+}
+
+// reportTiming prints a per-trace reconstruction-time summary (percentiles in
+// microseconds) and, if path != "", writes the full per-trace CSV.
+func reportTiming(ha *harness, path string) {
+	recs := ha.timingRecs
+	ns := make([]int64, len(recs))
+	var total int64
+	for i, r := range recs {
+		ns[i] = r.ns
+		total += r.ns
+	}
+	sort.Slice(ns, func(i, j int) bool { return ns[i] < ns[j] })
+	us := func(v int64) float64 { return float64(v) / 1000 }
+	pctl := func(p float64) int64 {
+		if len(ns) == 0 {
+			return 0
+		}
+		i := int(p * float64(len(ns)-1))
+		return ns[i]
+	}
+	fmt.Fprintf(os.Stderr, "TIMING traces=%d recon_total=%s mean=%.1fus p50=%.1f p90=%.1f p99=%.1f max=%.1f (us)\n",
+		len(ns), time.Duration(total).Round(time.Millisecond),
+		us(total/int64(len(ns))), us(pctl(0.50)), us(pctl(0.90)), us(pctl(0.99)), us(ns[len(ns)-1]))
+	if path == "" {
+		return
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "timing: %v\n", err)
+		return
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+	fmt.Fprintln(w, "tid,survivors,spans,dropped,recon_ns")
+	for _, r := range recs {
+		fmt.Fprintf(w, "%016x,%d,%d,%d,%d\n", r.tid, r.nsurv, r.nspan, r.ndrop, r.ns)
+	}
 }
 
 func runFromJSON(c config, ha *harness) []uint64 {

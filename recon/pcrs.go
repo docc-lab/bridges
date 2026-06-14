@@ -314,47 +314,6 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		prov[fs][s.Depth] = kind
 		return true
 	}
-	// --- CGP: HA-named dropped fan-outs as hard, exclusive occupants ---
-	// With --cgrp the survivors carry a hash array witnessing dropped branch
-	// points. A span carrying an HA entry for parent N is a CERTAIN descendant
-	// of N, so N must occupy its depth on that fragment's chain — and nothing
-	// else may (named nodes are unique and never merge; only synthetics do).
-	// We realize this directly in the ledger: one canonical synthetic *Span per
-	// named id, written 'B' (immovable) at N's depth on every chain whose
-	// orphan descends from N. 'B' makes open() false there (exclusivity) and
-	// the B&B treat it as a hard block; the rest is the existing MAP solve.
-	named := make(map[uint64]*Span)
-	if cfg.CGRP {
-		namedAt := func(id uint64, depth int) *Span {
-			if n := named[id]; n != nil {
-				return n
-			}
-			n := &Span{SpanID: id, Depth: depth}
-			named[id] = n
-			return n
-		}
-		for _, fs := range states {
-			o, a := fs.p.o, fs.p.anchor
-			// Walk o's surviving subtree; any HA entry it carries names a true
-			// dropped ancestor of o (a carrier of N descends from N, and a
-			// descendant of o naming an ancestor strictly above o names an
-			// ancestor of o too). Restrict to the chain's interior (a, o).
-			stack := []*Span{o}
-			for len(stack) > 0 {
-				s := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-				for _, e := range s.HA {
-					dN := e.Depth - 1 // HAEntry.Depth is the child depth
-					if dN <= a.Depth || dN >= o.Depth {
-						continue
-					}
-					write(fs, namedAt(e.ParentID, dN), 'B')
-				}
-				stack = append(stack, children[s.SpanID]...)
-			}
-		}
-	}
-
 	chainsByW := make(map[uint64][]*fragState)
 	for _, fs := range states {
 		chainsByW[fs.p.anchor.SpanID] = append(chainsByW[fs.p.anchor.SpanID], fs)
@@ -1096,6 +1055,90 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				}
 			}
 		}
+		// --fullsat-cgpb: also couple items that share a named dropped parent
+		// (siblings under one fan-out). A shared join node can only form if its
+		// children are solved in the same cluster, so union them by ParentID.
+		if fullsatNaming {
+			parentItem := make(map[uint64]int)
+			for i, it := range items {
+				if !it.isOrphan || it.span == nil || it.span.ParentID == 0 {
+					continue
+				}
+				if j, ok := parentItem[it.span.ParentID]; ok {
+					parent[find(i)] = find(j)
+				} else {
+					parentItem[it.span.ParentID] = i
+				}
+			}
+			// HA source: couple items that share an upstream fan-out witnessed by
+			// the hash array (co-descendants of one dropped branch point, even with
+			// different direct parents).
+			if fullsatHA {
+				haItem := make(map[uint64]int)
+				for i, it := range items {
+					if it.span == nil {
+						continue
+					}
+					for _, e := range it.span.HA {
+						if j, ok := haItem[e.ParentID]; ok {
+							parent[find(i)] = find(j)
+						} else {
+							haItem[e.ParentID] = i
+						}
+					}
+				}
+			}
+		}
+		// Bloom-confirmer source: gather the full fan-out electorate. Couple items
+		// whose covering bloom confirms a COMMON named node — the soft co-descendant
+		// subtrees of a fan-out — so every voter lands in one cluster and votes on
+		// the shared anchor together (not just the direct children, who already
+		// agree). This is the aggressive grouping legacy's bloom-merge did cheaply;
+		// here it grows the per-cluster MAP (watch tractability via the work-cap).
+		if fullsatNaming && fullsatHA {
+			named := make(map[uint64]int)
+			for _, it := range items {
+				if it.span == nil {
+					continue
+				}
+				if it.span.ParentID != 0 {
+					named[it.span.ParentID] = it.span.Depth - 1
+				}
+				for _, e := range it.span.HA {
+					named[e.ParentID] = e.Depth - 1
+				}
+			}
+			ids := make([]uint64, 0, len(named))
+			for nID := range named {
+				ids = append(ids, nID)
+			}
+			sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+			confItem := make(map[uint64]int)
+			for i, it := range items {
+				if it.span == nil {
+					continue
+				}
+				_, _, tb, _ := coveringPCRBPayload(it.span, children, cfg)
+				if tb == nil {
+					continue
+				}
+				bf := bloom.Deserialize(tb, cfg.BloomM, cfg.BloomK)
+				for _, nID := range ids {
+					if named[nID] >= it.span.Depth {
+						continue
+					}
+					key := bridge.HexOf(nID)
+					if !bf.Test(key[:]) {
+						continue
+					}
+					if j, ok := confItem[nID]; ok {
+						parent[find(i)] = find(j)
+					} else {
+						confItem[nID] = i
+					}
+				}
+			}
+		}
 		clusters := make(map[int][]int)
 		for i := range items {
 			clusters[find(i)] = append(clusters[find(i)], i)
@@ -1655,6 +1698,24 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				// Structured per-item options for the --fullsat-pb model (built
 				// from the same feasible options as the C/I/O block below).
 				var fsItems []fsItem
+				// Named-node universe for this cluster (id -> depth), from direct
+				// ParentIDs + HA entries — the candidate join nodes a fragment's
+				// bloom can soft-attach to (--fullsat-cgpb, HA source).
+				var namedDepth map[uint64]int
+				if useFullsat && fullsatNaming && fullsatHA {
+					namedDepth = make(map[uint64]int)
+					for _, it := range cl {
+						if it.span == nil {
+							continue
+						}
+						if it.span.ParentID != 0 {
+							namedDepth[it.span.ParentID] = it.span.Depth - 1
+						}
+						for _, e := range it.span.HA {
+							namedDepth[e.ParentID] = e.Depth - 1
+						}
+					}
+				}
 				// dumpToOpt[i][j] = original cl[i].opts index of the j-th
 				// emitted (feasible-against-bare-ledger) option for item i,
 				// so a CP-SAT assignment in emitted-option space maps back to
@@ -1707,16 +1768,63 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 						}
 						lines = append(lines, ob.String())
 						if useFullsat {
-							fo := fsOpt{gain: cl[i].opts[oi].gain, cost: cost, rsvID: ol.rsvID}
+							fo := fsOpt{gain: cl[i].opts[oi].gain, cost: cost, rsvID: ol.rsvID, chainAnchor: cl[i].opts[oi].fs.p.anchor.SpanID}
 							fo.levels = append(fo.levels, ol.spanIDs...)
 							for si := range ol.spanIDs {
 								fo.spanIDs = append(fo.spanIDs, ol.spanPtrs[si].SpanID)
+							}
+							// --fullsat-cgpb: name the dropped-parent slot by the
+							// fragment root's exact ParentID, turning the bare
+							// reservation into a named occupancy (same id coexists =>
+							// coalesce; different id conflicts => exclusivity). Direct-
+							// parent source: intrinsic span metadata, no payload needed.
+							if fullsatNaming && cl[i].isOrphan && ol.rsvID >= 0 {
+								fo.rsvSpanID = cl[i].span.ParentID
+							}
+							// HA source: name the upstream fan-outs the hash array
+							// witnesses, at their depths on this option's chain (dropped
+							// ancestors between the anchor and the fragment root).
+							if fullsatNaming && fullsatHA && cl[i].span != nil {
+								ofs := cl[i].opts[oi].fs
+								for _, e := range cl[i].span.HA {
+									dN := e.Depth - 1
+									if dN > ofs.p.anchor.Depth && dN < cl[i].span.Depth {
+										fo.named = append(fo.named, fsNamed{level: int32(idOf(ofs, dN)), id: e.ParentID})
+									}
+								}
 							}
 							fOpts = append(fOpts, fo)
 						}
 					}
 					if useFullsat {
-						fsItems = append(fsItems, fsItem{skipPen: pen, opts: fOpts})
+						fi := fsItem{skipPen: pen, opts: fOpts}
+						// Carrier-hard source: the HA-named fan-outs this fragment
+						// CARRIES (certain descendant) — used to force all carriers of
+						// a fan-out onto its single shared upstream anchor.
+						if fullsatNaming && fullsatHA && cl[i].span != nil {
+							for _, e := range cl[i].span.HA {
+								fi.carries = append(fi.carries, e.ParentID)
+							}
+							// Soft-attach source: named nodes ABOVE this fragment whose
+							// id its covering bloom confirms (candidate descendant). A
+							// negative would be definitive (blooms have no false
+							// negatives), so a positive admits it as a join candidate;
+							// the MAP solve then grades it against other routes.
+							if _, _, tb, _ := coveringPCRBPayload(cl[i].span, children, cfg); tb != nil {
+								bf := bloom.Deserialize(tb, cfg.BloomM, cfg.BloomK)
+								for nID, nD := range namedDepth {
+									if nD >= cl[i].span.Depth || nID == cl[i].span.ParentID {
+										continue
+									}
+									key := bridge.HexOf(nID)
+									if bf.Test(key[:]) {
+										fi.confirms = append(fi.confirms, nID)
+									}
+								}
+								sort.Slice(fi.confirms, func(a, b int) bool { return fi.confirms[a] < fi.confirms[b] })
+							}
+						}
+						fsItems = append(fsItems, fi)
 					}
 					fmt.Fprintf(&b, "I %d %d\n", pen, len(lines))
 					for _, ln := range lines {
@@ -2100,12 +2208,20 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			}
 		}
 		res.Reconnected++
+		// --fullsat-cgpb: the fragment root's exact dropped-parent id IS its
+		// recovered immediate parent (the shared join node). Fragments sharing it
+		// are reconstructed siblings under that one node — the fan-out.
+		var rf uint64
+		if fullsatNaming {
+			rf = fs.p.o.ParentID
+		}
 		res.Bridges = append(res.Bridges, Bridge{
-			OrphanID:   fs.p.o.SpanID,
-			AnchorID:   anchor.SpanID,
-			Synthetic:  fs.p.o.Depth - anchor.Depth - 1,
-			Ambiguous:  fs.p.ambiguous,
-			ViaCarrier: fs.p.viaCarrier,
+			OrphanID:    fs.p.o.SpanID,
+			AnchorID:    anchor.SpanID,
+			Synthetic:   fs.p.o.Depth - anchor.Depth - 1,
+			Ambiguous:   fs.p.ambiguous,
+			ViaCarrier:  fs.p.viaCarrier,
+			ReconFanout: rf,
 		})
 	}
 	for _, r := range unplaced {
@@ -2133,12 +2249,17 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		if via == 0 {
 			via = primary.fs.p.o.SpanID
 		}
+		var rf uint64
+		if fullsatNaming {
+			rf = r.ParentID
+		}
 		res.Bridges = append(res.Bridges, Bridge{
-			OrphanID:   r.SpanID,
-			AnchorID:   top.SpanID,
-			Synthetic:  r.Depth - top.Depth - 1,
-			Forced:     forcedRoots[r.SpanID],
-			ViaCarrier: via,
+			OrphanID:    r.SpanID,
+			AnchorID:    top.SpanID,
+			Synthetic:   r.Depth - top.Depth - 1,
+			Forced:      forcedRoots[r.SpanID],
+			ViaCarrier:  via,
+			ReconFanout: rf,
 		})
 		res.Reconnected++
 	}

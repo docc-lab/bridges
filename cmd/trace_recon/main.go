@@ -41,6 +41,8 @@ type config struct {
 	corpusDir          string
 	outputPath         string
 	mode               string // "pb" or "pcr"
+	cgrp               bool   // pcrs + HA: run the PCRS solver on CGPRB (HA-bearing) payloads, with named dropped fan-outs as constraints
+	fullsatPB          bool   // pcrs: solve each cluster as a general declarative CP-SAT model (full-SAT parity baseline; no HA)
 	checkpointDistance int
 	dropRate           float64
 	seed               int64
@@ -71,6 +73,8 @@ func parseFlags() config {
 	flag.BoolVar(&c.dumpOnly, "dump-only", false, "With --dump-survivors: dump the trace inputs and SKIP reconstruction (fast capture of slow traces for offline replay).")
 	flag.StringVar(&c.traceStore, "trace-store", "", "Read a per-trace store (cmd/corpus_split output) instead of --corpus. Runs handler+drop+reconstruct per-trace in PARALLEL (no single-threaded event streaming); bit-identical results. Needs --corpus too (for meta: trace order + service names).")
 	flag.StringVar(&c.mode, "mode", "pb", "Bridge mode: pb (bloom membership), pcr (truncated checkpoint-root ID), or pcrb (checkpoint root + window bloom for in-window threading)")
+	flag.BoolVar(&c.cgrp, "cgrp", false, "PCRS+CGP: run the PCRS solver on CGPRB (HA-bearing) payloads, ingesting the hash array so named dropped fan-outs become constraints (carriers hard, bloom-confirmers soft). Requires --mode pcrs.")
+	flag.BoolVar(&c.fullsatPB, "fullsat-pb", false, "PCRS: solve each cluster as a general declarative CP-SAT model (docs/fullsat_shim.md) instead of the Go B&B — the full-SAT parity baseline (no HA). Requires --mode pcrs and the cpsat build tag.")
 	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
 	flag.StringVar(&c.onlyTraces, "only-traces", "", "Diagnostic: comma-separated hex trace IDs to reconstruct ONLY (corpus still streams and drop RNG still advances for all traces, so survivors are bit-identical to a full run). Lets you repro a single slow trace in seconds.")
 	flag.StringVar(&c.dumpSurvivors, "dump-survivors", "", "Gob-dump each reconstructed trace's decoded survivors+truth+dropped+cfg to this file. Pair with --only-traces to capture one trace from a single corpus walk, then replay it offline with cmd/recon_one (no corpus walk).")
@@ -101,6 +105,17 @@ func parseFlags() config {
 	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" {
 		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, pcrs, or cgprb (got %q)\n", c.mode)
 		os.Exit(2)
+	}
+	if c.cgrp && c.mode != "pcrs" {
+		fmt.Fprintf(os.Stderr, "error: --cgrp requires --mode pcrs (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	if c.fullsatPB && c.mode != "pcrs" {
+		fmt.Fprintf(os.Stderr, "error: --fullsat-pb requires --mode pcrs (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	if c.fullsatPB {
+		recon.EnableFullsatPB(c.seed, 0) // fixed seed for machine-independent results
 	}
 	switch gapPolicy {
 	case "continue":
@@ -272,8 +287,6 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		cfg.PrefixLen = c.prefixLen
 		return ph, cfg
 	case "pcrb", "pcrs":
-		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
-		ph.Capture = true
 		// PCRB bloom geometry differs from PB's for the same --bloom-fp
 		// (sized for cpd-1; see bridge.PCRBBloomCapacity) — rebuild the
 		// config with the matching constructor.
@@ -281,6 +294,17 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		pcrbCfg.BottomUp, pcrbCfg.ChainCheck = cfg.BottomUp, cfg.ChainCheck
 		pcrbCfg.StopOnGap = c.stopOnGap
 		pcrbCfg.TiePolicy = c.tiePolicy
+		// --cgrp (pcrs only): emit the CGPRB payload so the PCRS solver gets
+		// the hash array. Same checkpoint-root + bloom geometry as PCRB, so it
+		// shares the PCRB config; the solver keys off cfg.CGRP.
+		if c.cgrp {
+			ch := bridge.NewCGPRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
+			ch.Capture = true
+			pcrbCfg.CGRP = true
+			return ch, pcrbCfg
+		}
+		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
+		ph.Capture = true
 		return ph, pcrbCfg
 	case "cgprb":
 		// Call-graph-preserving: PCRB payload + window-local hash array. Same
@@ -551,7 +575,7 @@ func (ha *harness) process(j finishJob) {
 				sp.Depth = d
 				sp.CkptPrefix = prefix
 				sp.LeafCarrier = d%ha.cpd != 0
-			} else if ha.mode == "pcrb" || ha.mode == "pcrs" {
+			} else if (ha.mode == "pcrb" || ha.mode == "pcrs") && !ha.cfg.CGRP {
 				d, prefix, bits, err := recon.DecodePCRBPayload(s.br, ha.cfg)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
@@ -561,7 +585,7 @@ func (ha *harness) process(j finishJob) {
 				sp.CkptPrefix = prefix
 				sp.BloomBits = bits
 				sp.LeafCarrier = d%ha.cpd != 0
-			} else if ha.mode == "cgprb" {
+			} else if ha.mode == "cgprb" || ha.cfg.CGRP {
 				d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)

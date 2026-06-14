@@ -314,6 +314,47 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		prov[fs][s.Depth] = kind
 		return true
 	}
+	// --- CGP: HA-named dropped fan-outs as hard, exclusive occupants ---
+	// With --cgrp the survivors carry a hash array witnessing dropped branch
+	// points. A span carrying an HA entry for parent N is a CERTAIN descendant
+	// of N, so N must occupy its depth on that fragment's chain — and nothing
+	// else may (named nodes are unique and never merge; only synthetics do).
+	// We realize this directly in the ledger: one canonical synthetic *Span per
+	// named id, written 'B' (immovable) at N's depth on every chain whose
+	// orphan descends from N. 'B' makes open() false there (exclusivity) and
+	// the B&B treat it as a hard block; the rest is the existing MAP solve.
+	named := make(map[uint64]*Span)
+	if cfg.CGRP {
+		namedAt := func(id uint64, depth int) *Span {
+			if n := named[id]; n != nil {
+				return n
+			}
+			n := &Span{SpanID: id, Depth: depth}
+			named[id] = n
+			return n
+		}
+		for _, fs := range states {
+			o, a := fs.p.o, fs.p.anchor
+			// Walk o's surviving subtree; any HA entry it carries names a true
+			// dropped ancestor of o (a carrier of N descends from N, and a
+			// descendant of o naming an ancestor strictly above o names an
+			// ancestor of o too). Restrict to the chain's interior (a, o).
+			stack := []*Span{o}
+			for len(stack) > 0 {
+				s := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				for _, e := range s.HA {
+					dN := e.Depth - 1 // HAEntry.Depth is the child depth
+					if dN <= a.Depth || dN >= o.Depth {
+						continue
+					}
+					write(fs, namedAt(e.ParentID, dN), 'B')
+				}
+				stack = append(stack, children[s.SpanID]...)
+			}
+		}
+	}
+
 	chainsByW := make(map[uint64][]*fragState)
 	for _, fs := range states {
 		chainsByW[fs.p.anchor.SpanID] = append(chainsByW[fs.p.anchor.SpanID], fs)
@@ -1578,6 +1619,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			}
 			dumpW := clusterDumpWriter()
 			useCpsat := cpsatEnabled && cpsatSolveFn != nil
+			useFullsat := fullsatEnabled && fullsatSolveFn != nil
 			// bt() is the pure-Go branch-and-bound solver. When CP-SAT is the
 			// active solver it PROVES the per-cluster optimum and replaces bt()'s
 			// best-found assignment wholesale below; the cluster block handed to
@@ -1590,7 +1632,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			// CP-SAT) always run bt — it IS the solver there. The CLUSTERDUMP
 			// validator needs bt's bestScore for offline comparison, so dump runs
 			// also run bt.
-			if !useCpsat || dumpW != nil {
+			if (!useCpsat && !useFullsat) || dumpW != nil {
 				bt(0, 0)
 			}
 			// Export this solved cluster as a "C/I/O" block. Per option we
@@ -1603,13 +1645,16 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			// (TRACE_RECON_CLUSTERDUMP), and — when TRACE_RECON_CPSAT=1 and
 			// the cpsat build tag is compiled in — CP-SAT AS THE SOLVER, whose
 			// proven-optimal assignment replaces bt()'s best-found one below.
-			if dumpW != nil || useCpsat {
+			if dumpW != nil || useCpsat || useFullsat {
 				capped := 0
 				if work > workBudget {
 					capped = 1
 				}
 				var b strings.Builder
 				fmt.Fprintf(&b, "C %d %d %d\n", bestScore, capped, len(cl))
+				// Structured per-item options for the --fullsat-pb model (built
+				// from the same feasible options as the C/I/O block below).
+				var fsItems []fsItem
 				// dumpToOpt[i][j] = original cl[i].opts index of the j-th
 				// emitted (feasible-against-bare-ledger) option for item i,
 				// so a CP-SAT assignment in emitted-option space maps back to
@@ -1624,6 +1669,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 						pen = 0
 					}
 					var lines []string
+					var fOpts []fsOpt
 					for oi := range cl[i].opts {
 						ol := optLvls[i][oi]
 						feas := true
@@ -1660,6 +1706,17 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 							fmt.Fprintf(&ob, " %d:%d", ol.spanIDs[si], ol.spanPtrs[si].SpanID)
 						}
 						lines = append(lines, ob.String())
+						if useFullsat {
+							fo := fsOpt{gain: cl[i].opts[oi].gain, cost: cost, rsvID: ol.rsvID}
+							fo.levels = append(fo.levels, ol.spanIDs...)
+							for si := range ol.spanIDs {
+								fo.spanIDs = append(fo.spanIDs, ol.spanPtrs[si].SpanID)
+							}
+							fOpts = append(fOpts, fo)
+						}
+					}
+					if useFullsat {
+						fsItems = append(fsItems, fsItem{skipPen: pen, opts: fOpts})
 					}
 					fmt.Fprintf(&b, "I %d %d\n", pen, len(lines))
 					for _, ln := range lines {
@@ -1672,7 +1729,34 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 					dumpW.WriteString(b.String())
 					clusterDumpMu.Unlock()
 				}
-				if useCpsat {
+				if useFullsat {
+					// Full-SAT path: solve the cluster as a general declarative
+					// model (same items/options as the C/I/O block, faithfully
+					// re-encoded). Replaces bt()'s assignment; falls back to bt()
+					// only on a genuine no-solution.
+					statClusters.Add(1)
+					t0 := time.Now()
+					da, ok := solveClusterFullsat(fsItems)
+					statCpsatNanos.Add(int64(time.Since(t0)))
+					if ok {
+						statCpsatOK.Add(1)
+						ba := make([]int, len(cl))
+						for i := range cl {
+							if i >= len(da) || da[i] < 0 {
+								ba[i] = -1
+							} else {
+								ba[i] = dumpToOpt[i][da[i]]
+							}
+						}
+						bestAssign = ba
+					} else if bestAssign == nil {
+						statBtFallback.Add(1)
+						tb := time.Now()
+						bt(0, 0)
+						statBtNanos.Add(int64(time.Since(tb)))
+					}
+				}
+				if useCpsat && !useFullsat {
 					// CP-SAT solves the SAME model bt() does. It returns its best
 					// assignment (OPTIMAL or, at the time limit, FEASIBLE) — which
 					// replaces bt()'s. Only a genuine no-solution (UNKNOWN/

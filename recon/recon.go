@@ -140,6 +140,13 @@ type Config struct {
 	//             ID as final fallback. Default.
 	TiePolicy string
 
+	// CGRP enables the PCRS+CGP mode: the survivors carry CGPRB (HA-bearing)
+	// payloads, and ReconstructPCRS ingests the hash array so each named
+	// dropped fan-out becomes a constraint — descendants that CARRY its HA
+	// entry must route through it (hard), and spans whose bloom merely
+	// confirms it MAY route through it (soft, scored by the MAP objective).
+	CGRP bool
+
 	// BottomUp processes orphans deepest-first and lets shallower orphans
 	// discover descendant carriers by walking across already-reconstructed
 	// bridges (verified by bloom containment) before falling back to the

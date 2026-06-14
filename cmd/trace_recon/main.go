@@ -45,6 +45,7 @@ type config struct {
 	cgrp               bool   // pcrs + HA: run the PCRS solver on CGPRB (HA-bearing) payloads, with named dropped fan-outs as constraints
 	fullsatPB          bool   // pcrs: solve each cluster as a general declarative CP-SAT model (full-SAT parity baseline; no HA)
 	fullsatCGPB        bool   // pcrs + HA: full-SAT model with named-synthetic identities (CGP) injected into the cluster occupancy
+	fullsatEngine      bool   // pcrs: the single-pass ReconstructFullSAT engine (anchoring + all rules as one CP-SAT model)
 	timingPath         string // non-empty: write per-trace reconstruction timing CSV here
 	checkpointDistance int
 	dropRate           float64
@@ -80,6 +81,7 @@ func parseFlags() config {
 	flag.BoolVar(&c.fullsatPB, "fullsat-pb", false, "PCRS: solve each cluster as a general declarative CP-SAT model (docs/fullsat_shim.md) instead of the Go B&B — the full-SAT parity baseline (no HA). Requires --mode pcrs and the cpsat build tag.")
 	flag.StringVar(&c.timingPath, "timing", "", "Write a per-trace reconstruction-timing CSV here (tid,survivors,spans,dropped,recon_ns) and print a TIMING summary. (TRACE_RECON_TIMING=1 prints the summary without the CSV.)")
 	flag.BoolVar(&c.fullsatCGPB, "fullsat-cgpb", false, "PCRS + HA: the --fullsat-pb model plus named-synthetic identities from the hash array (CGP) injected into the cluster occupancy — hard fan-out coalescing + exclusivity. Requires --mode pcrs and the cpsat build tag.")
+	flag.BoolVar(&c.fullsatEngine, "fullsat", false, "PCRS: the single-pass ReconstructFullSAT engine — anchoring + all invariants compiled into one CP-SAT model per cluster, solved once (no pass-1 commit, no post-processing). Requires --mode pcrs and the cpsat build tag.")
 	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
 	flag.StringVar(&c.onlyTraces, "only-traces", "", "Diagnostic: comma-separated hex trace IDs to reconstruct ONLY (corpus still streams and drop RNG still advances for all traces, so survivors are bit-identical to a full run). Lets you repro a single slow trace in seconds.")
 	flag.StringVar(&c.dumpSurvivors, "dump-survivors", "", "Gob-dump each reconstructed trace's decoded survivors+truth+dropped+cfg to this file. Pair with --only-traces to capture one trace from a single corpus walk, then replay it offline with cmd/recon_one (no corpus walk).")
@@ -123,8 +125,12 @@ func parseFlags() config {
 		fmt.Fprintf(os.Stderr, "error: --fullsat-cgpb requires --mode pcrs (got %q)\n", c.mode)
 		os.Exit(2)
 	}
-	if c.fullsatPB || c.fullsatCGPB {
+	if c.fullsatPB || c.fullsatCGPB || c.fullsatEngine {
 		recon.EnableFullsatPB(c.seed, 0) // fixed seed for machine-independent results
+	}
+	if c.fullsatEngine && c.mode != "pcrs" {
+		fmt.Fprintf(os.Stderr, "error: --fullsat requires --mode pcrs (got %q)\n", c.mode)
+		os.Exit(2)
 	}
 	if c.fullsatCGPB {
 		recon.EnableFullsatCGPB() // inject named-synthetic identities into the cluster occupancy
@@ -187,9 +193,10 @@ type collSpan struct {
 
 // harness drives the per-trace collect -> drop -> reconstruct -> score loop.
 type harness struct {
-	h       bridge.Handler
-	mode    string // "pb" or "pcr": selects payload decode + reconstruction
-	cfg     recon.Config
+	h             bridge.Handler
+	mode          string // "pb" or "pcr": selects payload decode + reconstruction
+	fullsatEngine bool   // pcrs mode: use the single-pass ReconstructFullSAT engine
+	cfg           recon.Config
 	rng     *rand.Rand
 	dropAll bool
 	rate    float64
@@ -376,6 +383,7 @@ func newHarness(c config) *harness {
 		nextSeq:    make(map[uint64]map[uint64]int),
 		jobs:       make(chan finishJob, workers*2),
 	}
+	ha.fullsatEngine = c.fullsatEngine
 	ha.timingPath = c.timingPath
 	ha.timingOn = c.timingPath != "" || os.Getenv("TRACE_RECON_TIMING") == "1"
 	ha.prog.start = time.Now()
@@ -657,7 +665,12 @@ func (ha *harness) process(j finishJob) {
 		ha.classifyWrong(tid, res, truth, dropped)
 	} else if ha.mode == "pcrs" {
 		t0 := time.Now()
-		res := recon.ReconstructPCRS(survivors, ha.cfg)
+		var res recon.Result
+		if ha.fullsatEngine {
+			res = recon.ReconstructFullSAT(survivors, ha.cfg)
+		} else {
+			res = recon.ReconstructPCRS(survivors, ha.cfg)
+		}
 		ha.recRecon(tid, len(survivors), len(truth), len(dropped), time.Since(t0))
 		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
 		ha.classifyWrong(tid, res, truth, dropped)

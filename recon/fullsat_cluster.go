@@ -35,6 +35,7 @@ func EnableFullsatCGPB() { fullsatNaming = true }
 // to check whether the HA mechanism is engaging at all.
 var fullsatDiag = os.Getenv("TRACE_RECON_FSDIAG") == "1"
 
+
 // fullsatHA gates the HA naming source (upstream fan-outs witnessed by the hash
 // array) on top of the always-on direct-ParentID source. Default on; set
 // TRACE_RECON_FULLSAT_HA=0 for the direct-parent-only ablation (the "PB" rung).

@@ -7,10 +7,44 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"bridges/bloom"
 	"bridges/bridge"
 )
+
+// Cluster-solve diagnostics: how each per-cluster MAP solve resolved, summed
+// over every solveCluster call (all traces, all goroutines). Distinguishes a
+// many-hard-clusters cost from a CP-SAT-failure-then-bt-grind. Read via
+// ClusterStats; recon_one snapshots the per-trace delta.
+var (
+	statClusters   atomic.Int64 // solveCluster calls that ran a solve
+	statCpsatOK    atomic.Int64 // CP-SAT returned a usable (OPTIMAL or FEASIBLE) assignment
+	statBtFallback atomic.Int64 // CP-SAT unusable -> pure-Go bt() fallback ran
+	statCpsatNanos atomic.Int64 // wall time spent in CP-SAT calls
+	statBtNanos    atomic.Int64 // wall time spent in bt() fallback
+)
+
+// ClusterStats returns a snapshot of the cluster-solve counters (times in ms).
+func ClusterStats() (clusters, cpsatOK, btFallback, cpsatMillis, btMillis int64) {
+	return statClusters.Load(), statCpsatOK.Load(), statBtFallback.Load(),
+		statCpsatNanos.Load() / 1e6, statBtNanos.Load() / 1e6
+}
+
+// cpsatSolveFn, when non-nil (set by the //go:build cpsat cgo file), is the
+// per-cluster CP-SAT MAP solver. It takes the "C/I/O" cluster block the engine
+// builds for the validator and returns, per item, the chosen option index
+// within that item's emitted feasible-option list (-1 = skip). The default
+// pure-Go build leaves it nil. Gated per-run by TRACE_RECON_CPSAT so the same
+// binary can run either solver.
+var cpsatSolveFn func(block string, nItems int) (assign []int, ok bool)
+
+var cpsatEnabled = os.Getenv("TRACE_RECON_CPSAT") == "1"
+
+// ambigCount gates the (cheap, atomic) ambiguity tallies. Enabled by either
+// TRACE_RECON_AMBIG=1 or full debug, so the AMBIG line can be captured without
+// the per-cluster CLUSTER spam that TRACE_RECON_DEBUG also turns on.
+var ambigCount = os.Getenv("TRACE_RECON_AMBIG") == "1" || os.Getenv("TRACE_RECON_DEBUG") == "1"
 
 // Ambiguity instrumentation (TRACE_RECON_DEBUG=1): process-global tallies
 // of the actual reconstruction decision points, to measure the real
@@ -219,7 +253,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				}
 				dfs(r)
 			}
-			if debugScore {
+			if ambigCount {
 				// one-shot threading-ambiguity tally: bloom-positive
 				// candidate multiplicity per interior window level
 				for d := p.anchor.Depth + 1; d <= maxD; d++ {
@@ -1302,7 +1336,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 			// seating (first descent finishes far under budget), is counted
 			// (capped) and anatomized (CLUSTERDUMP). Invariant-safe: the
 			// round loop recovers any skips in a capped seating.
-			const workBudget = 1000000000
+			workBudget := 1000000000
 			work := 0
 			capDumped := false
 			// Simple admissible bound: sum of each remaining item's best
@@ -1542,7 +1576,130 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 				cur[i] = -1
 				bt(i+1, score-pen)
 			}
-			bt(0, 0)
+			dumpW := clusterDumpWriter()
+			useCpsat := cpsatEnabled && cpsatSolveFn != nil
+			// bt() is the pure-Go branch-and-bound solver. When CP-SAT is the
+			// active solver it PROVES the per-cluster optimum and replaces bt()'s
+			// best-found assignment wholesale below; the cluster block handed to
+			// CP-SAT is built from the persistent ledger, independent of bt. So
+			// running the full branch-and-bound first is pure wasted work — on
+			// pathological tail clusters (large symmetry groups) it ground ~50s
+			// before its result was discarded. Solve with CP-SAT directly and
+			// only run bt as a fallback if CP-SAT cannot prove optimality within
+			// its time limit (never observed on this corpus). Pure-Go builds (no
+			// CP-SAT) always run bt — it IS the solver there. The CLUSTERDUMP
+			// validator needs bt's bestScore for offline comparison, so dump runs
+			// also run bt.
+			if !useCpsat || dumpW != nil {
+				bt(0, 0)
+			}
+			// Export this solved cluster as a "C/I/O" block. Per option we
+			// emit the gain (bonus-included, matching bestScore scale), the
+			// displacement cost against the bare ledger, the reservation
+			// level, and the occupied (level:spanID) pairs — enough to
+			// re-derive feasibility (same-span sharing, occ/rsv exclusivity)
+			// and the objective independently. This same block feeds two
+			// consumers: the independent CP-SAT validator
+			// (TRACE_RECON_CLUSTERDUMP), and — when TRACE_RECON_CPSAT=1 and
+			// the cpsat build tag is compiled in — CP-SAT AS THE SOLVER, whose
+			// proven-optimal assignment replaces bt()'s best-found one below.
+			if dumpW != nil || useCpsat {
+				capped := 0
+				if work > workBudget {
+					capped = 1
+				}
+				var b strings.Builder
+				fmt.Fprintf(&b, "C %d %d %d\n", bestScore, capped, len(cl))
+				// dumpToOpt[i][j] = original cl[i].opts index of the j-th
+				// emitted (feasible-against-bare-ledger) option for item i,
+				// so a CP-SAT assignment in emitted-option space maps back to
+				// the opts-index space bt()/applyAssign use.
+				dumpToOpt := make([][]int, len(cl))
+				for i := range cl {
+					pen := 1000000000
+					if cl[i].reseat {
+						pen = 2000000000
+					}
+					if cl[i].thread {
+						pen = 0
+					}
+					var lines []string
+					for oi := range cl[i].opts {
+						ol := optLvls[i][oi]
+						feas := true
+						cost := 0
+						for si := range ol.spanIDs {
+							L := ol.spanIDs[si]
+							if rsvBlock[L] {
+								feas = false
+								break
+							}
+							if x := occSpanArr[L]; x != nil && x != ol.spanPtrs[si] {
+								if occBlock[L] {
+									feas = false
+									break
+								}
+								cost += occSoftCost[L]
+							}
+						}
+						if feas && ol.rsvID >= 0 {
+							R := ol.rsvID
+							if occBlock[R] {
+								feas = false
+							} else if occSpanArr[R] != nil {
+								cost += occSoftCost[R]
+							}
+						}
+						if !feas {
+							continue
+						}
+						dumpToOpt[i] = append(dumpToOpt[i], oi)
+						var ob strings.Builder
+						fmt.Fprintf(&ob, "O %d %d %d %d", cl[i].opts[oi].gain, cost, ol.rsvID, len(ol.spanIDs))
+						for si := range ol.spanIDs {
+							fmt.Fprintf(&ob, " %d:%d", ol.spanIDs[si], ol.spanPtrs[si].SpanID)
+						}
+						lines = append(lines, ob.String())
+					}
+					fmt.Fprintf(&b, "I %d %d\n", pen, len(lines))
+					for _, ln := range lines {
+						b.WriteString(ln)
+						b.WriteByte('\n')
+					}
+				}
+				if dumpW != nil {
+					clusterDumpMu.Lock()
+					dumpW.WriteString(b.String())
+					clusterDumpMu.Unlock()
+				}
+				if useCpsat {
+					// CP-SAT solves the SAME model bt() does. It returns its best
+					// assignment (OPTIMAL or, at the time limit, FEASIBLE) — which
+					// replaces bt()'s. Only a genuine no-solution (UNKNOWN/
+					// INFEASIBLE) yields !ok; then fall back to the pure-Go bt().
+					statClusters.Add(1)
+					t0 := time.Now()
+					da, ok := cpsatSolveFn(b.String(), len(cl))
+					statCpsatNanos.Add(int64(time.Since(t0)))
+					if ok {
+						statCpsatOK.Add(1)
+						ba := make([]int, len(cl))
+						for i := range cl {
+							if i >= len(da) || da[i] < 0 {
+								ba[i] = -1
+							} else {
+								ba[i] = dumpToOpt[i][da[i]]
+							}
+						}
+						bestAssign = ba
+					} else if bestAssign == nil {
+						statBtFallback.Add(1)
+						tb := time.Now()
+						bt(0, 0)
+						statBtNanos.Add(int64(time.Since(tb)))
+					}
+				}
+			}
 			// revert the coverage bonus: gains live on shared option state,
 			// and any future re-solve of these items must not see it
 			// double-applied
@@ -1760,7 +1917,7 @@ func ReconstructPCRS(survivors []Span, cfg Config) Result {
 		return any
 	}
 
-	if debugScore {
+	if ambigCount {
 		// one-shot orphan placement-ambiguity tally: viable windows per
 		// unplaced orphan (gated in >1 window = placement the search must
 		// disambiguate)

@@ -30,12 +30,35 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 
 	"bridges/bloom"
 	"bridges/bridge"
 )
 
 var debugScore = os.Getenv("TRACE_RECON_DEBUG") == "1"
+
+// Cluster export for the independent C++ (CP-SAT) solver validator. When
+// TRACE_RECON_CLUSTERDUMP names a file, each solved per-cluster
+// optimization instance is appended in a compact text format (see
+// cmd_validate). The validator re-solves each cluster to optimality and
+// checks our branch-and-bound's bestScore against the true optimum.
+var (
+	clusterDumpMu   sync.Mutex
+	clusterDumpFile *os.File
+	clusterDumpOnce sync.Once
+)
+
+func clusterDumpWriter() *os.File {
+	clusterDumpOnce.Do(func() {
+		if p := os.Getenv("TRACE_RECON_CLUSTERDUMP"); p != "" {
+			if f, err := os.Create(p); err == nil {
+				clusterDumpFile = f
+			}
+		}
+	})
+	return clusterDumpFile
+}
 
 // debugEnds: comma-separated hex span IDs (TRACE_RECON_DEBUG_ENDS) whose
 // ledger placements are logged at census time (ENDMATCH lines).
@@ -74,6 +97,20 @@ type Span struct {
 	// descendants, so it can never be a threading candidate — any bloom
 	// positive on it is a structurally impossible attachment.
 	LeafCarrier bool
+
+	// HA is the decoded CGPRB hash array: the in-window branch points this
+	// span witnesses, each entry (branch-parent id, child depth). nil outside
+	// cgprb mode. Used to materialize dropped branch points and attach their
+	// direct children losslessly before bloom-threading.
+	HA []HAEntry
+}
+
+// HAEntry is one decoded CGPRB hash-array record: a branching parent's exact
+// span id and the depth of its children (= parent depth + 1). The parent may
+// or may not have survived; the branch point exists either way.
+type HAEntry struct {
+	ParentID uint64
+	Depth    int
 }
 
 // Config is the global knowledge a real reconstruction module would have:
@@ -175,6 +212,15 @@ type Bridge struct {
 	// deeper candidates) was committed deterministically. Flagged because
 	// the evidence did not single it out.
 	Forced bool
+
+	// ReconFanout is the CGPRB-recovered identity of this fragment's IMMEDIATE
+	// reconstructed parent (the node at orphan.Depth-1): the true span id of the
+	// dropped fan-out it was coalesced under, or 0 if its direct parent is a
+	// surviving span or an un-recovered anonymous synthetic. Two fragments with
+	// the same non-zero ReconFanout were reconstructed as siblings under that
+	// recovered fan-out. Set only in cgprb mode; 0 everywhere else (P-Bridge
+	// gives each a private synthetic parent — never reconstructed siblings).
+	ReconFanout uint64
 }
 
 // Result is the outcome of reconstructing one trace.

@@ -35,6 +35,7 @@ type config struct {
 	logDee             bool
 	deeLogBytes        int
 	emitDepth          bool
+	emitOC             bool
 	prefixLen          int
 	bloomFP            float64
 }
@@ -50,6 +51,7 @@ func parseFlags() config {
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
 	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
 	flag.BoolVar(&c.emitDepth, "emit-depth", false, "Emit absolute depth: varint(depth) replaces varint(depthMod) in _br payloads, and interior non-checkpoint spans carry a _d attribute (see docs/depth_emission.md)")
+	flag.BoolVar(&c.emitOC, "emit-oc", false, "S-bridge: emit an _oc attribute (window-relative ordinal chain) on interior non-checkpoint spans, to measure per-span ordinal-chain inflation")
 	flag.BoolVar(&c.logDee, "log-dee", false, "S-bridge: log DEE pickup/queue events to stderr")
 	flag.IntVar(&c.deeLogBytes, "dee-log-bytes", 10000, "Threshold for --log-dee")
 	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
@@ -106,6 +108,7 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 		}
 		h := bridge.NewSBridgeHandler(c.checkpointDistance, logger)
 		h.EmitDepth = c.emitDepth
+		h.EmitOC = c.emitOC
 		return h
 	}
 	fmt.Fprintf(os.Stderr, "unknown mode %q\n", c.mode)
@@ -123,7 +126,7 @@ func main() {
 		metrics = runFromJSON(c)
 	}
 
-	if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth); err != nil {
+	if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth, c.emitOC); err != nil {
 		fmt.Fprintf(os.Stderr, "write output: %v\n", err)
 		os.Exit(1)
 	}

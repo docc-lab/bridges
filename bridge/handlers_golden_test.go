@@ -218,8 +218,11 @@ func TestHandlersAgainstPythonGolden(t *testing.T) {
 		{"pb_cpd3", func() Handler { return NewPathBridgeHandler(3, DefaultBloomFPRate) }},
 		{"cgpb_cpd1", func() Handler { return NewCGPBBridgeHandler(1, DefaultBloomFPRate) }},
 		{"cgpb_cpd3", func() Handler { return NewCGPBBridgeHandler(3, DefaultBloomFPRate) }},
-		{"sb_cpd1", func() Handler { return NewSBridgeHandler(1, nil) }},
-		{"sb_cpd3", func() Handler { return NewSBridgeHandler(3, nil) }},
+		// S-Bridge has intentionally diverged from the Python reference
+		// (gen_golden.py): the breadcrumb now carries a 4-byte checkpoint anchor
+		// plus per-ancestor 2-byte fingerprints (see PackSBridgeBR). Python parity
+		// no longer applies; the new emitted-byte format is guarded by
+		// TestPackSBridgeBR. (Re-add here if/when an S-Bridge reference is rebuilt.)
 	}
 
 	for _, c := range cases {

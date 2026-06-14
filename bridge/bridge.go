@@ -52,6 +52,14 @@ type EndResult struct {
 	// EmitDepth is off.
 	DepthBytes int
 
+	// OcBytes is the size of the "_oc" attribute (OcKeyBytes + the serialized
+	// window-relative ordinal chain) emitted on interior non-checkpoint spans
+	// in EmitOC mode (S-Bridge): the per-span start-ordinal chain that lets a
+	// surviving non-checkpoint self-place. 0 when the span carries a _br
+	// payload instead, or when EmitOC is off. Used to measure the per-span
+	// inflation of emitting the ordinal chain everywhere.
+	OcBytes int
+
 	// Payload is the serialized _br value for leaf emission in capture mode.
 	Payload []byte
 

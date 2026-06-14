@@ -9,7 +9,6 @@ package bridge
 import (
 	"encoding/binary"
 	"encoding/hex"
-	"sort"
 )
 
 // Constants matching trace_simulator.py.
@@ -37,6 +36,11 @@ const (
 	// depth) on spans that never emit a _br payload (--emit-depth mode; see
 	// docs/depth_emission.md).
 	DepthKeyBytes = 2
+
+	// Key byte size for the per-span "_oc" attribute carrying the window-
+	// relative ordinal chain on interior non-checkpoint spans (S-Bridge
+	// --emit-oc mode). Stripped key "_oc" = 3 bytes.
+	OcKeyBytes = 3
 )
 
 // VarintEncode encodes a non-negative integer as a protobuf-style varint.
@@ -163,31 +167,33 @@ func TraceIDHexTo16Bytes(s string) [16]byte {
 	return out
 }
 
-// PackSBridgeBR packs the S-Bridge baggage payload, matching Python
-// pack_sbridge_br exactly (sorted depth groups, varint counts, varint sequences,
-// and a trailing dee_bytes blob).
-//
-// depth is clamped to >= 0; ckpt8 must be exactly 8 bytes (caller ensures).
-func PackSBridgeBR(
-	depth int,
-	ckpt8 [8]byte,
-	ordinalGroups map[int][]int,
-	endEvents []int,
-	deeBytes []byte,
-) []byte {
-	depths := make([]int, 0, len(ordinalGroups))
-	for d := range ordinalGroups {
-		depths = append(depths, d)
-	}
-	sort.Ints(depths)
+// bcEntry is one level of an S-Bridge vertical breadcrumb chain: a start
+// ordinal plus, for a non-checkpoint parent, that parent's 2-byte fingerprint
+// (the top 2 bytes of its span ID). The chain is a flat POD slice, so building
+// a child's breadcrumb is a cheap copy+append rather than a per-span map
+// allocation — matching the live implementation and avoiding heavy GC over the
+// hundreds of millions of spans in a corpus.
+type bcEntry struct {
+	ord   int
+	fp    uint16 // big-endian first 2 bytes of the propagating parent's span ID
+	hasFp bool
+}
 
-	// Pre-compute size to avoid reallocation.
-	size := VarintLen(depth) + 8 + VarintLen(len(depths))
-	for _, d := range depths {
-		seqs := ordinalGroups[d]
-		size += VarintLen(d) + VarintLen(len(seqs))
-		for _, s := range seqs {
-			size += VarintLen(s)
+// chainStartDepth is the absolute depth of chain[0] for a span at `depth`:
+// the chain holds one entry per level from the last checkpoint's child down to
+// (and including) the span itself.
+func chainStartDepth(depth, chainLen int) int { return depth - chainLen + 1 }
+
+// sbridgeBRSize returns the serialized size of an S-Bridge _br payload WITHOUT
+// allocating it — used in the per-span hot path (only the byte count matters
+// for the bag-size study). It matches PackSBridgeBR byte-for-byte in length.
+func sbridgeBRSize(depth int, chain []bcEntry, endEvents []int, deeBytes []byte) int {
+	start := chainStartDepth(depth, len(chain))
+	size := VarintLen(depth) + 4 + VarintLen(len(chain))
+	for i := range chain {
+		size += VarintLen(start+i) + VarintLen(1) + VarintLen(maxInt(chain[i].ord, 0))
+		if chain[i].hasFp {
+			size += 2
 		}
 	}
 	size += VarintLen(len(endEvents))
@@ -195,17 +201,33 @@ func PackSBridgeBR(
 		size += VarintLen(s)
 	}
 	size += len(deeBytes)
+	return size
+}
 
-	out := make([]byte, 0, size)
+// PackSBridgeBR packs the S-Bridge baggage payload from a flat breadcrumb
+// chain: varint(depth), the 4-byte checkpoint-root anchor, varint(N), then per
+// level varint(depth_i) varint(1) varint(ordinal) [2-byte parent fingerprint],
+// then the end-event list and the trailing dee_bytes blob. Byte layout is
+// identical to the prior per-depth-map form for a real (one-ordinal-per-depth)
+// chain.
+func PackSBridgeBR(
+	depth int,
+	ckpt4 [4]byte,
+	chain []bcEntry,
+	endEvents []int,
+	deeBytes []byte,
+) []byte {
+	start := chainStartDepth(depth, len(chain))
+	out := make([]byte, 0, sbridgeBRSize(depth, chain, endEvents, deeBytes))
 	out = binary.AppendUvarint(out, uint64(maxInt(depth, 0)))
-	out = append(out, ckpt8[:]...)
-	out = binary.AppendUvarint(out, uint64(len(depths)))
-	for _, d := range depths {
-		seqs := ordinalGroups[d]
-		out = binary.AppendUvarint(out, uint64(d))
-		out = binary.AppendUvarint(out, uint64(len(seqs)))
-		for _, s := range seqs {
-			out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))
+	out = append(out, ckpt4[:]...)
+	out = binary.AppendUvarint(out, uint64(len(chain)))
+	for i := range chain {
+		out = binary.AppendUvarint(out, uint64(maxInt(start+i, 0)))
+		out = binary.AppendUvarint(out, 1)
+		out = binary.AppendUvarint(out, uint64(maxInt(chain[i].ord, 0)))
+		if chain[i].hasFp {
+			out = append(out, byte(chain[i].fp>>8), byte(chain[i].fp))
 		}
 	}
 	out = binary.AppendUvarint(out, uint64(len(endEvents)))

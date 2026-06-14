@@ -145,30 +145,46 @@ func TestTraceIDHexTo16Bytes(t *testing.T) {
 }
 
 func TestPackSBridgeBR(t *testing.T) {
-	ckpt := [8]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
-	zeros8 := [8]byte{}
+	ckpt := [4]byte{0x11, 0x22, 0x33, 0x44} // 4-byte window anchor (truncated root)
+	zeros4 := [4]byte{}
 
-	got1 := hex.EncodeToString(PackSBridgeBR(
-		5, ckpt,
-		map[int][]int{3: {1, 2, 3}, 1: {10}, 2: {}},
-		[]int{4, 5},
-		[]byte{0xaa, 0xbb, 0xcc},
-	))
-	want1 := "0511223344556677880301010a02000303010203020405aabbcc"
+	// A 3-level breadcrumb chain for a span at depth 5 (levels at depths 3,4,5).
+	// The first level's parent is the checkpoint (no 2-byte fp); the deeper
+	// levels carry the propagating parent's 2-byte fingerprint.
+	chain := []bcEntry{
+		{ord: 10},
+		{ord: 7, fp: 0xabcd, hasFp: true},
+		{ord: 2, fp: 0xdef0, hasFp: true},
+	}
+	got1 := hex.EncodeToString(PackSBridgeBR(5, ckpt, chain, []int{4, 5}, []byte{0xaa, 0xbb, 0xcc}))
+	want1 := "05112233440303010a040107abcd050102def0020405aabbcc"
 	if got1 != want1 {
 		t.Errorf("p1: got %s, want %s", got1, want1)
 	}
 
-	got2 := hex.EncodeToString(PackSBridgeBR(0, zeros8, map[int][]int{}, []int{}, nil))
-	want2 := "0000000000000000000000"
+	got2 := hex.EncodeToString(PackSBridgeBR(0, zeros4, nil, []int{}, nil))
+	want2 := "00000000000000"
 	if got2 != want2 {
 		t.Errorf("p2: got %s, want %s", got2, want2)
 	}
 
-	got3 := hex.EncodeToString(PackSBridgeBR(7, ckpt, map[int][]int{0: {9}}, []int{1, 2, 3, 4}, nil))
-	want3 := "071122334455667788010001090401020304"
-	if got3 != want3 {
-		t.Errorf("p3: got %s, want %s", got3, want3)
+	// sbridgeBRSize must equal the serialized length for every shape.
+	cases := []struct {
+		depth int
+		chain []bcEntry
+		ee    []int
+		dee   []byte
+	}{
+		{5, chain, []int{4, 5}, []byte{0xaa, 0xbb, 0xcc}},
+		{0, nil, nil, nil},
+		{3, []bcEntry{{ord: 1}, {ord: 99, fp: 0x1234, hasFp: true}}, []int{1, 2, 3}, nil},
+	}
+	for i, c := range cases {
+		gotSize := sbridgeBRSize(c.depth, c.chain, c.ee, c.dee)
+		wantSize := len(PackSBridgeBR(c.depth, ckpt, c.chain, c.ee, c.dee))
+		if gotSize != wantSize {
+			t.Errorf("case %d: sbridgeBRSize=%d != len(pack)=%d", i, gotSize, wantSize)
+		}
 	}
 }
 

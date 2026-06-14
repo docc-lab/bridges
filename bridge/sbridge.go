@@ -79,6 +79,13 @@ type SBridgeHandler struct {
 	// payload and baggage accounting are unchanged. See docs/depth_emission.md.
 	EmitDepth bool
 
+	// EmitOC emits an "_oc" attribute on interior non-checkpoint spans carrying
+	// the span's window-relative ordinal chain (its path of start ordinals
+	// since the last checkpoint), so a surviving non-checkpoint can self-place.
+	// Used to measure the per-span inflation of carrying the chain everywhere;
+	// checkpoints/leaves already fold the chain into their _br payload.
+	EmitOC bool
+
 	state            map[stateKey]*sbState
 	parentEventCount map[stateKey]int
 	childSeqStart    map[stateKey]int
@@ -89,15 +96,22 @@ type SBridgeHandler struct {
 }
 
 type sbState struct {
-	depth         int
-	ckpt8         [8]byte
-	ordinalGroups map[int][]int
-	endEvents     []int
-	deeBytes      []byte
+	depth     int
+	ckpt4     [4]byte   // window anchor: 4-byte truncated checkpoint-root span ID
+	chain     []bcEntry // breadcrumb: per-level (ordinal, parent fingerprint) since the last checkpoint
+	endEvents []int
+	deeBytes  []byte
 
 	packedLen   int // cached len of pack_sbridge_br applied to the fields above
 	emitted     bool
 	hasChildren bool
+}
+
+// fpBytes returns the first n bytes of the big-endian span ID — a truncated
+// fingerprint, used for the 4-byte checkpoint-root window anchor.
+func fpBytes(id uint64, n int) []byte {
+	b := BigEndian8(id)
+	return append([]byte(nil), b[:n]...)
 }
 
 func NewSBridgeHandler(checkpointDistance int, deeLogger *DeeSizeLogger) *SBridgeHandler {
@@ -170,36 +184,41 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 
 	// Initial values pulled from parent's state (or zeroed for root).
 	var (
-		depth                int
-		ckpt8                [8]byte
-		ordinalGroups        map[int][]int
-		endEvents            []int
-		parentDEEFromParent  []byte
+		depth               int
+		ckpt4               [4]byte
+		chain               []bcEntry
+		endEvents           []int
+		parentDEEFromParent []byte
 	)
 
 	if pid != 0 {
 		var parentDepth int
-		var parentOrdinalGroups map[int][]int
+		var parentChain []bcEntry
 		var parentEEFromParent []int
 		if parentState != nil {
 			parentDepth = parentState.depth
-			ckpt8 = parentState.ckpt8
-			parentOrdinalGroups = parentState.ordinalGroups
+			ckpt4 = parentState.ckpt4
+			parentChain = parentState.chain
 			parentEEFromParent = parentState.endEvents
 			parentDEEFromParent = parentState.deeBytes
 		}
 		depth = parentDepth + 1
 
-		// Deep-copy parent's ordinal groups and append our seq_start.
-		ordinalGroups = make(map[int][]int, len(parentOrdinalGroups)+1)
-		for d, seqs := range parentOrdinalGroups {
-			cp := make([]int, len(seqs))
-			copy(cp, seqs)
-			ordinalGroups[d] = cp
-		}
+		// Copy the parent's breadcrumb chain and append this level: our start
+		// ordinal plus, when our parent is NOT a checkpoint, its 2-byte
+		// fingerprint. (A checkpoint parent's identity is the 4-byte ckpt4
+		// anchor, so that edge carries no 2-byte entry.) A flat slice copy+append
+		// — no per-span map allocation.
 		seqStart := h.bumpEvent(tid, pid)
 		h.childSeqStart[stateKey{tid, sid}] = seqStart
-		ordinalGroups[depth] = append(ordinalGroups[depth], seqStart)
+		chain = make([]bcEntry, len(parentChain), len(parentChain)+1)
+		copy(chain, parentChain)
+		e := bcEntry{ord: seqStart}
+		if parentDepth%int(h.cpd) != 0 { // parent is not a checkpoint
+			e.fp = uint16(pid >> 48)
+			e.hasFp = true
+		}
+		chain = append(chain, e)
 
 		accEnds := h.parentEEAcc[stateKey{tid, pid}]
 		if parentSeqNum == 1 {
@@ -224,12 +243,15 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	isCheckpoint := depth%int(h.cpd) == 0
 	var emitBytes int
 	if isCheckpoint {
-		prePayload := PackSBridgeBR(depth, ckpt8, ordinalGroups, endEvents, deeBytes)
-		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + len(prePayload)
+		// Only the payload SIZE matters for the bag-size study, so compute it
+		// without serializing (no per-span allocation).
+		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSize(depth, chain, endEvents, deeBytes)
 
-		// Reset state for the post-checkpoint snapshot.
-		ckpt8 = BigEndian8(sid)
-		ordinalGroups = nil
+		// Reset state for the post-checkpoint snapshot: this span becomes the
+		// new 4-byte window anchor; the breadcrumb chain restarts empty.
+		ckpt4 = [4]byte{}
+		copy(ckpt4[:], fpBytes(sid, 4))
+		chain = nil
 		endEvents = nil
 		deeBytes = nil
 
@@ -238,8 +260,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		h.parentEEAcc[stateKey{tid, sid}] = nil
 	}
 
-	packed := PackSBridgeBR(depth, ckpt8, ordinalGroups, endEvents, deeBytes)
-	packedLen := len(packed)
+	packedLen := sbridgeBRSize(depth, chain, endEvents, deeBytes)
 
 	var baggageBytes int
 	if baggageFound {
@@ -247,13 +268,13 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	}
 
 	h.state[stateKey{tid, sid}] = &sbState{
-		depth:         depth,
-		ckpt8:         ckpt8,
-		ordinalGroups: ordinalGroups,
-		endEvents:     endEvents,
-		deeBytes:      deeBytes,
-		packedLen:     packedLen,
-		emitted:       isCheckpoint,
+		depth:     depth,
+		ckpt4:     ckpt4,
+		chain:     chain,
+		endEvents: endEvents,
+		deeBytes:  deeBytes,
+		packedLen: packedLen,
+		emitted:   isCheckpoint,
 	}
 
 	return StartResult{
@@ -295,16 +316,38 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 	// their parent's end and need to find parent state alive.
 
 	isLeaf := !ps.hasChildren
-	var emitBytes, depthBytes int
+	var emitBytes, depthBytes, ocBytes int
 	if isLeaf && !ps.emitted {
 		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + ps.packedLen
 		ps.emitted = true
-	} else if h.EmitDepth && !ps.emitted {
-		// Interior non-checkpoint span: never carries _br, so absolute depth
-		// rides as its own "_d" attribute.
-		depthBytes = DepthKeyBytes + VarintLen(ps.depth)
+	} else if !ps.emitted {
+		// Interior non-checkpoint span: never carries _br. In EmitDepth mode
+		// absolute depth rides as a "_d" attribute; in EmitOC mode the window-
+		// relative ordinal chain rides as an "_oc" attribute (self-placement).
+		if h.EmitDepth {
+			depthBytes = DepthKeyBytes + VarintLen(ps.depth)
+		}
+		if h.EmitOC {
+			// Orphan self-placement breadcrumb: the 4-byte window anchor plus
+			// the ordinal+fingerprint chain from the last checkpoint to here.
+			ocBytes = OcKeyBytes + 4 + ordinalChainBytes(ps.chain)
+		}
 	}
-	return EndResult{EmitBytes: emitBytes, DepthBytes: depthBytes}
+	return EndResult{EmitBytes: emitBytes, DepthBytes: depthBytes, OcBytes: ocBytes}
+}
+
+// ordinalChainBytes is the compact serialized size of a span's window-relative
+// breadcrumb chain: per level, one varint for the start ordinal plus the
+// propagating parent's fingerprint bytes (2 when present).
+func ordinalChainBytes(chain []bcEntry) int {
+	n := 0
+	for i := range chain {
+		n += VarintLen(chain[i].ord)
+		if chain[i].hasFp {
+			n += 2
+		}
+	}
+	return n
 }
 
 func (h *SBridgeHandler) EvictTrace(traceID uint64) {

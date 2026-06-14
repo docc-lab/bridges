@@ -12,7 +12,7 @@ import (
 // representation of the bagsize output. Float formatting matches Python's
 // repr(): whole-number floats get a trailing ".0", others use the shortest
 // roundtrip representation.
-func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emitDepth bool) error {
+func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emitDepth, emitOC bool) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -48,10 +48,14 @@ func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emi
 		}
 		return float64(t.BaggageSum) / float64(t.NumBaggageCalls)
 	}, true)
-	writeIntArr(w, "max_baggage_call", m, func(t TraceMetrics) int { return t.BaggageMax }, emitDepth)
+	writeIntArr(w, "max_baggage_call", m, func(t TraceMetrics) int { return t.BaggageMax }, emitDepth || emitOC)
 	if emitDepth {
 		writeIntArr(w, "num_depth_spans", m, func(t TraceMetrics) int { return t.NumDepthSpans }, true)
-		writeIntArr(w, "depth_overhead_sum", m, func(t TraceMetrics) int { return t.DepthSum }, false)
+		writeIntArr(w, "depth_overhead_sum", m, func(t TraceMetrics) int { return t.DepthSum }, emitOC)
+	}
+	if emitOC {
+		writeIntArr(w, "num_oc_spans", m, func(t TraceMetrics) int { return t.NumOcSpans }, true)
+		writeIntArr(w, "oc_overhead_sum", m, func(t TraceMetrics) int { return t.OcSum }, false)
 	}
 
 	io.WriteString(w, "}")

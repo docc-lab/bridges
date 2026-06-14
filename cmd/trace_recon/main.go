@@ -22,7 +22,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +57,10 @@ type config struct {
 	scoreAudit         bool   // fault-injection sensitivity audit of the scorer
 	dumpRecon          string // serialize per-trace reconstruction artifacts (JSONL.gz) for recon_verify
 	verifyInline       bool   // run the independent checker in-process after every reconstruction
+	onlyTraces         string // comma-separated hex trace IDs: reconstruct ONLY these (drop RNG still advances for all -> exact survivors). Diagnostic.
+	dumpSurvivors      string // gob-dump each reconstructed trace's survivors+truth+dropped+cfg here (pair with --only-traces to capture one trace for offline replay via cmd/recon_one).
+	dumpOnly           bool   // with --dump-survivors: capture only, skip reconstruction (fast capture of slow traces)
+	traceStore         string // read a per-trace store (cmd/corpus_split output) instead of --corpus, running handler+drop+reconstruct per-trace in PARALLEL (bit-identical to streaming).
 }
 
 func parseFlags() config {
@@ -61,8 +68,12 @@ func parseFlags() config {
 	flag.StringVar(&c.outputPath, "o", "", "Output JSON file (required)")
 	flag.StringVar(&c.outputPath, "output", "", "Output JSON file (required)")
 	flag.StringVar(&c.corpusDir, "corpus", "", "Read events.bin + meta.bin from this corpus dir")
+	flag.BoolVar(&c.dumpOnly, "dump-only", false, "With --dump-survivors: dump the trace inputs and SKIP reconstruction (fast capture of slow traces for offline replay).")
+	flag.StringVar(&c.traceStore, "trace-store", "", "Read a per-trace store (cmd/corpus_split output) instead of --corpus. Runs handler+drop+reconstruct per-trace in PARALLEL (no single-threaded event streaming); bit-identical results. Needs --corpus too (for meta: trace order + service names).")
 	flag.StringVar(&c.mode, "mode", "pb", "Bridge mode: pb (bloom membership), pcr (truncated checkpoint-root ID), or pcrb (checkpoint root + window bloom for in-window threading)")
 	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
+	flag.StringVar(&c.onlyTraces, "only-traces", "", "Diagnostic: comma-separated hex trace IDs to reconstruct ONLY (corpus still streams and drop RNG still advances for all traces, so survivors are bit-identical to a full run). Lets you repro a single slow trace in seconds.")
+	flag.StringVar(&c.dumpSurvivors, "dump-survivors", "", "Gob-dump each reconstructed trace's decoded survivors+truth+dropped+cfg to this file. Pair with --only-traces to capture one trace from a single corpus walk, then replay it offline with cmd/recon_one (no corpus walk).")
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides)")
 	flag.Float64Var(&c.dropRate, "drop-rate", 1.0, "Probability of dropping each non-checkpoint span (1.0 = drop all)")
@@ -87,8 +98,8 @@ func parseFlags() config {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" {
-		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, or pcrs (got %q)\n", c.mode)
+	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" {
+		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, pcrs, or cgprb (got %q)\n", c.mode)
 		os.Exit(2)
 	}
 	switch gapPolicy {
@@ -166,6 +177,18 @@ type harness struct {
 
 	scores map[uint64]recon.Score
 
+	// CGP call-graph-topology accounting (TRACE_RECON_TOPO=1), guarded by mu.
+	topoOn        bool
+	topoTotal     int64
+	topoConn      int64 // connectivity-correct traces
+	topoCorrect   int64 // topology-correct traces (conn + fan-out)
+	topoFanTraces int64 // traces with >=1 dropped fan-out
+	topoCorrectF  int64 // topology-correct among the dropped-fan-out traces
+	topoTrueSib   int64
+	topoRecall    int64
+	topoReconSib  int64
+	topoPrec      int64
+
 	cpd      int
 	wrongLog *os.File // non-nil: wrong-edge classification dump
 
@@ -194,6 +217,23 @@ type harness struct {
 	verifyOn   bool
 	verifyCfg  verify.Config
 	violations int
+
+	// only: if non-nil, reconstruct ONLY these trace IDs (--only-traces). The
+	// drop RNG still advances for every trace, so survivors are bit-identical.
+	only map[uint64]bool
+
+	dumpOnly bool // capture-only: skip reconstruction after dumping
+
+	// dumpW: if non-nil (--dump-survivors), each reconstructed trace's decoded
+	// input (survivors+truth+dropped+cfg) is gob-streamed here for offline replay.
+	dumpW *recon.DumpWriter
+
+	// inflight: tids currently being reconstructed -> start time (watchdog,
+	// TRACE_RECON_WATCHDOG=<secs>). A background goroutine logs any tid in
+	// flight longer than the threshold, so a single grinding monster trace
+	// self-identifies at the tail without waiting for it to finish.
+	inflight   map[uint64]time.Time
+	inflightMu sync.Mutex
 }
 
 type finishJob struct {
@@ -216,8 +256,12 @@ type wrongRec struct {
 
 type spanKey struct{ traceID, spanID uint64 }
 
-func newHarness(c config) *harness {
-	var h bridge.Handler
+// makeHandler builds a fresh bridge handler and the matching reconstruction
+// Config for the given mode. Factored out of newHarness so the trace-store
+// pipeline can give each parallel replay worker its own handler instance
+// (handler state is strictly per-trace, so a per-worker handler reused across
+// traces with EvictTrace is identical to the shared streaming handler).
+func makeHandler(c config) (bridge.Handler, recon.Config) {
 	cfg := recon.NewConfig(c.checkpointDistance, c.bloomFP)
 	cfg.BottomUp = c.bottomUp
 	cfg.ChainCheck = c.chainCheck
@@ -226,7 +270,7 @@ func newHarness(c config) *harness {
 		ph := bridge.NewPCRBridgeHandler(c.checkpointDistance, c.prefixLen)
 		ph.Capture = true
 		cfg.PrefixLen = c.prefixLen
-		h = ph
+		return ph, cfg
 	case "pcrb", "pcrs":
 		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		ph.Capture = true
@@ -237,14 +281,28 @@ func newHarness(c config) *harness {
 		pcrbCfg.BottomUp, pcrbCfg.ChainCheck = cfg.BottomUp, cfg.ChainCheck
 		pcrbCfg.StopOnGap = c.stopOnGap
 		pcrbCfg.TiePolicy = c.tiePolicy
-		cfg = pcrbCfg
-		h = ph
+		return ph, pcrbCfg
+	case "cgprb":
+		// Call-graph-preserving: PCRB payload + window-local hash array. Same
+		// checkpoint-root + bloom geometry as PCRB, so it shares the PCRB
+		// config; reconstruction additionally consumes the HA.
+		ph := bridge.NewCGPRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
+		ph.Capture = true
+		pcrbCfg := recon.NewPCRBConfig(c.checkpointDistance, c.prefixLen, c.bloomFP)
+		pcrbCfg.BottomUp, pcrbCfg.ChainCheck = cfg.BottomUp, cfg.ChainCheck
+		pcrbCfg.StopOnGap = c.stopOnGap
+		pcrbCfg.TiePolicy = c.tiePolicy
+		return ph, pcrbCfg
 	default: // pb
 		pb := bridge.NewPathBridgeHandler(c.checkpointDistance, c.bloomFP)
 		pb.EmitDepth = true
 		pb.Capture = true
-		h = pb
+		return pb, cfg
 	}
+}
+
+func newHarness(c config) *harness {
+	h, cfg := makeHandler(c)
 	var wlog *os.File
 	if c.classifyWrong != "" {
 		f, err := os.Create(c.classifyWrong)
@@ -261,6 +319,7 @@ func newHarness(c config) *harness {
 	ha := &harness{
 		h:          h,
 		mode:       c.mode,
+		topoOn:     os.Getenv("TRACE_RECON_TOPO") == "1",
 		cpd:        c.checkpointDistance,
 		wrongLog:   wlog,
 		cfg:        cfg,
@@ -289,6 +348,51 @@ func newHarness(c config) *harness {
 		ha.verifyOn = true
 		ha.verifyCfg = verify.Config{PrefixLen: cfg.PrefixLen, BloomM: cfg.BloomM, BloomK: cfg.BloomK, PCRBTypeByte: byte(bridge.PCRBBridgeTypeID), CPD: cfg.CPD}
 	}
+	if c.onlyTraces != "" {
+		ha.only = make(map[uint64]bool)
+		for _, h := range strings.Split(c.onlyTraces, ",") {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				continue
+			}
+			id, err := strconv.ParseUint(h, 16, 64)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "bad --only-traces hex %q: %v\n", h, err)
+				os.Exit(2)
+			}
+			ha.only[id] = true
+		}
+		fmt.Fprintf(os.Stderr, "only-traces: reconstructing %d trace(s) only\n", len(ha.only))
+	}
+	if c.dumpSurvivors != "" {
+		dw, err := recon.NewDumpWriter(c.dumpSurvivors)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dump-survivors: %v\n", err)
+			os.Exit(1)
+		}
+		ha.dumpW = dw
+		ha.dumpOnly = c.dumpOnly
+	}
+	// Watchdog: log any trace in flight longer than TRACE_RECON_WATCHDOG secs.
+	if w := os.Getenv("TRACE_RECON_WATCHDOG"); w != "" {
+		if secs, err := strconv.Atoi(w); err == nil && secs > 0 {
+			ha.inflight = make(map[uint64]time.Time)
+			go func() {
+				thresh := time.Duration(secs) * time.Second
+				for {
+					time.Sleep(time.Duration(secs) * time.Second)
+					now := time.Now()
+					ha.inflightMu.Lock()
+					for tid, t0 := range ha.inflight {
+						if d := now.Sub(t0); d >= thresh {
+							fmt.Fprintf(os.Stderr, "WATCHDOG tid=%016x in-flight %.0fs\n", tid, d.Seconds())
+						}
+					}
+					ha.inflightMu.Unlock()
+				}
+			}()
+		}
+	}
 	for i := 0; i < workers; i++ {
 		ha.wg.Add(1)
 		go func() {
@@ -305,6 +409,9 @@ func newHarness(c config) *harness {
 func (ha *harness) drain() {
 	close(ha.jobs)
 	ha.wg.Wait()
+	if ha.dumpW != nil {
+		ha.dumpW.Close()
+	}
 	if ha.audit != nil {
 		ha.audit.report()
 	}
@@ -314,8 +421,25 @@ func (ha *harness) drain() {
 	if ha.verifyOn {
 		fmt.Fprintf(os.Stderr, "VERIFY violations=%d\n", ha.violations)
 	}
-	if ha.mode == "pcrs" && os.Getenv("TRACE_RECON_DEBUG") == "1" {
+	// Ambiguity counters increment unconditionally; surface them either under
+	// full debug or via the dedicated TRACE_RECON_AMBIG flag (which avoids the
+	// per-cluster CLUSTER spam that TRACE_RECON_DEBUG also enables).
+	if ha.mode == "pcrs" && (os.Getenv("TRACE_RECON_DEBUG") == "1" || os.Getenv("TRACE_RECON_AMBIG") == "1") {
 		recon.DumpPCRSAmbiguity()
+	}
+	if ha.topoOn {
+		pct := func(num, den int64) float64 {
+			if den == 0 {
+				return 0
+			}
+			return 100 * float64(num) / float64(den)
+		}
+		fmt.Fprintf(os.Stderr,
+			"TOPO traces=%d topo_correct=%.4f%% conn_correct=%.4f%% | dropfanout_traces=%d topo_correct_among_them=%.4f%% | sib_recall=%.4f%% (%d/%d) sib_precision=%.4f%% (%d/%d)\n",
+			ha.topoTotal, pct(ha.topoCorrect, ha.topoTotal), pct(ha.topoConn, ha.topoTotal),
+			ha.topoFanTraces, pct(ha.topoCorrectF, ha.topoFanTraces),
+			pct(ha.topoRecall, ha.topoTrueSib), ha.topoRecall, ha.topoTrueSib,
+			pct(ha.topoPrec, ha.topoReconSib), ha.topoPrec, ha.topoReconSib)
 	}
 }
 
@@ -382,12 +506,29 @@ func (ha *harness) finishTrace(tid uint64) {
 			dropped[s.spanID] = struct{}{}
 		}
 	}
+	// --only-traces: the drop loop above still ran (RNG advanced identically),
+	// so survivors match a full run; we just skip the expensive reconstruct for
+	// non-target traces by not enqueueing them.
+	if ha.only != nil && !ha.only[tid] {
+		return
+	}
 	ha.jobs <- finishJob{tid: tid, spans: spans, dropped: dropped}
 }
 
 // process is the per-trace parallel work: decode, reconstruct, score.
 func (ha *harness) process(j finishJob) {
 	tid, spans, dropped := j.tid, j.spans, j.dropped
+
+	if ha.inflight != nil {
+		ha.inflightMu.Lock()
+		ha.inflight[tid] = time.Now()
+		ha.inflightMu.Unlock()
+		defer func() {
+			ha.inflightMu.Lock()
+			delete(ha.inflight, tid)
+			ha.inflightMu.Unlock()
+		}()
+	}
 
 	truth := make([]recon.TruthSpan, len(spans))
 	for i, s := range spans {
@@ -420,6 +561,17 @@ func (ha *harness) process(j finishJob) {
 				sp.CkptPrefix = prefix
 				sp.BloomBits = bits
 				sp.LeafCarrier = d%ha.cpd != 0
+			} else if ha.mode == "cgprb" {
+				d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
+					os.Exit(1)
+				}
+				sp.Depth = d
+				sp.CkptPrefix = prefix
+				sp.BloomBits = bits
+				sp.LeafCarrier = d%ha.cpd != 0
+				sp.HA = haEntries
 			} else {
 				d, bits, err := recon.DecodePBPayload(s.br, ha.cfg)
 				if err != nil {
@@ -431,6 +583,22 @@ func (ha *harness) process(j finishJob) {
 			}
 		}
 		survivors = append(survivors, sp)
+	}
+
+	if ha.dumpW != nil {
+		dropIDs := make([]uint64, 0, len(dropped))
+		for id := range dropped {
+			dropIDs = append(dropIDs, id)
+		}
+		if err := ha.dumpW.Write(recon.DumpedTrace{
+			TID: tid, Survivors: survivors, Truth: truth, Dropped: dropIDs, Cfg: ha.cfg,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "dump-survivors: %v\n", err)
+			os.Exit(1)
+		}
+		if ha.dumpOnly {
+			return // capture only: skip the (possibly slow) reconstruction
+		}
 	}
 
 	if ha.mode == "pcr" {
@@ -445,6 +613,9 @@ func (ha *harness) process(j finishJob) {
 		res := recon.ReconstructPCRS(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
 		ha.classifyWrong(tid, res, truth, dropped)
+		if ha.topoOn {
+			ha.addTopo(recon.ScoreCGPTopology(res, truth, dropped, tid))
+		}
 		if ha.audit != nil {
 			st := auditScores(res, truth, dropped, int64(tid))
 			ha.mu.Lock()
@@ -475,10 +646,49 @@ func (ha *harness) process(j finishJob) {
 				}
 			}
 		}
+	} else if ha.mode == "cgprb" {
+		var t0 time.Time
+		if slowReconMS > 0 {
+			t0 = time.Now()
+		}
+		res := recon.ReconstructCGPRB(survivors, ha.cfg)
+		if slowReconMS > 0 {
+			if ms := time.Since(t0).Milliseconds(); ms >= slowReconMS {
+				fmt.Fprintf(os.Stderr, "SLOWRECON tid=%016x survivors=%d ms=%d\n", tid, len(survivors), ms)
+			}
+		}
+		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
+		ha.classifyWrong(tid, res, truth, dropped)
+		if ha.topoOn {
+			ha.addTopo(recon.ScoreCGPTopology(res, truth, dropped, tid))
+		}
 	} else {
 		res := recon.ReconstructPB(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))
 	}
+}
+
+// addTopo accumulates one trace's call-graph-topology verdict (guarded by mu).
+func (ha *harness) addTopo(ts recon.TopoScore) {
+	ha.mu.Lock()
+	ha.topoTotal++
+	if ts.ConnCorrect {
+		ha.topoConn++
+	}
+	if ts.TopoCorrect {
+		ha.topoCorrect++
+	}
+	if ts.HasDropFanout {
+		ha.topoFanTraces++
+		if ts.TopoCorrect {
+			ha.topoCorrectF++
+		}
+	}
+	ha.topoTrueSib += int64(ts.TrueSibPairs)
+	ha.topoRecall += int64(ts.RecallPairs)
+	ha.topoReconSib += int64(ts.ReconSibPairs)
+	ha.topoPrec += int64(ts.PrecisionPairs)
+	ha.mu.Unlock()
 }
 
 // classifyWrong writes one JSONL record per bridge whose anchor is not a
@@ -622,12 +832,70 @@ type output struct {
 	NumOrphanOpenEnds  []int   `json:"num_orphan_open_ends,omitempty"`  // PCRB only
 }
 
+// slowReconMS: if >0 (set via TRACE_RECON_SLOW=<ms>), log any single cgprb
+// trace whose reconstruction takes at least this many ms. Diagnostic only.
+var slowReconMS = func() int64 {
+	if v := os.Getenv("TRACE_RECON_SLOW"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
+}()
+
 func main() {
 	c := parseFlags()
+
+	// CPU profile (TRACE_RECON_CPUPROF=<path>): diagnostic for the tail grind.
+	// TRACE_RECON_PROFAFTER=<n>: delay StartCPUProfile by n seconds so the
+	// window lands on the tail monster traces rather than the early bulk.
+	if p := os.Getenv("TRACE_RECON_CPUPROF"); p != "" {
+		f, err := os.Create(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cpuprof create: %v\n", err)
+			os.Exit(1)
+		}
+		startProf := func() {
+			if err := pprof.StartCPUProfile(f); err != nil {
+				fmt.Fprintf(os.Stderr, "cpuprof start: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		if after := os.Getenv("TRACE_RECON_PROFAFTER"); after != "" {
+			if secs, err := strconv.Atoi(after); err == nil && secs > 0 {
+				time.AfterFunc(time.Duration(secs)*time.Second, func() {
+					fmt.Fprintf(os.Stderr, "PROFAFTER: starting cpu profile at %ds\n", secs)
+					startProf()
+				})
+			} else {
+				startProf()
+			}
+		} else {
+			startProf()
+		}
+		defer pprof.StopCPUProfile()
+		// Timer-based flush (TRACE_RECON_PROFSECS=<n>): after n seconds, stop the
+		// profile, flush it, and exit cleanly. Reliable where signal delivery
+		// races default termination. Slow traces are interspersed throughout the
+		// corpus, so a short window captures the hot path.
+		if s := os.Getenv("TRACE_RECON_PROFSECS"); s != "" {
+			if secs, err := strconv.Atoi(s); err == nil && secs > 0 {
+				time.AfterFunc(time.Duration(secs)*time.Second, func() {
+					pprof.StopCPUProfile()
+					f.Close()
+					fmt.Fprintf(os.Stderr, "PROFSECS: cpu profile flushed after %ds, exiting\n", secs)
+					os.Exit(0)
+				})
+			}
+		}
+	}
+
 	ha := newHarness(c)
 
 	var traceOrder []uint64
-	if c.corpusDir != "" {
+	if c.traceStore != "" {
+		traceOrder = runFromTraceStore(c, ha)
+	} else if c.corpusDir != "" {
 		traceOrder = runFromCorpus(c, ha)
 	} else {
 		traceOrder = runFromJSON(c, ha)
@@ -650,7 +918,7 @@ func main() {
 	switch c.mode {
 	case "pcr":
 		out.PrefixLen = c.prefixLen
-	case "pcrb", "pcrs":
+	case "pcrb", "pcrs", "cgprb":
 		out.PrefixLen = c.prefixLen
 		out.BloomFP = c.bloomFP
 	default:
@@ -670,7 +938,7 @@ func main() {
 		out.NumUnanchored = append(out.NumUnanchored, sc.Unanchored)
 		out.NumSynthetic = append(out.NumSynthetic, sc.Synthetic)
 		out.NumBorrowed = append(out.NumBorrowed, sc.Borrowed)
-		if c.mode == "pcr" || c.mode == "pcrb" || c.mode == "pcrs" {
+		if c.mode == "pcr" || c.mode == "pcrb" || c.mode == "pcrs" || c.mode == "cgprb" {
 			out.NumFragmentsLost = append(out.NumFragmentsLost, sc.FragmentsLost)
 			out.NumSpansLost = append(out.NumSpansLost, sc.SpansLost)
 			out.NumAncestorsSkip = append(out.NumAncestorsSkip, sc.AncestorsSkipped)
@@ -858,6 +1126,169 @@ func runFromCorpus(c config, ha *harness) []uint64 {
 			continue
 		}
 		ha.onEvent(ce.TS, bridge.Kind(ce.Kind), ce.TraceID, ce.SpanID, ce.ParentID, ce.ServiceID)
+	}
+	return traceOrder
+}
+
+// replayTrace reconstructs one trace's collected spans by replaying its event
+// block through a per-worker handler — the exact span-building onEvent does in
+// the streaming path, but for one isolated trace. Handler state is strictly
+// per-trace, so feeding one trace's events to a fresh/evicted handler yields
+// byte-identical payloads to the interleaved streaming run. EvictTrace clears
+// the handler's per-trace state so the same handler can serve the next trace.
+func replayTrace(h bridge.Handler, st corpus.StoredTrace) []collSpan {
+	spans := make([]collSpan, 0, len(st.Events)/2)
+	idx := make(map[uint64]int, len(st.Events)/2)
+	nextSeq := make(map[uint64]int)
+	for i := range st.Events {
+		e := &st.Events[i]
+		ev := &bridge.Event{TraceID: st.TraceID, SpanID: e.SpanID, ParentID: e.ParentID, ServiceID: e.ServiceID}
+		if e.Kind == corpus.KindStart {
+			seqNum := 0
+			if e.ParentID != 0 {
+				seqNum = nextSeq[e.ParentID] + 1
+				nextSeq[e.ParentID] = seqNum
+			}
+			r := h.OnStart(ev, seqNum)
+			idx[e.SpanID] = len(spans)
+			spans = append(spans, collSpan{spanID: e.SpanID, parentID: e.ParentID, depth: -1, br: r.Payload})
+		} else {
+			r := h.OnEnd(ev)
+			if j, ok := idx[e.SpanID]; ok {
+				spans[j].depth = r.Depth
+				if r.Payload != nil {
+					spans[j].br = r.Payload
+				}
+			}
+		}
+	}
+	h.EvictTrace(st.TraceID)
+	return spans
+}
+
+// runFromTraceStore is the parallel pipeline: a per-trace store (in completion
+// order) is read sequentially; each trace's handler replay runs on a worker
+// pool (the expensive part the single global stream forced to be serial);
+// results are re-sequenced into completion order for a cheap serial drop pass
+// (reproducing the global RNG exactly), then handed to the existing
+// reconstruction worker pool. Results are bit-identical to runFromCorpus.
+func runFromTraceStore(c config, ha *harness) []uint64 {
+	if c.corpusDir == "" {
+		fmt.Fprintln(os.Stderr, "error: --trace-store also needs --corpus (for meta: trace order)")
+		os.Exit(2)
+	}
+	_, metaPath := corpus.Paths(c.corpusDir)
+	meta, err := corpus.ReadMeta(metaPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error reading meta: %v\n", err)
+		os.Exit(1)
+	}
+	traceOrder := append([]uint64(nil), meta.TraceOrder...)
+	if c.traceCount > 0 && c.traceCount < len(traceOrder) {
+		traceOrder = traceOrder[:c.traceCount]
+	}
+	selected := make(map[uint64]bool, len(traceOrder))
+	for _, tid := range traceOrder {
+		selected[tid] = true
+	}
+
+	r, err := corpus.OpenTraceStore(c.traceStore)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open trace store: %v\n", err)
+		os.Exit(1)
+	}
+
+	nw := c.workers
+	if nw <= 0 {
+		nw = runtime.NumCPU()
+	}
+	fmt.Fprintf(os.Stderr, "Trace store: %d traces selected, %d parallel replay workers\n", len(traceOrder), nw)
+
+	type seqTrace struct {
+		seq int
+		st  corpus.StoredTrace
+	}
+	type prepped struct {
+		seq   int
+		tid   uint64
+		spans []collSpan
+	}
+	inCh := make(chan seqTrace, nw*2)
+	outCh := make(chan prepped, nw*2)
+
+	// Reader: stream blocks in completion order, assign a contiguous sequence
+	// number to each SELECTED trace (so the drop pass below can re-impose
+	// completion order and consume the RNG exactly as streaming does).
+	go func() {
+		seq := 0
+		for {
+			st, err := r.Next()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				fmt.Fprintf(os.Stderr, "trace store read: %v\n", err)
+				os.Exit(1)
+			}
+			if !selected[st.TraceID] {
+				continue
+			}
+			inCh <- seqTrace{seq: seq, st: st}
+			seq++
+		}
+		close(inCh)
+		r.Close()
+	}()
+
+	// Phase 1 (parallel): handler replay. Each worker owns one handler.
+	var p1wg sync.WaitGroup
+	for i := 0; i < nw; i++ {
+		p1wg.Add(1)
+		go func() {
+			defer p1wg.Done()
+			h, _ := makeHandler(c)
+			for stx := range inCh {
+				outCh <- prepped{seq: stx.seq, tid: stx.st.TraceID, spans: replayTrace(h, stx.st)}
+			}
+		}()
+	}
+	go func() { p1wg.Wait(); close(outCh) }()
+
+	// Serializer (this goroutine): re-impose completion order via a reorder
+	// buffer, run the serial drop (global RNG), and dispatch to the existing
+	// reconstruction worker pool (ha.jobs). Drop visits br==nil spans in
+	// start-order and the RNG advances in completion order — identical to
+	// finishTrace, so the dropped set is bit-identical to streaming.
+	buf := make(map[int]prepped)
+	next := 0
+	dispatch := func(p prepped) {
+		dropped := make(map[uint64]struct{})
+		for _, s := range p.spans {
+			if s.br != nil {
+				continue
+			}
+			if ha.dropAll || ha.rng.Float64() < ha.rate {
+				dropped[s.spanID] = struct{}{}
+			}
+		}
+		// --only-traces: RNG already advanced above; skip the (expensive)
+		// reconstruction for non-target traces, mirroring finishTrace.
+		if ha.only != nil && !ha.only[p.tid] {
+			return
+		}
+		ha.jobs <- finishJob{tid: p.tid, spans: p.spans, dropped: dropped}
+	}
+	for p := range outCh {
+		buf[p.seq] = p
+		for {
+			q, ok := buf[next]
+			if !ok {
+				break
+			}
+			delete(buf, next)
+			next++
+			dispatch(q)
+		}
 	}
 	return traceOrder
 }

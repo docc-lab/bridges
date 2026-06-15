@@ -31,6 +31,14 @@ var fullsatNaming = os.Getenv("TRACE_RECON_FULLSAT_CGPB") == "1"
 // EnableFullsatCGPB turns on named-synthetic identity injection (--fullsat-cgpb).
 func EnableFullsatCGPB() { fullsatNaming = true }
 
+// fullsatNoParents ablates the intrinsic ParentID naming in ReconstructFullSAT
+// (--no-parents): when set, emitted bridges leave ReconFanout=0, so fragment
+// roots get private anonymous synthetic parents and siblings never coalesce.
+var fullsatNoParents bool
+
+// SetFullsatNoParents toggles the ParentID ablation (--no-parents).
+func SetFullsatNoParents(v bool) { fullsatNoParents = v }
+
 // fullsatDiag (TRACE_RECON_FSDIAG=1) prints per-cluster join-node / vote counts,
 // to check whether the HA mechanism is engaging at all.
 var fullsatDiag = os.Getenv("TRACE_RECON_FSDIAG") == "1"

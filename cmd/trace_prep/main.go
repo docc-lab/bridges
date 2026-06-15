@@ -54,6 +54,8 @@ func main() {
 		requireClean = flag.Bool("require-clean", true, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (Python parity)")
 		workers      = flag.Int("workers", runtime.NumCPU(), "Parallel parse workers")
 		progressN    = flag.Int("progress", 0, "Print progress every N files (0 = silent)")
+		stream       = flag.Bool("stream", false, "Stream events to events.bin per file (locally sorted), bounded memory — skips the global timestamp sort. events.bin is then per-trace-block ordered (correct for the trace-store path; only the streaming simulator needs global TS order). Use for large/unfiltered corpora that don't fit in RAM.")
+		archiveOut = flag.String("archive-out", "", "LEGACY (does not record lenient repair flags — prefer cmd/trace_archive). Stream a minimal per-trace ARCHIVE (corpus.Archive*) to this path: each trace's spans (SpanID, ParentID, ServiceID, start/end TS) are written as a 34-byte/span block, then freed. meta.bin (service names + trace order) is written alongside.")
 	)
 	flag.Parse()
 	if *inputDir == "" || *outputDir == "" {
@@ -121,8 +123,53 @@ func main() {
 	globalServices := loader.NewServiceTable()
 	resultByIdx := make([]*prepResult, len(files))
 	var allEvents []corpus.Event
+	// Per-event sort key (the order Python uses; applied globally in default
+	// mode, per-file in --stream mode).
+	less := func(a, b corpus.Event) bool {
+		if a.TS != b.TS {
+			return a.TS < b.TS
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		var ar, br int16
+		if a.Kind == corpus.KindStart {
+			ar, br = int16(a.Depth), int16(b.Depth)
+		} else {
+			ar, br = -int16(a.Depth), -int16(b.Depth)
+		}
+		if ar != br {
+			return ar < br
+		}
+		if a.TraceID != b.TraceID {
+			return a.TraceID < b.TraceID
+		}
+		return a.SpanID < b.SpanID
+	}
+
+	eventsPath, metaPath := corpus.Paths(*outputDir)
+	var ew *corpus.EventsWriter
+	if *stream && *archiveOut == "" {
+		var err error
+		if ew, err = corpus.CreateEvents(eventsPath); err != nil {
+			fmt.Fprintf(os.Stderr, "create events: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	// Direct archive streaming: per-trace span blocks written as files are parsed.
+	var aw *corpus.ArchiveWriter
+	var tsOrder []traceMeta // (traceID, spanCount) in block-write order = meta.TraceOrder
+	if *archiveOut != "" {
+		var err error
+		if aw, err = corpus.NewArchiveWriter(*archiveOut); err != nil {
+			fmt.Fprintf(os.Stderr, "create archive: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	skipped := 0
 	processed := 0
+	var written int64
 	for r := range results {
 		processed++
 		if r.err != nil {
@@ -138,74 +185,134 @@ func main() {
 		for i := range r.events {
 			r.events[i].ServiceID = remap[r.events[i].ServiceID]
 		}
-		allEvents = append(allEvents, r.events...)
+		if *archiveOut != "" {
+			// Direct minimal archive: group this file's events by trace, pair each
+			// span's start/end events into one ArchiveSpan, write the per-trace block,
+			// then free. Bounded memory; OOM-proof.
+			byTrace := make(map[uint64]map[uint64]*corpus.ArchiveSpan, len(r.traceMetas))
+			for i := range r.events {
+				e := &r.events[i]
+				sp := byTrace[e.TraceID]
+				if sp == nil {
+					sp = make(map[uint64]*corpus.ArchiveSpan)
+					byTrace[e.TraceID] = sp
+				}
+				a := sp[e.SpanID]
+				if a == nil {
+					a = &corpus.ArchiveSpan{SpanID: e.SpanID, ParentID: e.ParentID, ServiceID: e.ServiceID}
+					sp[e.SpanID] = a
+				}
+				if e.Kind == corpus.KindStart {
+					a.StartTS = e.TS
+				} else {
+					a.EndTS = e.TS
+				}
+			}
+			for _, tm := range r.traceMetas {
+				sp := byTrace[tm.traceID]
+				if len(sp) == 0 {
+					continue
+				}
+				spans := make([]corpus.ArchiveSpan, 0, len(sp))
+				for _, a := range sp {
+					spans = append(spans, *a)
+				}
+				sort.Slice(spans, func(i, j int) bool { return spans[i].SpanID < spans[j].SpanID })
+				// flags=0: this events-derived path can't see loader repair markers.
+				// Use cmd/trace_archive for repair-flag-aware archives.
+				if err := aw.WriteTrace(tm.traceID, 0, spans); err != nil {
+					fmt.Fprintf(os.Stderr, "write trace %016x: %v\n", tm.traceID, err)
+					os.Exit(1)
+				}
+				tsOrder = append(tsOrder, tm)
+				written += int64(len(spans))
+			}
+		} else if *stream {
+			// Bounded memory: locally sort this file's events and flush them now,
+			// then free. events.bin ends up per-file-block ordered, not globally
+			// TS-interleaved (correct for the trace-store path; corpus_split
+			// regroups by trace). Timestamps are preserved (Event.TS).
+			sort.Slice(r.events, func(i, j int) bool { return less(r.events[i], r.events[j]) })
+			for _, e := range r.events {
+				if err := ew.Write(e); err != nil {
+					fmt.Fprintf(os.Stderr, "write event: %v\n", err)
+					os.Exit(1)
+				}
+			}
+			written += int64(len(r.events))
+		} else {
+			allEvents = append(allEvents, r.events...)
+		}
 		// Free per-result storage we don't need beyond this point.
 		r.events = nil
 		r.localServices = nil
-		resultByIdx[r.fileIdx] = &r
+		if *archiveOut == "" {
+			resultByIdx[r.fileIdx] = &r // needed only for events.bin-mode TraceOrder
+		}
 
 		if *progressN > 0 && processed%*progressN == 0 {
+			n := int64(len(allEvents))
+			if *stream || *archiveOut != "" {
+				n = written
+			}
 			fmt.Fprintf(os.Stderr, "  parsed %d/%d files, %d events so far\n",
-				processed, len(files), len(allEvents))
+				processed, len(files), n)
 		}
+	}
+	nev := int64(len(allEvents))
+	if *stream || *archiveOut != "" {
+		nev = written
 	}
 	fmt.Fprintf(os.Stderr, "Parsed %d files (%d skipped) in %s with %d workers: %d events\n",
-		len(files), skipped, time.Since(t1).Round(time.Millisecond), *workers, len(allEvents))
+		len(files), skipped, time.Since(t1).Round(time.Millisecond), *workers, nev)
 
-	// Phase 3: assemble TraceOrder in alphabetical file order.
+	// Phase 3: assemble TraceOrder. Trace-store mode uses block-write order
+	// (tsOrder, which meta must match); events.bin modes use alphabetical order.
 	var traceOrder []traceMeta
-	for _, r := range resultByIdx {
-		if r == nil {
-			continue
+	if *archiveOut != "" {
+		traceOrder = tsOrder
+	} else {
+		for _, r := range resultByIdx {
+			if r == nil {
+				continue
+			}
+			traceOrder = append(traceOrder, r.traceMetas...)
 		}
-		traceOrder = append(traceOrder, r.traceMetas...)
 	}
 
-	// Phase 4: global event sort. Same key Python uses.
-	t2 := time.Now()
-	sort.Slice(allEvents, func(i, j int) bool {
-		a, b := allEvents[i], allEvents[j]
-		if a.TS != b.TS {
-			return a.TS < b.TS
-		}
-		if a.Kind != b.Kind {
-			return a.Kind < b.Kind
-		}
-		// start: shallower first; end: deeper first
-		var ar, br int16
-		if a.Kind == corpus.KindStart {
-			ar, br = int16(a.Depth), int16(b.Depth)
-		} else {
-			ar, br = -int16(a.Depth), -int16(b.Depth)
-		}
-		if ar != br {
-			return ar < br
-		}
-		if a.TraceID != b.TraceID {
-			return a.TraceID < b.TraceID
-		}
-		return a.SpanID < b.SpanID
-	})
-	fmt.Fprintf(os.Stderr, "Sorted %d events in %s\n",
-		len(allEvents), time.Since(t2).Round(time.Millisecond))
-
-	// Phase 5: write events.bin and meta.bin.
+	// Phase 4+5: finalize the event output. Trace-store and --stream are already
+	// written (just close); default mode global-sorts then writes events.bin.
 	t3 := time.Now()
-	eventsPath, metaPath := corpus.Paths(*outputDir)
-	ew, err := corpus.CreateEvents(eventsPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create events: %v\n", err)
-		os.Exit(1)
-	}
-	for _, e := range allEvents {
-		if err := ew.Write(e); err != nil {
-			fmt.Fprintf(os.Stderr, "write event: %v\n", err)
+	if *archiveOut != "" {
+		if err := aw.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close archive: %v\n", err)
 			os.Exit(1)
 		}
-	}
-	if err := ew.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "close events: %v\n", err)
-		os.Exit(1)
+	} else if *stream {
+		if err := ew.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close events: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		t2 := time.Now()
+		sort.Slice(allEvents, func(i, j int) bool { return less(allEvents[i], allEvents[j]) })
+		fmt.Fprintf(os.Stderr, "Sorted %d events in %s\n",
+			len(allEvents), time.Since(t2).Round(time.Millisecond))
+		ewd, err := corpus.CreateEvents(eventsPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create events: %v\n", err)
+			os.Exit(1)
+		}
+		for _, e := range allEvents {
+			if err := ewd.Write(e); err != nil {
+				fmt.Fprintf(os.Stderr, "write event: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		if err := ewd.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close events: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	traceIDs := make([]uint64, len(traceOrder))
@@ -223,11 +330,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "write meta: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "Wrote corpus in %s: %s, %s\n",
-		time.Since(t3).Round(time.Millisecond), eventsPath, metaPath)
+	dataPath := eventsPath
+	if *archiveOut != "" {
+		dataPath = *archiveOut
+	}
+	fmt.Fprintf(os.Stderr, "Wrote corpus in %s: %s, %s (%d traces)\n",
+		time.Since(t3).Round(time.Millisecond), dataPath, metaPath, len(traceOrder))
 
-	if eventsStat, err := os.Stat(eventsPath); err == nil {
-		fmt.Fprintf(os.Stderr, "events.bin: %.1f MB\n", float64(eventsStat.Size())/(1<<20))
+	if st, err := os.Stat(dataPath); err == nil {
+		fmt.Fprintf(os.Stderr, "%s: %.1f MB\n", filepath.Base(dataPath), float64(st.Size())/(1<<20))
 	}
 }
 

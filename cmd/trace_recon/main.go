@@ -46,6 +46,7 @@ type config struct {
 	fullsatPB          bool   // pcrs: solve each cluster as a general declarative CP-SAT model (full-SAT parity baseline; no HA)
 	fullsatCGPB        bool   // pcrs + HA: full-SAT model with named-synthetic identities (CGP) injected into the cluster occupancy
 	fullsatEngine      bool   // pcrs: the single-pass ReconstructFullSAT engine (anchoring + all rules as one CP-SAT model)
+	noParents          bool   // ablation: ignore the intrinsic ParentID naming (no sibling coalescing) even though it is available
 	timingPath         string // non-empty: write per-trace reconstruction timing CSV here
 	checkpointDistance int
 	dropRate           float64
@@ -67,6 +68,7 @@ type config struct {
 	dumpSurvivors      string // gob-dump each reconstructed trace's survivors+truth+dropped+cfg here (pair with --only-traces to capture one trace for offline replay via cmd/recon_one).
 	dumpOnly           bool   // with --dump-survivors: capture only, skip reconstruction (fast capture of slow traces)
 	traceStore         string // read a per-trace store (cmd/corpus_split output) instead of --corpus, running handler+drop+reconstruct per-trace in PARALLEL (bit-identical to streaming).
+	perTraceDropSeed   bool   // seed the drop RNG per-trace (from traceID+seed) instead of one global stream, so drops are independent of trace order/partitioning.
 }
 
 func parseFlags() config {
@@ -82,6 +84,7 @@ func parseFlags() config {
 	flag.StringVar(&c.timingPath, "timing", "", "Write a per-trace reconstruction-timing CSV here (tid,survivors,spans,dropped,recon_ns) and print a TIMING summary. (TRACE_RECON_TIMING=1 prints the summary without the CSV.)")
 	flag.BoolVar(&c.fullsatCGPB, "fullsat-cgpb", false, "PCRS + HA: the --fullsat-pb model plus named-synthetic identities from the hash array (CGP) injected into the cluster occupancy — hard fan-out coalescing + exclusivity. Requires --mode pcrs and the cpsat build tag.")
 	flag.BoolVar(&c.fullsatEngine, "fullsat", false, "PCRS: the single-pass ReconstructFullSAT engine — anchoring + all invariants compiled into one CP-SAT model per cluster, solved once (no pass-1 commit, no post-processing). Requires --mode pcrs and the cpsat build tag.")
+	flag.BoolVar(&c.noParents, "no-parents", false, "Ablation (--fullsat): ignore the intrinsic ParentID naming, so fragment roots get private anonymous synthetic parents and siblings never coalesce (pure connectivity, no recovered fan-out topology).")
 	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
 	flag.StringVar(&c.onlyTraces, "only-traces", "", "Diagnostic: comma-separated hex trace IDs to reconstruct ONLY (corpus still streams and drop RNG still advances for all traces, so survivors are bit-identical to a full run). Lets you repro a single slow trace in seconds.")
 	flag.StringVar(&c.dumpSurvivors, "dump-survivors", "", "Gob-dump each reconstructed trace's decoded survivors+truth+dropped+cfg to this file. Pair with --only-traces to capture one trace from a single corpus walk, then replay it offline with cmd/recon_one (no corpus walk).")
@@ -93,6 +96,7 @@ func parseFlags() config {
 	consistency := ""
 	flag.StringVar(&consistency, "consistency", "chain", "Anchor candidate consistency check: chain (test the candidate's nameable ancestry against the bloom) or none")
 	flag.Int64Var(&c.seed, "seed", 42, "RNG seed for the drop policy")
+	flag.BoolVar(&c.perTraceDropSeed, "per-trace-drop-seed", false, "Seed the drop RNG per-trace from (traceID, seed) and draw over spans in spanID order, so each trace drops the same spans regardless of processing order or corpus partitioning. Required for partition-invariant parallel sweeps; differs bit-wise from the legacy global-stream drops.")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to process (0 = all). Corpus mode: first N of the corpus trace order; events of other traces are skipped during streaming")
 	flag.BoolVar(&c.requireClean, "require-clean", true, "Cleanliness filter (JSON mode only)")
 	flag.StringVar(&c.classifyWrong, "classify-wrong", "", "Write one JSONL record per wrong-edge bridge (anchor not a true ancestor) locating the divergence against truth")
@@ -128,6 +132,7 @@ func parseFlags() config {
 	if c.fullsatPB || c.fullsatCGPB || c.fullsatEngine {
 		recon.EnableFullsatPB(c.seed, 0) // fixed seed for machine-independent results
 	}
+	recon.SetFullsatNoParents(c.noParents) // ablation: drop intrinsic ParentID naming
 	if c.fullsatEngine && c.mode != "pcrs" {
 		fmt.Fprintf(os.Stderr, "error: --fullsat requires --mode pcrs (got %q)\n", c.mode)
 		os.Exit(2)
@@ -197,9 +202,11 @@ type harness struct {
 	mode          string // "pb" or "pcr": selects payload decode + reconstruction
 	fullsatEngine bool   // pcrs mode: use the single-pass ReconstructFullSAT engine
 	cfg           recon.Config
-	rng     *rand.Rand
-	dropAll bool
-	rate    float64
+	rng          *rand.Rand
+	dropAll      bool
+	rate         float64
+	seed         int64 // base drop seed (for per-trace reseeding)
+	perTraceSeed bool  // reseed the drop RNG per-trace (order/partition-invariant)
 
 	spansByTID map[uint64][]collSpan
 	idxByKey   map[spanKey]int
@@ -374,9 +381,11 @@ func newHarness(c config) *harness {
 		cpd:        c.checkpointDistance,
 		wrongLog:   wlog,
 		cfg:        cfg,
-		rng:        rand.New(rand.NewSource(c.seed)),
-		dropAll:    c.dropRate >= 1.0,
-		rate:       c.dropRate,
+		rng:          rand.New(rand.NewSource(c.seed)),
+		dropAll:      c.dropRate >= 1.0,
+		rate:         c.dropRate,
+		seed:         c.seed,
+		perTraceSeed: c.perTraceDropSeed,
 		spansByTID: make(map[uint64][]collSpan),
 		idxByKey:   make(map[spanKey]int),
 		openByTID:  make(map[uint64]int),
@@ -538,9 +547,63 @@ func (ha *harness) onEvent(ts int64, kind bridge.Kind, tid, sid, pid uint64, ser
 	}
 }
 
-// finishTrace frees the trace's collection state, makes the drop decisions
-// SERIALLY (global RNG order preserved -> bit-identical results regardless
-// of worker count), and hands reconstruction+scoring to the worker pool.
+// mixSeed derives a per-trace drop seed from the trace ID and the base seed
+// (splitmix64), so a trace's drop set depends only on its own ID — not on where
+// it falls in the stream or which partition it lands in.
+func mixSeed(tid uint64, base int64) int64 {
+	x := tid + uint64(base)*0x9E3779B97F4A7C15
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	x ^= x >> 31
+	return int64(x)
+}
+
+// computeDropped applies the drop policy to a trace's spans. Only non-checkpoint
+// spans (no _br) are candidates; _br carriers are never dropped. With
+// perTraceSeed, draws come from a per-trace RNG over spans in spanID order, so
+// the result is independent of processing order / corpus partitioning;
+// otherwise it advances the single global RNG stream (legacy, order-dependent).
+func (ha *harness) computeDropped(tid uint64, spans []collSpan) map[uint64]struct{} {
+	dropped := make(map[uint64]struct{})
+	if ha.dropAll {
+		for _, s := range spans {
+			if s.br == nil {
+				dropped[s.spanID] = struct{}{}
+			}
+		}
+		return dropped
+	}
+	if ha.perTraceSeed {
+		cands := make([]uint64, 0, len(spans))
+		for _, s := range spans {
+			if s.br == nil {
+				cands = append(cands, s.spanID)
+			}
+		}
+		sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
+		rng := rand.New(rand.NewSource(mixSeed(tid, ha.seed)))
+		for _, id := range cands {
+			if rng.Float64() < ha.rate {
+				dropped[id] = struct{}{}
+			}
+		}
+		return dropped
+	}
+	for _, s := range spans {
+		if s.br != nil {
+			continue
+		}
+		if ha.rng.Float64() < ha.rate {
+			dropped[s.spanID] = struct{}{}
+		}
+	}
+	return dropped
+}
+
+// finishTrace frees the trace's collection state, makes the drop decisions, and
+// hands reconstruction+scoring to the worker pool. Drops are bit-identical
+// regardless of worker count; with --per-trace-drop-seed they are also identical
+// across corpus partitionings (see computeDropped).
 func (ha *harness) finishTrace(tid uint64) {
 	spans := ha.spansByTID[tid]
 	delete(ha.spansByTID, tid)
@@ -551,15 +614,7 @@ func (ha *harness) finishTrace(tid uint64) {
 
 	// Drop policy: only non-checkpoint spans (no _br) are candidates;
 	// _br carriers ride the high-priority queue and are never dropped.
-	dropped := make(map[uint64]struct{})
-	for _, s := range spans {
-		if s.br != nil {
-			continue
-		}
-		if ha.dropAll || ha.rng.Float64() < ha.rate {
-			dropped[s.spanID] = struct{}{}
-		}
-	}
+	dropped := ha.computeDropped(tid, spans)
 	// --only-traces: the drop loop above still ran (RNG advanced identically),
 	// so survivors match a full run; we just skip the expensive reconstruct for
 	// non-target traces by not enqueueing them.
@@ -867,10 +922,21 @@ func (ha *harness) scoresStore(tid uint64, sc recon.Score) {
 			}
 			return 100 * float64(x) / float64(y)
 		}
-		fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds exact=%.2f%% benign=%.2f%% wrong=%.4f%% tr=%.2f%% oe=%.4f%% lost=%.3f%% placed=%d\n",
+		topoStr := ""
+		if ha.topoOn {
+			tc, tcf := 100.0, 100.0
+			if ha.topoTotal > 0 {
+				tc = 100 * float64(ha.topoCorrect) / float64(ha.topoTotal)
+			}
+			if ha.topoFanTraces > 0 {
+				tcf = 100 * float64(ha.topoCorrectF) / float64(ha.topoFanTraces)
+			}
+			topoStr = fmt.Sprintf(" topo_correct=%.4f%% topo_df=%.4f%%", tc, tcf)
+		}
+		fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds exact=%.2f%% benign=%.2f%% wrong=%.4f%% tr=%.2f%% oe=%.4f%% lost=%.3f%% placed=%d%s\n",
 			n, int(time.Since(ha.prog.start).Seconds()),
 			den(p.c, r), den(p.a-p.c, r), den(p.w, r), den(p.affected, n),
-			den(p.oem, p.oe), den(p.lost, p.spans), p.placed)
+			den(p.oem, p.oe), den(p.lost, p.spans), p.placed, topoStr)
 	}
 }
 
@@ -1379,15 +1445,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 	buf := make(map[int]prepped)
 	next := 0
 	dispatch := func(p prepped) {
-		dropped := make(map[uint64]struct{})
-		for _, s := range p.spans {
-			if s.br != nil {
-				continue
-			}
-			if ha.dropAll || ha.rng.Float64() < ha.rate {
-				dropped[s.spanID] = struct{}{}
-			}
-		}
+		dropped := ha.computeDropped(p.tid, p.spans)
 		// --only-traces: RNG already advanced above; skip the (expensive)
 		// reconstruction for non-target traces, mirroring finishTrace.
 		if ha.only != nil && !ha.only[p.tid] {

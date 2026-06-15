@@ -77,7 +77,7 @@ func main() {
 			continue // event of a trace not in meta (shouldn't happen)
 		}
 		buckets[tid] = append(buckets[tid], corpus.StoredEvent{
-			Kind: ce.Kind, SpanID: ce.SpanID, ParentID: ce.ParentID, ServiceID: ce.ServiceID,
+			Kind: ce.Kind, SpanID: ce.SpanID, ParentID: ce.ParentID, ServiceID: ce.ServiceID, TS: ce.TS,
 		})
 		r--
 		remaining[tid] = r

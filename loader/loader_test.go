@@ -189,3 +189,86 @@ func TestNoCleanPassesMultiRootThrough(t *testing.T) {
 		t.Fatalf("want all 3 spans without cleaning, got %+v", traces)
 	}
 }
+
+// spanDur builds a raw span with a custom duration (to create conflicting
+// duplicate-ID data for the dedup test).
+func spanDur(id, parent string, dur int64) map[string]any {
+	s := span(id, parent)
+	s["duration"] = dur
+	return s
+}
+
+func loadLenient(t *testing.T, spans []map[string]any) []Trace {
+	t.Helper()
+	traces, err := LoadTraceFile(writeTrace(t, spans), NewServiceTable(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return traces
+}
+
+func TestLenientDanglingSubtreePrunedAndFlagged(t *testing.T) {
+	// a1<-a2 is a clean tree; c1 references an absent parent, c2 hangs off c1.
+	// The c-subtree is dropped, the trace is kept, and the flag is set.
+	traces := loadLenient(t, []map[string]any{
+		span("a1", ""),
+		span("a2", "a1"),
+		span("c1", "dead"),
+		span("c2", "c1"),
+	})
+	if len(traces) != 1 {
+		t.Fatalf("want 1 trace kept, got %d", len(traces))
+	}
+	ids := spanIDs(traces[0])
+	if len(ids) != 2 || !ids[0xa1] || !ids[0xa2] {
+		t.Fatalf("want spans {a1,a2} after pruning dangling subtree, got %v", ids)
+	}
+	if traces[0].Flags&FlagPrunedDangling == 0 {
+		t.Fatalf("want FlagPrunedDangling set, got flags=%#x", traces[0].Flags)
+	}
+}
+
+func TestLenientCycleRejectsWholeTrace(t *testing.T) {
+	// A valid tree plus a 2-cycle (x1<->x2). A cycle is corrupt, not a
+	// repairable fragment, so the entire trace is rejected.
+	traces := loadLenient(t, []map[string]any{
+		span("a1", ""),
+		span("a2", "a1"),
+		span("e1", "e2"),
+		span("e2", "e1"),
+	})
+	if len(traces) != 0 {
+		t.Fatalf("want trace rejected (cycle present), got %+v", traces)
+	}
+}
+
+func TestLenientIdenticalDuplicateCollapsed(t *testing.T) {
+	// Two identical a2 spans collapse to one; trace kept, dedup flag set.
+	traces := loadLenient(t, []map[string]any{
+		span("a1", ""),
+		span("a2", "a1"),
+		span("a2", "a1"),
+	})
+	if len(traces) != 1 {
+		t.Fatalf("want 1 trace, got %d", len(traces))
+	}
+	ids := spanIDs(traces[0])
+	if len(ids) != 2 || !ids[0xa1] || !ids[0xa2] {
+		t.Fatalf("want spans {a1,a2} after collapsing identical dup, got %v", ids)
+	}
+	if traces[0].Flags&FlagDedupedSpans == 0 {
+		t.Fatalf("want FlagDedupedSpans set, got flags=%#x", traces[0].Flags)
+	}
+}
+
+func TestLenientConflictingDuplicateRejected(t *testing.T) {
+	// Same span ID with different data (duration) is untrustworthy: reject.
+	traces := loadLenient(t, []map[string]any{
+		span("a1", ""),
+		spanDur("a2", "a1", 1000),
+		spanDur("a2", "a1", 9999),
+	})
+	if len(traces) != 0 {
+		t.Fatalf("want trace rejected (conflicting duplicate), got %+v", traces)
+	}
+}

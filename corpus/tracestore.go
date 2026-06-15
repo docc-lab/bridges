@@ -17,13 +17,14 @@ import (
 // reproduce the global drop RNG sequence exactly with a cheap serial pass,
 // while the expensive handler + reconstruction run per-trace in parallel.
 //
-// Only the fields onEvent actually consumes are stored: event order (implicit
-// in block order), Kind, SpanID, ParentID, ServiceID. Timestamp and depth are
-// omitted — onEvent ignores ts, and depth comes from the handler (OnEnd), not
-// the event.
+// Stored per event: Kind, SpanID, ParentID, ServiceID, and TS (the start/end
+// timestamp). Recon's onEvent ignores ts and derives depth from the handler,
+// but TS is retained so the store is a complete per-trace record (S-Bridge /
+// critical-path analysis need it). Event order is implicit in block order.
 //
-// Block layout (little-endian): TraceID uint64, NEvents uint32, then NEvents ×
-// { Kind uint8, SpanID uint64, ParentID uint64, ServiceID uint16 }.
+// File header (little-endian): Magic uint32 ("TSTR") + Version uint32.
+// Block layout: TraceID uint64, NEvents uint32, then NEvents ×
+// { Kind uint8, SpanID uint64, ParentID uint64, ServiceID uint16, TS int64 }.
 
 // StoredEvent is one start/end event in a trace's block, in stream order.
 type StoredEvent struct {
@@ -31,9 +32,19 @@ type StoredEvent struct {
 	SpanID    uint64
 	ParentID  uint64
 	ServiceID uint16
+	TS        int64 // start/end timestamp (store v2+)
 }
 
-const storedEventBytes = 1 + 8 + 8 + 2 // 19
+const storedEventBytes = 1 + 8 + 8 + 2 + 8 // 27
+
+// Trace-store file header. v2 added per-event TS; a v1 (headerless, 19-byte
+// record) store is rejected on open so it can't be silently misread at the new
+// record size.
+const (
+	traceStoreMagic    uint32 = 0x54535452 // "TSTR"
+	traceStoreVersion  uint32 = 2
+	traceStoreHdrBytes        = 8
+)
 
 // StoredTrace is one decoded per-trace block.
 type StoredTrace struct {
@@ -55,7 +66,15 @@ func NewTraceStoreWriter(path string) (*TraceStoreWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TraceStoreWriter{f: f, w: bufio.NewWriterSize(f, 1<<20), buf: make([]byte, 0, 4096)}, nil
+	w := &TraceStoreWriter{f: f, w: bufio.NewWriterSize(f, 1<<20), buf: make([]byte, 0, 4096)}
+	var h [traceStoreHdrBytes]byte
+	binary.LittleEndian.PutUint32(h[0:], traceStoreMagic)
+	binary.LittleEndian.PutUint32(h[4:], traceStoreVersion)
+	if _, err := w.w.Write(h[:]); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return w, nil
 }
 
 // WriteTrace appends one trace's block.
@@ -74,6 +93,7 @@ func (w *TraceStoreWriter) WriteTrace(tid uint64, events []StoredEvent) error {
 		binary.LittleEndian.PutUint64(b[off+1:], e.SpanID)
 		binary.LittleEndian.PutUint64(b[off+9:], e.ParentID)
 		binary.LittleEndian.PutUint16(b[off+17:], e.ServiceID)
+		binary.LittleEndian.PutUint64(b[off+19:], uint64(e.TS))
 		off += storedEventBytes
 	}
 	if _, err := w.w.Write(b); err != nil {
@@ -108,7 +128,17 @@ func OpenTraceStore(path string) (*TraceStoreReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TraceStoreReader{f: f, r: bufio.NewReaderSize(f, 1<<20), hdr: make([]byte, 12)}, nil
+	r := &TraceStoreReader{f: f, r: bufio.NewReaderSize(f, 1<<20), hdr: make([]byte, 12)}
+	var h [traceStoreHdrBytes]byte
+	if _, err := io.ReadFull(r.r, h[:]); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("trace store header: %w", err)
+	}
+	if binary.LittleEndian.Uint32(h[0:]) != traceStoreMagic || binary.LittleEndian.Uint32(h[4:]) != traceStoreVersion {
+		f.Close()
+		return nil, fmt.Errorf("trace store %s: bad magic/version (need v%d — rebuild it)", path, traceStoreVersion)
+	}
+	return r, nil
 }
 
 // Next reads the next trace block. Returns io.EOF cleanly at end-of-stream.
@@ -133,6 +163,7 @@ func (r *TraceStoreReader) Next() (StoredTrace, error) {
 			SpanID:    binary.LittleEndian.Uint64(body[off+1:]),
 			ParentID:  binary.LittleEndian.Uint64(body[off+9:]),
 			ServiceID: binary.LittleEndian.Uint16(body[off+17:]),
+			TS:        int64(binary.LittleEndian.Uint64(body[off+19:])),
 		}
 		off += storedEventBytes
 	}

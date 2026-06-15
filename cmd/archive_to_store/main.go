@@ -24,6 +24,60 @@ import (
 	"bridges/corpus"
 )
 
+// keepLargestTree applies the multi-root salvage: among the ParentID==0-rooted
+// trees in a trace, keep only the largest (by reachable span count; ties broken
+// by lowest root SpanID, matching loader's strict salvage), drop the rest.
+// Single-root traces are returned unchanged. The archive has no dangling spans
+// (the lenient loader pruned them at archive time), so reachable-from-root ==
+// the whole tree.
+func keepLargestTree(spans []corpus.ArchiveSpan) []corpus.ArchiveSpan {
+	idIdx := make(map[uint64]int, len(spans))
+	for i := range spans {
+		idIdx[spans[i].SpanID] = i
+	}
+	children := make(map[uint64][]int)
+	var roots []int
+	for i := range spans {
+		if spans[i].ParentID == 0 {
+			roots = append(roots, i)
+		} else if _, ok := idIdx[spans[i].ParentID]; ok {
+			children[spans[i].ParentID] = append(children[spans[i].ParentID], i)
+		}
+	}
+	if len(roots) <= 1 {
+		return spans
+	}
+	best, bestSize := -1, -1
+	var bestKeep []bool
+	for _, r := range roots {
+		keep := make([]bool, len(spans))
+		stack := []int{r}
+		sz := 0
+		for len(stack) > 0 {
+			c := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if keep[c] {
+				continue
+			}
+			keep[c] = true
+			sz++
+			for _, ch := range children[spans[c].SpanID] {
+				stack = append(stack, ch)
+			}
+		}
+		if sz > bestSize || (sz == bestSize && spans[r].SpanID < spans[best].SpanID) {
+			best, bestSize, bestKeep = r, sz, keep
+		}
+	}
+	out := make([]corpus.ArchiveSpan, 0, bestSize)
+	for i := range spans {
+		if bestKeep[i] {
+			out = append(out, spans[i])
+		}
+	}
+	return out
+}
+
 // ev is a per-trace event with depth, used only to order events within a trace.
 type ev struct {
 	ts        int64
@@ -40,6 +94,7 @@ func main() {
 	storeOut := flag.String("store", "", "output trace-store path")
 	metaOutDir := flag.String("meta-out", "", "output dir for this partition's meta.bin (services + trace order)")
 	progressN := flag.Int("progress", 0, "print progress every N traces (0 = silent)")
+	salvage := flag.Bool("salvage-multiroot", true, "multi-root cleaning: keep only the largest ParentID==0 tree per trace, drop the rest (matches the strict-corpus salvage). Archive stays lossless; this cleans at store-build time.")
 	flag.Parse()
 	if *archivePath == "" || *metaIn == "" || *storeOut == "" || *metaOutDir == "" {
 		fmt.Fprintln(os.Stderr, "usage: archive_to_store --archive A.arc --meta full_meta.bin --store out.store --meta-out DIR")
@@ -65,7 +120,7 @@ func main() {
 	t0 := time.Now()
 	var traceIDs []uint64
 	var spanCounts []uint32
-	var nt, ns int64
+	var nt, ns, nSalvaged int64
 	for {
 		tr, err := r.Next()
 		if err == io.EOF {
@@ -77,6 +132,13 @@ func main() {
 		}
 		if len(tr.Spans) == 0 {
 			continue
+		}
+		if *salvage {
+			before := len(tr.Spans)
+			tr.Spans = keepLargestTree(tr.Spans)
+			if len(tr.Spans) != before {
+				nSalvaged++
+			}
 		}
 		// depth from topology (memoized over this trace's spans).
 		idx := make(map[uint64]int, len(tr.Spans))
@@ -160,6 +222,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "write meta: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Fprintf(os.Stderr, "multi-root salvage: %d traces reduced to largest tree\n", nSalvaged)
 	fmt.Fprintf(os.Stderr, "store: %d traces, %d spans in %s -> %s (meta %s)\n",
 		nt, ns, time.Since(t0).Round(time.Millisecond), *storeOut, metaPath)
 }

@@ -69,6 +69,8 @@ type config struct {
 	dumpOnly           bool   // with --dump-survivors: capture only, skip reconstruction (fast capture of slow traces)
 	traceStore         string // read a per-trace store (cmd/corpus_split output) instead of --corpus, running handler+drop+reconstruct per-trace in PARALLEL (bit-identical to streaming).
 	perTraceDropSeed   bool   // seed the drop RNG per-trace (from traceID+seed) instead of one global stream, so drops are independent of trace order/partitioning.
+	sampleCount        int    // if >0, process a RANDOM sample of this many traces (seeded) instead of the first traceCount; avoids prefix bias.
+	sampleSeed         int64  // seed for the random sample selection (independent of the drop seed)
 }
 
 func parseFlags() config {
@@ -98,6 +100,8 @@ func parseFlags() config {
 	flag.Int64Var(&c.seed, "seed", 42, "RNG seed for the drop policy")
 	flag.BoolVar(&c.perTraceDropSeed, "per-trace-drop-seed", false, "Seed the drop RNG per-trace from (traceID, seed) and draw over spans in spanID order, so each trace drops the same spans regardless of processing order or corpus partitioning. Required for partition-invariant parallel sweeps; differs bit-wise from the legacy global-stream drops.")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to process (0 = all). Corpus mode: first N of the corpus trace order; events of other traces are skipped during streaming")
+	flag.IntVar(&c.sampleCount, "sample", 0, "If >0, process a RANDOM sample of this many traces (uniform over the trace order, seeded by --sample-seed) instead of the first --trace-count. Avoids prefix bias; same seed => same sample across runs/cells.")
+	flag.Int64Var(&c.sampleSeed, "sample-seed", 1, "Seed for --sample trace selection (independent of the drop --seed)")
 	flag.BoolVar(&c.requireClean, "require-clean", true, "Cleanliness filter (JSON mode only)")
 	flag.StringVar(&c.classifyWrong, "classify-wrong", "", "Write one JSONL record per wrong-edge bridge (anchor not a true ancestor) locating the divergence against truth")
 	flag.IntVar(&c.workers, "workers", 0, "Reconstruction worker goroutines (0 = NumCPU). Drop decisions stay serial, so results are bit-identical at any worker count")
@@ -1278,12 +1282,7 @@ func runFromCorpus(c config, ha *harness) []uint64 {
 		os.Exit(1)
 	}
 	defer er.Close()
-	traceOrder := append([]uint64(nil), meta.TraceOrder...)
-	spanCounts := meta.SpanCounts
-	if c.traceCount > 0 && c.traceCount < len(traceOrder) {
-		traceOrder = traceOrder[:c.traceCount]
-		spanCounts = spanCounts[:c.traceCount]
-	}
+	traceOrder, spanCounts := pickTraces(meta.TraceOrder, meta.SpanCounts, c)
 	fmt.Fprintf(os.Stderr, "Opened corpus (%d traces, processing %d)\n",
 		len(meta.TraceOrder), len(traceOrder))
 
@@ -1355,6 +1354,42 @@ func replayTrace(h bridge.Handler, st corpus.StoredTrace) []collSpan {
 // results are re-sequenced into completion order for a cheap serial drop pass
 // (reproducing the global RNG exactly), then handed to the existing
 // reconstruction worker pool. Results are bit-identical to runFromCorpus.
+// pickTraces selects which traces to process: a uniform random sample of
+// c.sampleCount (seeded by c.sampleSeed) if set, else the first c.traceCount
+// (prefix), else all. counts (pass nil if unused) is kept aligned with the
+// returned order. The sample is re-sorted into original order for locality.
+func pickTraces(order []uint64, counts []uint32, c config) ([]uint64, []uint32) {
+	if c.sampleCount > 0 && c.sampleCount < len(order) {
+		idx := make([]int, len(order))
+		for i := range idx {
+			idx[i] = i
+		}
+		rng := rand.New(rand.NewSource(c.sampleSeed))
+		rng.Shuffle(len(idx), func(i, j int) { idx[i], idx[j] = idx[j], idx[i] })
+		idx = idx[:c.sampleCount]
+		sort.Ints(idx)
+		o := make([]uint64, len(idx))
+		var ct []uint32
+		if counts != nil {
+			ct = make([]uint32, len(idx))
+		}
+		for k, i := range idx {
+			o[k] = order[i]
+			if counts != nil {
+				ct[k] = counts[i]
+			}
+		}
+		return o, ct
+	}
+	if c.traceCount > 0 && c.traceCount < len(order) {
+		if counts != nil {
+			return order[:c.traceCount], counts[:c.traceCount]
+		}
+		return order[:c.traceCount], nil
+	}
+	return order, counts
+}
+
 func runFromTraceStore(c config, ha *harness) []uint64 {
 	if c.corpusDir == "" {
 		fmt.Fprintln(os.Stderr, "error: --trace-store also needs --corpus (for meta: trace order)")
@@ -1366,10 +1401,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 		fmt.Fprintf(os.Stderr, "error reading meta: %v\n", err)
 		os.Exit(1)
 	}
-	traceOrder := append([]uint64(nil), meta.TraceOrder...)
-	if c.traceCount > 0 && c.traceCount < len(traceOrder) {
-		traceOrder = traceOrder[:c.traceCount]
-	}
+	traceOrder, _ := pickTraces(meta.TraceOrder, nil, c)
 	selected := make(map[uint64]bool, len(traceOrder))
 	for _, tid := range traceOrder {
 		selected[tid] = true

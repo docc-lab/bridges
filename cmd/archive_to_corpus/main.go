@@ -19,12 +19,64 @@ import (
 	"bridges/loader"
 )
 
+// keepLargestTree applies the multi-root salvage: keep only the largest
+// ParentID==0 tree per trace (ties -> lowest root SpanID), matching the strict
+// corpus and archive_to_store. Single-root traces are returned unchanged.
+func keepLargestTree(spans []corpus.ArchiveSpan) []corpus.ArchiveSpan {
+	idIdx := make(map[uint64]int, len(spans))
+	for i := range spans {
+		idIdx[spans[i].SpanID] = i
+	}
+	children := make(map[uint64][]int)
+	var roots []int
+	for i := range spans {
+		if spans[i].ParentID == 0 {
+			roots = append(roots, i)
+		} else if _, ok := idIdx[spans[i].ParentID]; ok {
+			children[spans[i].ParentID] = append(children[spans[i].ParentID], i)
+		}
+	}
+	if len(roots) <= 1 {
+		return spans
+	}
+	best, bestSize := -1, -1
+	var bestKeep []bool
+	for _, r := range roots {
+		keep := make([]bool, len(spans))
+		stack := []int{r}
+		sz := 0
+		for len(stack) > 0 {
+			c := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if keep[c] {
+				continue
+			}
+			keep[c] = true
+			sz++
+			for _, ch := range children[spans[c].SpanID] {
+				stack = append(stack, ch)
+			}
+		}
+		if sz > bestSize || (sz == bestSize && spans[r].SpanID < spans[best].SpanID) {
+			best, bestSize, bestKeep = r, sz, keep
+		}
+	}
+	out := make([]corpus.ArchiveSpan, 0, bestSize)
+	for i := range spans {
+		if bestKeep[i] {
+			out = append(out, spans[i])
+		}
+	}
+	return out
+}
+
 func main() {
 	archivePath := flag.String("archive", "", "input archive (corpus.Archive)")
 	metaIn := flag.String("meta", "", "input meta.bin (service names + trace order)")
 	outDir := flag.String("output-dir", "", "output corpus dir (events.bin + meta.bin)")
 	excludePruned := flag.Bool("exclude-pruned", false, "skip traces that had dangling-parent subtrees pruned (FlagPrunedDangling)")
 	excludeDeduped := flag.Bool("exclude-deduped", false, "skip traces that had identical duplicate spans collapsed (FlagDedupedSpans)")
+	salvage := flag.Bool("salvage-multiroot", true, "multi-root cleaning: keep only the largest ParentID==0 tree per trace (matches the strict corpus and archive_to_store). Keeps the regenerated events.bin consistent with the salvaged store.")
 	flag.Parse()
 
 	var excludeMask uint8
@@ -68,6 +120,9 @@ func main() {
 		if excludeMask != 0 && tr.Flags&excludeMask != 0 {
 			nExcluded++
 			continue
+		}
+		if *salvage {
+			tr.Spans = keepLargestTree(tr.Spans)
 		}
 		nt++
 		keptIDs = append(keptIDs, tr.TraceID)

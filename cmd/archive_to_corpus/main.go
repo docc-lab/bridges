@@ -108,7 +108,16 @@ func main() {
 	defer r.Close()
 
 	t0 := time.Now()
-	var events []corpus.Event
+	// Pre-size the events slice to its upper-bound final length (2 events/span,
+	// from the meta span counts): one big allocation up front, so append never
+	// reallocates+copies. Those copies dominate and grow at billion-event scale
+	// (each doubling copies tens of GB); pre-sizing removes them and keeps the
+	// footprint flat instead of peaking ~2x during a realloc.
+	var totalSpans int64
+	for _, c := range meta.SpanCounts {
+		totalSpans += int64(c)
+	}
+	events := make([]corpus.Event, 0, int(2*totalSpans))
 	var keptIDs []uint64
 	var keptCounts []uint32
 	nt := 0

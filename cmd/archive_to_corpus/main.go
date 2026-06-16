@@ -12,7 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"time"
 
 	"bridges/corpus"
@@ -165,13 +165,20 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "sorting %d events (single silent step)...\n", len(events))
 	// Same global sort key as trace_prep.
-	sort.Slice(events, func(i, j int) bool {
-		a, b := events[i], events[j]
+	// slices.SortFunc (pdqsort + direct struct swaps) is ~2x faster than
+	// sort.Slice here, whose reflection-based swaps dominate at billion-event scale.
+	slices.SortFunc(events, func(a, b corpus.Event) int {
 		if a.TS != b.TS {
-			return a.TS < b.TS
+			if a.TS < b.TS {
+				return -1
+			}
+			return 1
 		}
 		if a.Kind != b.Kind {
-			return a.Kind < b.Kind
+			if a.Kind < b.Kind {
+				return -1
+			}
+			return 1
 		}
 		var ar, br int16
 		if a.Kind == corpus.KindStart {
@@ -180,12 +187,24 @@ func main() {
 			ar, br = -int16(a.Depth), -int16(b.Depth)
 		}
 		if ar != br {
-			return ar < br
+			if ar < br {
+				return -1
+			}
+			return 1
 		}
 		if a.TraceID != b.TraceID {
-			return a.TraceID < b.TraceID
+			if a.TraceID < b.TraceID {
+				return -1
+			}
+			return 1
 		}
-		return a.SpanID < b.SpanID
+		if a.SpanID != b.SpanID {
+			if a.SpanID < b.SpanID {
+				return -1
+			}
+			return 1
+		}
+		return 0
 	})
 
 	eventsPath, metaPath := corpus.Paths(*outDir)

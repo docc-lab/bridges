@@ -23,6 +23,7 @@ cd "$(dirname "$0")/.."
 CORPUS=${1:-/mydata/uber/corpus_full}
 SAMPLE=${SAMPLE:-20000}
 SAMPLE_SEED=${SAMPLE_SEED:-1}
+PROGRESS=${PROGRESS:-50000}   # per-cell: print PROGRESS traces=N to the cell's .err every N traces (0 = silent)
 MAXCORES=${MAXCORES:-$(nproc)}
 MODES=(${MODES:-vanilla pb cgpb sbridge})
 CPDS=(2 3 4 5 6 7 8)
@@ -36,7 +37,7 @@ echo "corpus=$CORPUS sample=$SAMPLE seed=$SAMPLE_SEED maxcores=$MAXCORES modes=$
 t0=$SECONDS
 for mode in "${MODES[@]}"; do
   for cpd in "${CPDS[@]}"; do
-    ( ./bin/trace_sim_go --corpus "$CORPUS" --bagsize --mode "$mode" --checkpoint-distance "$cpd" $SARG \
+    ( ./bin/trace_sim_go --corpus "$CORPUS" --bagsize --mode "$mode" --checkpoint-distance "$cpd" --progress "$PROGRESS" $SARG \
         -o "$OUT/${mode}_cpd${cpd}.json" 2> "$OUT/${mode}_cpd${cpd}.err"
       echo "done $mode cpd=$cpd" ) &
     while [ "$(jobs -rp | wc -l)" -ge "$MAXCORES" ]; do wait -n; done

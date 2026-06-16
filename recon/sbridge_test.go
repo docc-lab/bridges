@@ -155,3 +155,45 @@ func TestSBridgeReconstructNoDropSingleWindow(t *testing.T) {
 		t.Fatalf("reconstruction not correct: unsolvable=%v reason=%q", v.Unsolvable, v.Reason)
 	}
 }
+
+// TestSBridgeReconstructNoDropMultiWindow uses cpd=2 over a depth-4 tree, so
+// there are windows anchored at depths 0, 2 and 4 (checkpoints root, C, F, H).
+// Exercises ckpt4 stitching, interior inferred nodes (A,D,G), checkpoint anchors
+// that are also leaves (F,H), and a non-checkpoint leaf (L).
+func TestSBridgeReconstructNoDropMultiWindow(t *testing.T) {
+	const traceID = 0x0123456789abcdef
+	const (
+		root = 0x1111_1111_0000_0001 // d0 ckpt
+		A    = 0x2222_2222_0000_0002 // d1
+		C    = 0x3333_3333_0000_0003 // d2 ckpt (window anchor)
+		D    = 0x4444_4444_0000_0004 // d3
+		F    = 0x5555_5555_0000_0005 // d4 ckpt + leaf
+		G    = 0x6666_6666_0000_0006 // d3
+		H    = 0x7777_7777_0000_0007 // d4 ckpt + leaf
+		L    = 0x8888_8888_0000_0008 // d3 leaf (non-ckpt)
+	)
+	spans := []tspan{
+		{id: root, parent: 0, start: 0, end: 100},
+		{id: A, parent: root, start: 5, end: 98},
+		{id: C, parent: A, start: 8, end: 95},
+		{id: D, parent: C, start: 12, end: 55},
+		{id: F, parent: D, start: 15, end: 50},
+		{id: G, parent: C, start: 60, end: 90},
+		{id: H, parent: G, start: 62, end: 88},
+		{id: L, parent: C, start: 92, end: 94},
+	}
+	const cpd = 2
+
+	inputs := runSBridge(t, traceID, spans, cpd)
+	// Emitting = checkpoints (root, C, F, H) + non-checkpoint leaves (L).
+	// A, D, G are interior non-checkpoint spans with children -> no emit.
+	if len(inputs) != 5 {
+		t.Fatalf("expected 5 emitting spans, got %d", len(inputs))
+	}
+
+	res := ReconstructSBridge(inputs, Config{CPD: cpd})
+	v := ScoreSBridge(res, truthFromSpans(spans))
+	if !v.Correct {
+		t.Fatalf("reconstruction not correct: unsolvable=%v reason=%q", v.Unsolvable, v.Reason)
+	}
+}

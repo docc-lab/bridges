@@ -18,10 +18,12 @@ import (
 // ordinal-path from the root, and interior non-emitting spans fall out as
 // inferred nodes identified by the fingerprint their children carry.
 //
-// MILESTONE: this is the no-drop, single-window pass (one checkpoint = the
-// depth-0 root; every other emitting span carries that root's ckpt4). Multi-
-// window ckpt4 stitching is the next increment; until then a trace that
-// presents more than one window is reported Unsolvable rather than mis-built.
+// MILESTONE: no-drop, multi-window. Windows are stitched by ckpt4 — each
+// checkpoint span anchors its own window AND sits as a terminal node in its
+// parent window's chains, and those two are the same node object, so child
+// windows hang under their anchor automatically. Ambiguous ckpt4 (two distinct
+// checkpoints sharing a 4-byte truncation) -> Unsolvable. Drop handling is the
+// next increment.
 
 // SBInput is one surviving emitting span: its known span id plus the raw _br
 // payload it persisted.
@@ -60,75 +62,95 @@ func ReconstructSBridge(inputs []SBInput, cfg Config) SBResult {
 		id uint64
 		br bridge.SBridgeBR
 	}
-	var checkpoints, others []decoded
+	ds := make([]decoded, 0, len(inputs))
 	for _, in := range inputs {
 		br, err := bridge.DecodeSBridgeBR(in.Payload, cfg.CPD)
 		if err != nil {
 			return unsolvable("decode span %016x: %v", in.SpanID, err)
 		}
-		d := decoded{id: in.SpanID, br: br}
-		if br.Depth%cfg.CPD == 0 {
-			checkpoints = append(checkpoints, d)
-		} else {
-			others = append(others, d)
+		ds = append(ds, decoded{id: in.SpanID, br: br})
+	}
+
+	// Ambiguous ckpt4: two DISTINCT checkpoints whose ids share a 4-byte
+	// truncation can't be told apart as window anchors -> the trace is
+	// unsolvable (practically never happens, but guard it rather than misbuild).
+	ckptByTop4 := map[uint32]uint64{}
+	for _, d := range ds {
+		if d.br.Depth%cfg.CPD == 0 {
+			t4 := uint32(d.id >> 32)
+			if prev, ok := ckptByTop4[t4]; ok && prev != d.id {
+				return unsolvable("ambiguous ckpt4 %08x: checkpoints %016x and %016x", t4, prev, d.id)
+			}
+			ckptByTop4[t4] = d.id
 		}
 	}
 
-	// Single-window milestone: exactly one checkpoint, the depth-0 root.
-	var roots []decoded
-	for _, c := range checkpoints {
-		if c.br.Depth == 0 {
-			roots = append(roots, c)
+	// One node per window anchor (its 4-byte ckpt4 identity). A checkpoint span
+	// is BOTH a terminal in its parent window's chains and the root of its own
+	// window, so its parent-window placement reuses the very same node object
+	// (getWindow by top4(id)) — that unification IS the stitch.
+	windowRoot := map[uint32]*SBNode{}
+	getWindow := func(x uint32) *SBNode {
+		if n, ok := windowRoot[x]; ok {
+			return n
 		}
-	}
-	if len(roots) == 0 {
-		return unsolvable("no depth-0 root checkpoint among %d emitting spans", len(inputs))
-	}
-	if len(roots) > 1 {
-		return unsolvable("ambiguous root: %d depth-0 checkpoints", len(roots))
-	}
-	if len(checkpoints) > 1 {
-		return unsolvable("multi-window stitching not yet implemented (%d checkpoints)", len(checkpoints))
+		n := newSBNode(0)
+		n.FP, n.FPBits = x, 32
+		windowRoot[x] = n
+		return n
 	}
 
-	root := roots[0]
-	rootCkpt4 := uint32(root.id >> 32)
-	tree := newSBNode(0)
-	tree.RealID = root.id
-	tree.FP = rootCkpt4
-	tree.FPBits = 32
-
-	for _, o := range others {
-		// Every non-checkpoint emitting span must anchor to the one window.
-		if got := binary.BigEndian.Uint32(o.br.Ckpt4[:]); got != rootCkpt4 {
-			return unsolvable("multi-window stitching not yet implemented (span %016x ckpt4 %08x != root %08x)", o.id, got, rootCkpt4)
+	var root *SBNode
+	for _, d := range ds {
+		isCkpt := d.br.Depth%cfg.CPD == 0
+		if isCkpt && d.br.Depth == 0 {
+			// Trace root: its own window anchor, no parent window to place into.
+			n := getWindow(uint32(d.id >> 32))
+			if n.RealID != 0 && n.RealID != d.id {
+				return unsolvable("root collision: %016x vs %016x", n.RealID, d.id)
+			}
+			n.RealID = d.id
+			root = n
+			continue
 		}
-		cur := tree
-		for _, lv := range o.br.Chain {
-			// lv.FP is the PARENT's fingerprint (cur), present iff cur is not a
-			// checkpoint. Record it and check all children agree.
-			if lv.HasFP {
+		// Place this span in its window (its payload ckpt4) by walking the chain.
+		cur := getWindow(binary.BigEndian.Uint32(d.br.Ckpt4[:]))
+		for j, lv := range d.br.Chain {
+			// lv.FP is cur's (the parent's) fingerprint when present; never
+			// overwrite a window root's 4-byte ckpt4 (FPBits 32).
+			if lv.HasFP && cur.FPBits != 32 {
 				if cur.FPBits == 16 && uint16(cur.FP) != lv.FP {
-					return unsolvable("span %016x: conflicting fp at a chain node (%04x vs %04x)", o.id, uint16(cur.FP), lv.FP)
+					return unsolvable("span %016x: conflicting fp (%04x vs %04x)", d.id, uint16(cur.FP), lv.FP)
 				}
-				if cur.FPBits != 32 { // never overwrite the window root's 4-byte id
-					cur.FP, cur.FPBits = uint32(lv.FP), 16
-				}
+				cur.FP, cur.FPBits = uint32(lv.FP), 16
 			}
-			child, ok := cur.Children[lv.Ord]
-			if !ok {
+			var child *SBNode
+			if j == len(d.br.Chain)-1 && isCkpt {
+				// Terminal checkpoint: its node IS the root of its own window.
+				child = getWindow(uint32(d.id >> 32))
+			}
+			if existing, ok := cur.Children[lv.Ord]; ok {
+				if child != nil && existing != child {
+					return unsolvable("span %016x: ordinal %d already taken at a chain node", d.id, lv.Ord)
+				}
+				child = existing
+			}
+			if child == nil {
 				child = newSBNode(lv.Ord)
-				cur.Children[lv.Ord] = child
 			}
+			child.Ord = lv.Ord
+			cur.Children[lv.Ord] = child
 			cur = child
 		}
-		// cur is this emitting span's own node.
-		if cur.RealID != 0 && cur.RealID != o.id {
-			return unsolvable("span %016x collides with %016x at the same chain position", o.id, cur.RealID)
+		if cur.RealID != 0 && cur.RealID != d.id {
+			return unsolvable("span %016x collides with %016x at the same chain position", d.id, cur.RealID)
 		}
-		cur.RealID = o.id
+		cur.RealID = d.id
 	}
-	return SBResult{Root: tree}
+	if root == nil {
+		return unsolvable("no depth-0 root checkpoint among %d emitting spans", len(inputs))
+	}
+	return SBResult{Root: root}
 }
 
 // ---- scoring against ground truth ----

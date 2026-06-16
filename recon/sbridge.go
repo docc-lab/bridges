@@ -190,6 +190,78 @@ func ScoreSBridge(res SBResult, truth SBTruth) SBVerdict {
 	return SBVerdict{Correct: true}
 }
 
+// ScoreSBridgeUnderDrop is the drop-tolerant verdict. The reconstructed tree
+// must EMBED correctly into ground truth — every reconstructed node sits at a
+// true position (true ancestry) with a matching fingerprint and id — but truth
+// children that were dropped (hence not reconstructed) are not required, and a
+// dropped span's node may have RealID 0 (matched by fp/position instead).
+// Correct iff there are no wrong edges and every recovered fp/id matches.
+func ScoreSBridgeUnderDrop(res SBResult, truth SBTruth) SBVerdict {
+	if res.Unsolvable {
+		return SBVerdict{Unsolvable: true, Reason: res.Reason}
+	}
+	if res.Root == nil {
+		return SBVerdict{Reason: "nil root"}
+	}
+	if res.Root.RealID != 0 && res.Root.RealID != truth.RootID {
+		return SBVerdict{Reason: fmt.Sprintf("root id %016x != truth %016x", res.Root.RealID, truth.RootID)}
+	}
+	if ok, why := sbWalkPartial(res.Root, truth.RootID, truth); !ok {
+		return SBVerdict{Reason: why}
+	}
+	return SBVerdict{Correct: true}
+}
+
+// sbWalkPartial is sbWalk without the child-count equality requirement: it
+// rejects wrong edges and fp/id mismatches but tolerates truth children that
+// were dropped and so weren't reconstructed.
+func sbWalkPartial(node *SBNode, realID uint64, truth SBTruth) (bool, string) {
+	switch node.FPBits {
+	case 32:
+		if node.FP != uint32(realID>>32) {
+			return false, fmt.Sprintf("node %016x ckpt4 %08x != %08x", realID, node.FP, uint32(realID>>32))
+		}
+	case 16:
+		if uint16(node.FP) != uint16(realID>>48) {
+			return false, fmt.Sprintf("node %016x fp %04x != %04x", realID, uint16(node.FP), uint16(realID>>48))
+		}
+	}
+	kids := truth.ChildByOrd[realID]
+	for ord, child := range node.Children {
+		realChild, ok := kids[ord]
+		if !ok {
+			return false, fmt.Sprintf("wrong edge: node %016x has no truth child at ordinal %d", realID, ord)
+		}
+		if child.RealID != 0 && child.RealID != realChild {
+			return false, fmt.Sprintf("node %016x ord %d: id %016x != truth %016x", realID, ord, child.RealID, realChild)
+		}
+		if ok, why := sbWalkPartial(child, realChild, truth); !ok {
+			return false, why
+		}
+	}
+	return true, ""
+}
+
+// CountReal returns the number of reconstructed nodes carrying a known span id
+// (reachable from the root) — used to report coverage vs surviving emitters.
+func (r SBResult) CountReal() int {
+	if r.Root == nil {
+		return 0
+	}
+	n := 0
+	var rec func(*SBNode)
+	rec = func(nd *SBNode) {
+		if nd.RealID != 0 {
+			n++
+		}
+		for _, c := range nd.Children {
+			rec(c)
+		}
+	}
+	rec(r.Root)
+	return n
+}
+
 func sbWalk(node *SBNode, realID uint64, truth SBTruth) (bool, string) {
 	switch node.FPBits {
 	case 32:

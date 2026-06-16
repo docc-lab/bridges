@@ -77,6 +77,7 @@ func main() {
 	excludePruned := flag.Bool("exclude-pruned", false, "skip traces that had dangling-parent subtrees pruned (FlagPrunedDangling)")
 	excludeDeduped := flag.Bool("exclude-deduped", false, "skip traces that had identical duplicate spans collapsed (FlagDedupedSpans)")
 	salvage := flag.Bool("salvage-multiroot", true, "multi-root cleaning: keep only the largest ParentID==0 tree per trace (matches the strict corpus and archive_to_store). Keeps the regenerated events.bin consistent with the salvaged store.")
+	progressN := flag.Int("progress", 0, "print progress every N traces during the read phase (0 = silent); the global sort that follows is a single silent step")
 	flag.Parse()
 
 	var excludeMask uint8
@@ -156,9 +157,13 @@ func main() {
 				corpus.Event{TS: s.EndTS, Kind: corpus.KindEnd, SpanID: s.SpanID, ParentID: s.ParentID, TraceID: tr.TraceID, Depth: dp, ServiceID: s.ServiceID},
 			)
 		}
+		if *progressN > 0 && nt%*progressN == 0 {
+			fmt.Fprintf(os.Stderr, "  read %d traces, %d events in %s\n", nt, len(events), time.Since(t0).Round(time.Second))
+		}
 	}
 	fmt.Fprintf(os.Stderr, "read %d traces, %d events in %s (%d excluded by flags)\n", nt, len(events), time.Since(t0).Round(time.Millisecond), nExcluded)
 
+	fmt.Fprintf(os.Stderr, "sorting %d events (single silent step)...\n", len(events))
 	// Same global sort key as trace_prep.
 	sort.Slice(events, func(i, j int) bool {
 		a, b := events[i], events[j]

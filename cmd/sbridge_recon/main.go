@@ -48,7 +48,7 @@ func main() {
 	t0 := time.Now()
 	for i, tr := range traces {
 		payloads, truth := emitTrace(tr, *cpd)
-		dropped := dropSet(tr, *dropRate, *dropSeed)
+		dropped := dropSet(tr, *dropRate, *dropSeed, *cpd)
 
 		inputs := make([]recon.SBInput, 0, len(payloads))
 		for sid, p := range payloads {
@@ -136,20 +136,46 @@ func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth
 	return payloads, truth
 }
 
-// dropSet picks the dropped span ids for one trace: a per-trace splitmix seed,
-// then an independent uniform draw per span (iterated in sorted id order so the
-// decision is order/partition-invariant).
-func dropSet(tr corpus.StoredTrace, rate float64, base int64) map[uint64]struct{} {
+// dropSet picks the dropped span ids for one trace. CHECKPOINTS (depth%cpd==0)
+// are never droppable — they're the protected carriers, exactly as in every
+// other mode (trace_recon protects _br carriers identically). Only non-checkpoint
+// spans are candidates; a per-trace splitmix seed gives an independent uniform
+// draw per candidate (sorted id order), so the decision is order/partition-
+// invariant.
+func dropSet(tr corpus.StoredTrace, rate float64, base int64, cpd int) map[uint64]struct{} {
+	parent := map[uint64]uint64{}
 	var ids []uint64
 	for _, e := range tr.Events {
 		if e.Kind == corpus.KindStart {
+			parent[e.SpanID] = e.ParentID
 			ids = append(ids, e.SpanID)
 		}
 	}
+	depth := map[uint64]int{}
+	var d func(uint64) int
+	d = func(s uint64) int {
+		if v, ok := depth[s]; ok {
+			return v
+		}
+		p := parent[s]
+		if p == 0 {
+			depth[s] = 0
+			return 0
+		}
+		v := d(p) + 1
+		depth[s] = v
+		return v
+	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	cands := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		if d(id)%cpd != 0 { // skip checkpoints
+			cands = append(cands, id)
+		}
+	}
 	st := splitmix(tr.TraceID + uint64(base))
 	dropped := map[uint64]struct{}{}
-	for _, id := range ids {
+	for _, id := range cands {
 		var u float64
 		u, st = nextFloat(st)
 		if u < rate {

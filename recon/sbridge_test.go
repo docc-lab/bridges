@@ -156,6 +156,64 @@ func TestSBridgeReconstructNoDropSingleWindow(t *testing.T) {
 	}
 }
 
+// hasReal reports whether any reconstructed node carries the given span id.
+func hasReal(n *SBNode, id uint64) bool {
+	if n == nil {
+		return false
+	}
+	if n.RealID == id {
+		return true
+	}
+	for _, c := range n.Children {
+		if hasReal(c, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSBridgeReconstructDropLeaf drops a non-checkpoint leaf and checks the rest
+// still embeds correctly: no wrong edges (ScoreSBridgeUnderDrop Correct), the
+// dropped leaf is absent, and its interior parent is still inferred from the
+// surviving sibling's chain.
+func TestSBridgeReconstructDropLeaf(t *testing.T) {
+	const traceID = 0x00000000feedface
+	const (
+		root = 0x1111_0000_0000_0001 // d0 ckpt
+		A    = 0x2222_0000_0000_0002 // d1 interior (no emit)
+		A1   = 0x3333_0000_0000_0003 // d2 leaf
+		A2   = 0x4444_0000_0000_0004 // d2 leaf  <- dropped
+	)
+	spans := []tspan{
+		{id: root, parent: 0, start: 0, end: 100},
+		{id: A, parent: root, start: 10, end: 90},
+		{id: A1, parent: A, start: 20, end: 40},
+		{id: A2, parent: A, start: 50, end: 80},
+	}
+	const cpd = 4 // only depth 0 is a checkpoint
+
+	all := runSBridge(t, traceID, spans, cpd) // emits: root, A1, A2
+	inputs := make([]SBInput, 0, len(all))
+	for _, in := range all {
+		if in.SpanID == A2 { // drop the non-checkpoint leaf
+			continue
+		}
+		inputs = append(inputs, in)
+	}
+
+	res := ReconstructSBridge(inputs, Config{CPD: cpd})
+	v := ScoreSBridgeUnderDrop(res, truthFromSpans(spans))
+	if !v.Correct {
+		t.Fatalf("drop-leaf recon not correct: unsolvable=%v reason=%q", v.Unsolvable, v.Reason)
+	}
+	if hasReal(res.Root, A2) {
+		t.Fatalf("dropped leaf A2 must be absent from the reconstruction")
+	}
+	if res.Root.RealID != root || !hasReal(res.Root, A1) {
+		t.Fatalf("root + surviving leaf A1 should be reconstructed (A inferred between them)")
+	}
+}
+
 // TestSBridgeReconstructNoDropMultiWindow uses cpd=2 over a depth-4 tree, so
 // there are windows anchored at depths 0, 2 and 4 (checkpoints root, C, F, H).
 // Exercises ckpt4 stitching, interior inferred nodes (A,D,G), checkpoint anchors

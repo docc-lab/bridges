@@ -38,6 +38,8 @@ type config struct {
 	emitOC             bool
 	prefixLen          int
 	bloomFP            float64
+	sampleCount        int   // corpus mode: if >0, simulate a RANDOM sample of this many traces (seeded)
+	sampleSeed         int64 // seed for the random sample
 }
 
 func parseFlags() config {
@@ -49,6 +51,8 @@ func parseFlags() config {
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
 	flag.BoolVar(&c.bagsize, "bagsize", false, "Output per-trace bagsize metrics")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
+	flag.IntVar(&c.sampleCount, "sample", 0, "Corpus mode: if >0, simulate a RANDOM sample of this many traces (uniform over the trace order, seeded by --sample-seed). Same seed => same sample (match the recon sweep's --sample/--sample-seed for overhead-vs-accuracy on identical traces).")
+	flag.Int64Var(&c.sampleSeed, "sample-seed", 1, "Seed for --sample trace selection")
 	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
 	flag.BoolVar(&c.emitDepth, "emit-depth", false, "Emit absolute depth: varint(depth) replaces varint(depthMod) in _br payloads, and interior non-checkpoint spans carry a _d attribute (see docs/depth_emission.md)")
 	flag.BoolVar(&c.emitOC, "emit-oc", false, "S-bridge: emit an _oc attribute (window-relative ordinal chain) on interior non-checkpoint spans, to measure per-span ordinal-chain inflation")
@@ -202,7 +206,7 @@ func runFromCorpus(c config) []TraceMetrics {
 		// alone; fall back to "<traceIDhex>.json". DEE log uses this only for
 		// human-readable annotation.
 		func(tid uint64) string { return fmt.Sprintf("%016x.json", tid) })
-	metrics := runInterleavedFromCorpus(er, meta, h)
+	metrics := runInterleavedFromCorpus(er, meta, h, c)
 	fmt.Fprintf(os.Stderr, "Simulated in %s\n", time.Since(t1).Round(time.Millisecond))
 	return metrics
 }

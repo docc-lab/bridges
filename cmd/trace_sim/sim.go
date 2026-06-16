@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"sort"
 
@@ -241,11 +242,35 @@ func runInterleavedJSON(traces []loader.Trace, h bridge.Handler) []TraceMetrics 
 // runInterleavedFromCorpus streams events.bin and dispatches each event.
 // Corpus is already globally sorted by the same key as Python's sort_events,
 // so no sort happens here — pure streaming dispatch.
-func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h bridge.Handler) []TraceMetrics {
+func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h bridge.Handler, cfg config) []TraceMetrics {
 	traceOrder := append([]uint64(nil), meta.TraceOrder...)
 	spanCounts := make([]int, len(meta.SpanCounts))
 	for i, c := range meta.SpanCounts {
 		spanCounts[i] = int(c)
+	}
+	// Optional uniform random sample: simulate only a selected subset (events of
+	// other traces are skipped). NOTE: S-bridge's DEE queue is cross-trace, so
+	// its baggage amortization depends on trace density — a sample under-amortizes
+	// it; pb/cgpb/vanilla are per-trace and unbiased under sampling.
+	var selected map[uint64]struct{}
+	if cfg.sampleCount > 0 && cfg.sampleCount < len(traceOrder) {
+		idx := make([]int, len(traceOrder))
+		for i := range idx {
+			idx[i] = i
+		}
+		rng := rand.New(rand.NewSource(cfg.sampleSeed))
+		rng.Shuffle(len(idx), func(i, j int) { idx[i], idx[j] = idx[j], idx[i] })
+		idx = idx[:cfg.sampleCount]
+		sort.Ints(idx)
+		so := make([]uint64, len(idx))
+		sc := make([]int, len(idx))
+		selected = make(map[uint64]struct{}, len(idx))
+		for k, i := range idx {
+			so[k], sc[k] = traceOrder[i], spanCounts[i]
+			selected[traceOrder[i]] = struct{}{}
+		}
+		traceOrder, spanCounts = so, sc
+		fmt.Fprintf(os.Stderr, "sample: simulating %d random traces (seed %d)\n", len(traceOrder), cfg.sampleSeed)
 	}
 	s := newSimState(traceOrder, spanCounts)
 
@@ -257,6 +282,11 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 			}
 			fmt.Fprintf(os.Stderr, "corpus read error: %v\n", err)
 			os.Exit(1)
+		}
+		if selected != nil {
+			if _, ok := selected[ce.TraceID]; !ok {
+				continue
+			}
 		}
 		s.onEvent(h, streamEvent{
 			ts:        ce.TS,

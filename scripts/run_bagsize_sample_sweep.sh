@@ -25,7 +25,7 @@ SAMPLE=${SAMPLE:-20000}
 SAMPLE_SEED=${SAMPLE_SEED:-1}
 PROGRESS=${PROGRESS:-50000}   # per-cell: print PROGRESS traces=N to the cell's .err every N traces (0 = silent)
 MAXCORES=${MAXCORES:-$(nproc)}
-MODES=(${MODES:-vanilla pb cgpb sbridge})
+IFS=', ' read -ra MODES <<< "${MODES:-vanilla pb cgpb sbridge}"   # comma- or space-separated
 CPDS=(2 3 4 5 6 7 8)
 OUT=${OUT:-$HOME/bagsize_sample_sweep}
 

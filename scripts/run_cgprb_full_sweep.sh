@@ -37,21 +37,31 @@ fi
 mkdir -p "$OUT"
 echo "day=$DAY FULL corpus  maxcores=$MAXCORES workers/cell=$WORKERS concurrent=$CONC -> $OUT"
 
-echo "=== sweep (${#CPDS[@]}x${#DROPS[@]} cells, $CONC at a time, FULL corpus per cell) ==="
+echo "=== sweep (${#CPDS[@]}x${#DROPS[@]} cells, $CONC at a time, FULL corpus, heavy-first) ==="
 t0=$SECONDS
+# Heavy-first launch order (cost-descending). Mid-drop (0.5/0.75) x mid/high-cpd
+# are the long poles per the day-2 runtimes; cpd2 is trivial. Running the heavy
+# cells first keeps the box saturated and leaves a CHEAP cell as the lone tail
+# (the only spot where C<concurrency leaves cores idle).
+cells=()
 for cpd in "${CPDS[@]}"; do
   for r in "${DROPS[@]}"; do
-    (
-      TRACE_RECON_TOPO=1 TRACE_RECON_CPSAT=1 ./bin/trace_recon_cgprb \
-        --corpus "$META" --trace-store "$STORE" --mode cgprb \
-        --checkpoint-distance "$cpd" --drop-rate "$r" --tie-policy aware --per-trace-drop-seed \
-        --workers "$WORKERS" \
-        -o "$OUT/cpd${cpd}_r${r}.json" 2> "$OUT/cpd${cpd}_r${r}.err"
-      echo "done cpd=$cpd r=$r"
-    ) &
-    while [ "$(jobs -rp | wc -l)" -ge "$CONC" ]; do wait -n; done
+    case "$r" in 0.5|0.75) dw=5;; 0.25) dw=3;; 0.95) dw=2;; *) dw=1;; esac
+    case "$cpd" in 2) cw=1;; 3) cw=4;; 4|5|6) cw=8;; 7) cw=6;; *) cw=5;; esac
+    cells+=("$((dw * cw)) $cpd $r")
   done
 done
+while read -r _w cpd r; do
+  (
+    TRACE_RECON_TOPO=1 TRACE_RECON_CPSAT=1 ./bin/trace_recon_cgprb \
+      --corpus "$META" --trace-store "$STORE" --mode cgprb \
+      --checkpoint-distance "$cpd" --drop-rate "$r" --tie-policy aware --per-trace-drop-seed \
+      --workers "$WORKERS" \
+      -o "$OUT/cpd${cpd}_r${r}.json" 2> "$OUT/cpd${cpd}_r${r}.err"
+    echo "done cpd=$cpd r=$r"
+  ) &
+  while [ "$(jobs -rp | wc -l)" -ge "$CONC" ]; do wait -n; done
+done < <(printf '%s\n' "${cells[@]}" | sort -rn)
 wait
 echo "sweep done in $((SECONDS-t0))s"
 

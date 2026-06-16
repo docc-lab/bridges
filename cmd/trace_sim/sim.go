@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"time"
 
 	"bridges/bridge"
 	"bridges/corpus"
@@ -113,6 +114,10 @@ type simState struct {
 	traceOrder   []uint64
 	openByTID    map[uint64]int
 	nextSeq      map[seqKey]int
+
+	progressN int       // print a PROGRESS line every N completed traces (0 = off)
+	t0        time.Time // start time for the progress elapsed
+	completed int       // traces finished so far
 }
 
 type seqKey struct{ traceID, parentID uint64 }
@@ -210,6 +215,11 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 	if s.openByTID[e.traceID] == 0 {
 		h.EvictTrace(e.traceID)
 		delete(s.openByTID, e.traceID)
+		s.completed++
+		if s.progressN > 0 && s.completed%s.progressN == 0 {
+			fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds\n",
+				s.completed, int(time.Since(s.t0).Seconds()))
+		}
 	}
 }
 
@@ -273,6 +283,7 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 		fmt.Fprintf(os.Stderr, "sample: simulating %d random traces (seed %d)\n", len(traceOrder), cfg.sampleSeed)
 	}
 	s := newSimState(traceOrder, spanCounts)
+	s.progressN, s.t0 = cfg.progressN, time.Now()
 
 	for {
 		ce, err := er.Next()

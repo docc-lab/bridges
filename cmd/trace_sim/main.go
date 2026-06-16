@@ -40,6 +40,7 @@ type config struct {
 	bloomFP            float64
 	sampleCount        int   // corpus mode: if >0, simulate a RANDOM sample of this many traces (seeded)
 	sampleSeed         int64 // seed for the random sample
+	progressN          int   // corpus mode: print a PROGRESS line every N completed traces (0 = off)
 }
 
 func parseFlags() config {
@@ -53,6 +54,7 @@ func parseFlags() config {
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
 	flag.IntVar(&c.sampleCount, "sample", 0, "Corpus mode: if >0, simulate a RANDOM sample of this many traces (uniform over the trace order, seeded by --sample-seed). Same seed => same sample (match the recon sweep's --sample/--sample-seed for overhead-vs-accuracy on identical traces).")
 	flag.Int64Var(&c.sampleSeed, "sample-seed", 1, "Seed for --sample trace selection")
+	flag.IntVar(&c.progressN, "progress", 0, "Corpus mode: print a PROGRESS line to stderr every N completed traces (0 = silent)")
 	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
 	flag.BoolVar(&c.emitDepth, "emit-depth", false, "Emit absolute depth: varint(depth) replaces varint(depthMod) in _br payloads, and interior non-checkpoint spans carry a _d attribute (see docs/depth_emission.md)")
 	flag.BoolVar(&c.emitOC, "emit-oc", false, "S-bridge: emit an _oc attribute (window-relative ordinal chain) on interior non-checkpoint spans, to measure per-span ordinal-chain inflation")

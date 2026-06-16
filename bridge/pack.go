@@ -177,6 +177,14 @@ type bcEntry struct {
 	ord   int
 	fp    uint16 // big-endian first 2 bytes of the propagating parent's span ID
 	hasFp bool
+	// ee is this level's delayed-end-event sub-list: the start ordinals of the
+	// spans that ENDED in the gap just before this level's span started (i.e. its
+	// earlier siblings, children of this level's parent). Carried per-level so the
+	// EE is positionally aligned with the chain — each end is attributable to its
+	// owner (this entry's fp / the window anchor) with no inference, and a level
+	// with no ends just serializes varint(0). Replaces the old single flat trailing
+	// endEvents block.
+	ee []int
 }
 
 // chainStartDepth is the absolute depth of chain[0] for a span at `depth`:
@@ -187,7 +195,7 @@ func chainStartDepth(depth, chainLen int) int { return depth - chainLen + 1 }
 // sbridgeBRSize returns the serialized size of an S-Bridge _br payload WITHOUT
 // allocating it — used in the per-span hot path (only the byte count matters
 // for the bag-size study). It matches PackSBridgeBR byte-for-byte in length.
-func sbridgeBRSize(depth int, chain []bcEntry, endEvents []int, deeBytes []byte) int {
+func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte) int {
 	start := chainStartDepth(depth, len(chain))
 	size := VarintLen(depth) + 4 + VarintLen(len(chain))
 	for i := range chain {
@@ -195,10 +203,11 @@ func sbridgeBRSize(depth int, chain []bcEntry, endEvents []int, deeBytes []byte)
 		if chain[i].hasFp {
 			size += 2
 		}
-	}
-	size += VarintLen(len(endEvents))
-	for _, s := range endEvents {
-		size += VarintLen(s)
+		// per-level EE sub-list: varint(n) then n ordinals (varint(0) when empty).
+		size += VarintLen(len(chain[i].ee))
+		for _, s := range chain[i].ee {
+			size += VarintLen(s)
+		}
 	}
 	size += len(deeBytes)
 	return size
@@ -206,19 +215,19 @@ func sbridgeBRSize(depth int, chain []bcEntry, endEvents []int, deeBytes []byte)
 
 // PackSBridgeBR packs the S-Bridge baggage payload from a flat breadcrumb
 // chain: varint(depth), the 4-byte checkpoint-root anchor, varint(N), then per
-// level varint(depth_i) varint(1) varint(ordinal) [2-byte parent fingerprint],
-// then the end-event list and the trailing dee_bytes blob. Byte layout is
-// identical to the prior per-depth-map form for a real (one-ordinal-per-depth)
-// chain.
+// level varint(depth_i) varint(1) varint(ordinal) [2-byte parent fingerprint]
+// varint(ee_n) ee_n*varint(ordinal), then the trailing dee_bytes blob. The
+// end-event list is carried PER LEVEL (positionally aligned with the chain), so
+// a level with no ends serializes a single varint(0); this replaces the old
+// single flat trailing endEvents block.
 func PackSBridgeBR(
 	depth int,
 	ckpt4 [4]byte,
 	chain []bcEntry,
-	endEvents []int,
 	deeBytes []byte,
 ) []byte {
 	start := chainStartDepth(depth, len(chain))
-	out := make([]byte, 0, sbridgeBRSize(depth, chain, endEvents, deeBytes))
+	out := make([]byte, 0, sbridgeBRSize(depth, chain, deeBytes))
 	out = binary.AppendUvarint(out, uint64(maxInt(depth, 0)))
 	out = append(out, ckpt4[:]...)
 	out = binary.AppendUvarint(out, uint64(len(chain)))
@@ -229,26 +238,34 @@ func PackSBridgeBR(
 		if chain[i].hasFp {
 			out = append(out, byte(chain[i].fp>>8), byte(chain[i].fp))
 		}
-	}
-	out = binary.AppendUvarint(out, uint64(len(endEvents)))
-	for _, s := range endEvents {
-		out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))
+		out = binary.AppendUvarint(out, uint64(len(chain[i].ee)))
+		for _, s := range chain[i].ee {
+			out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))
+		}
 	}
 	out = append(out, deeBytes...)
 	return out
 }
 
-// EncodeDEETriple encodes one delayed-end-event triple:
+// EncodeDEEQuad encodes one delayed-end-event quadruple:
 //
-//	16-byte trace_id || varint(depth) || varint(n) || n * varint(start_seq)
-func EncodeDEETriple(traceID16 [16]byte, depth int, seqs []int) []byte {
-	size := 16 + VarintLen(depth) + VarintLen(len(seqs))
+//	16-byte trace_id || varint(depth) || 4-byte owner_fp || varint(n) || n * varint(start_seq)
+//
+// owner_fp is the top 4 bytes of the owning span's ID (same width as the ckpt4
+// window anchor). Unlike the in-baggage EE list — whose owner is recoverable for
+// free from the breadcrumb chain — a drained DEE batch carries no chain context,
+// so (trace_id, depth) alone can't pick the owner among same-depth spans in the
+// trace, and there's no surrounding path to narrow candidates the way a 2-byte
+// chain fp can. The full 4-byte fingerprint pins it on its own.
+func EncodeDEEQuad(traceID16 [16]byte, depth int, ownerFP uint32, seqs []int) []byte {
+	size := 16 + VarintLen(depth) + 4 + VarintLen(len(seqs))
 	for _, s := range seqs {
 		size += VarintLen(s)
 	}
 	out := make([]byte, 0, size)
 	out = append(out, traceID16[:]...)
 	out = binary.AppendUvarint(out, uint64(maxInt(depth, 0)))
+	out = append(out, byte(ownerFP>>24), byte(ownerFP>>16), byte(ownerFP>>8), byte(ownerFP))
 	out = binary.AppendUvarint(out, uint64(len(seqs)))
 	for _, s := range seqs {
 		out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))

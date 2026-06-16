@@ -150,20 +150,22 @@ func TestPackSBridgeBR(t *testing.T) {
 
 	// A 3-level breadcrumb chain for a span at depth 5 (levels at depths 3,4,5).
 	// The first level's parent is the checkpoint (no 2-byte fp); the deeper
-	// levels carry the propagating parent's 2-byte fingerprint.
+	// levels carry the propagating parent's 2-byte fingerprint. EE rides per
+	// level: levels 3,4 have none (varint(0)); level 5 carries [4,5].
 	chain := []bcEntry{
 		{ord: 10},
 		{ord: 7, fp: 0xabcd, hasFp: true},
-		{ord: 2, fp: 0xdef0, hasFp: true},
+		{ord: 2, fp: 0xdef0, hasFp: true, ee: []int{4, 5}},
 	}
-	got1 := hex.EncodeToString(PackSBridgeBR(5, ckpt, chain, []int{4, 5}, []byte{0xaa, 0xbb, 0xcc}))
-	want1 := "05112233440303010a040107abcd050102def0020405aabbcc"
+	got1 := hex.EncodeToString(PackSBridgeBR(5, ckpt, chain, []byte{0xaa, 0xbb, 0xcc}))
+	// 05 | 11223344 | 03 | [03 01 0a 00] [04 01 07 abcd 00] [05 01 02 def0 02 0405] | aabbcc
+	want1 := "05112233440303010a00040107abcd00050102def0020405aabbcc"
 	if got1 != want1 {
 		t.Errorf("p1: got %s, want %s", got1, want1)
 	}
 
-	got2 := hex.EncodeToString(PackSBridgeBR(0, zeros4, nil, []int{}, nil))
-	want2 := "00000000000000"
+	got2 := hex.EncodeToString(PackSBridgeBR(0, zeros4, nil, nil))
+	want2 := "000000000000"
 	if got2 != want2 {
 		t.Errorf("p2: got %s, want %s", got2, want2)
 	}
@@ -172,38 +174,39 @@ func TestPackSBridgeBR(t *testing.T) {
 	cases := []struct {
 		depth int
 		chain []bcEntry
-		ee    []int
 		dee   []byte
 	}{
-		{5, chain, []int{4, 5}, []byte{0xaa, 0xbb, 0xcc}},
-		{0, nil, nil, nil},
-		{3, []bcEntry{{ord: 1}, {ord: 99, fp: 0x1234, hasFp: true}}, []int{1, 2, 3}, nil},
+		{5, chain, []byte{0xaa, 0xbb, 0xcc}},
+		{0, nil, nil},
+		{3, []bcEntry{{ord: 1, ee: []int{1, 2, 3}}, {ord: 99, fp: 0x1234, hasFp: true}}, nil},
 	}
 	for i, c := range cases {
-		gotSize := sbridgeBRSize(c.depth, c.chain, c.ee, c.dee)
-		wantSize := len(PackSBridgeBR(c.depth, ckpt, c.chain, c.ee, c.dee))
+		gotSize := sbridgeBRSize(c.depth, c.chain, c.dee)
+		wantSize := len(PackSBridgeBR(c.depth, ckpt, c.chain, c.dee))
 		if gotSize != wantSize {
 			t.Errorf("case %d: sbridgeBRSize=%d != len(pack)=%d", i, gotSize, wantSize)
 		}
 	}
 }
 
-func TestEncodeDEETriple(t *testing.T) {
+func TestEncodeDEEQuad(t *testing.T) {
 	cases := []struct {
 		traceHex string
 		depth    int
+		ownerFP  uint32
 		seqs     []int
 		want     string
 	}{
-		{"928f188ef2409811", 4, []int{1, 2, 3}, "0000000000000000928f188ef24098110403010203"},
-		{"", 0, nil, "000000000000000000000000000000000000"},
-		{"928f188ef2409811928f188ef2409811", 200, []int{99}, "928f188ef2409811928f188ef2409811c8010163"},
+		// layout: trace_id(16) || varint(depth) || owner_fp(4 BE) || varint(n) || n*varint(seq)
+		{"928f188ef2409811", 4, 0xabcd1234, []int{1, 2, 3}, "0000000000000000928f188ef240981104abcd123403010203"},
+		{"", 0, 0x00000000, nil, "00000000000000000000000000000000000000000000"},
+		{"928f188ef2409811928f188ef2409811", 200, 0x12345678, []int{99}, "928f188ef2409811928f188ef2409811c801123456780163"},
 	}
 	for _, c := range cases {
 		tid := TraceIDHexTo16Bytes(c.traceHex)
-		got := hex.EncodeToString(EncodeDEETriple(tid, c.depth, c.seqs))
+		got := hex.EncodeToString(EncodeDEEQuad(tid, c.depth, c.ownerFP, c.seqs))
 		if got != c.want {
-			t.Errorf("EncodeDEETriple(%s,%d,%v) = %s, want %s", c.traceHex, c.depth, c.seqs, got, c.want)
+			t.Errorf("EncodeDEEQuad(%s,%d,%#x,%v) = %s, want %s", c.traceHex, c.depth, c.ownerFP, c.seqs, got, c.want)
 		}
 	}
 }

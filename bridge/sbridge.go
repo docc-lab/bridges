@@ -86,21 +86,27 @@ type SBridgeHandler struct {
 	// checkpoints/leaves already fold the chain into their _br payload.
 	EmitOC bool
 
+	// EmitSink, when non-nil, receives the actual serialized _br payload at each
+	// emit point (checkpoint OnStart, leaf OnEnd) — the faithful bytes a span
+	// would persist. Opt-in: the bag-size study leaves it nil and pays no
+	// serialization cost. Used by reconstruction tests / trace_recon --mode
+	// sbridge to feed the decoder real payloads.
+	EmitSink func(traceID, spanID uint64, payload []byte)
+
 	state            map[stateKey]*sbState
 	parentEventCount map[stateKey]int
 	childSeqStart    map[stateKey]int
 	parentEEAcc      map[stateKey][]int
 
-	// service_id -> queue of pending DEE triples (each triple is one []byte).
+	// service_id -> queue of pending DEE quadruples (each quad is one []byte).
 	deeQueue map[uint16][][]byte
 }
 
 type sbState struct {
-	depth     int
-	ckpt4     [4]byte   // window anchor: 4-byte truncated checkpoint-root span ID
-	chain     []bcEntry // breadcrumb: per-level (ordinal, parent fingerprint) since the last checkpoint
-	endEvents []int
-	deeBytes  []byte
+	depth    int
+	ckpt4    [4]byte   // window anchor: 4-byte truncated checkpoint-root span ID
+	chain    []bcEntry // breadcrumb: per-level (ordinal, parent fingerprint, EE sub-list) since the last checkpoint
+	deeBytes []byte
 
 	packedLen   int // cached len of pack_sbridge_br applied to the fields above
 	emitted     bool
@@ -187,28 +193,30 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		depth               int
 		ckpt4               [4]byte
 		chain               []bcEntry
-		endEvents           []int
 		parentDEEFromParent []byte
 	)
 
 	if pid != 0 {
 		var parentDepth int
 		var parentChain []bcEntry
-		var parentEEFromParent []int
 		if parentState != nil {
 			parentDepth = parentState.depth
 			ckpt4 = parentState.ckpt4
 			parentChain = parentState.chain
-			parentEEFromParent = parentState.endEvents
 			parentDEEFromParent = parentState.deeBytes
 		}
 		depth = parentDepth + 1
 
 		// Copy the parent's breadcrumb chain and append this level: our start
-		// ordinal plus, when our parent is NOT a checkpoint, its 2-byte
-		// fingerprint. (A checkpoint parent's identity is the 4-byte ckpt4
-		// anchor, so that edge carries no 2-byte entry.) A flat slice copy+append
-		// — no per-span map allocation.
+		// ordinal; when our parent is NOT a checkpoint, its 2-byte fingerprint
+		// (a checkpoint parent's identity is the 4-byte ckpt4 anchor, so that
+		// edge carries no 2-byte entry); and THIS level's EE sub-list — the
+		// start ordinals of our earlier siblings that ended in the gap before we
+		// started, consumed from the parent's accumulator. EE rides on the chain
+		// entry, so it propagates to every descendant positionally aligned with
+		// the chain (set once per level, reset only at a checkpoint when the
+		// chain restarts) — no flat inherit/reset, no owner inference. A flat
+		// slice copy+append — no per-span map allocation.
 		seqStart := h.bumpEvent(tid, pid)
 		h.childSeqStart[stateKey{tid, sid}] = seqStart
 		chain = make([]bcEntry, len(parentChain), len(parentChain)+1)
@@ -218,15 +226,10 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 			e.fp = uint16(pid >> 48)
 			e.hasFp = true
 		}
-		chain = append(chain, e)
-
-		accEnds := h.parentEEAcc[stateKey{tid, pid}]
-		if parentSeqNum == 1 {
-			endEvents = append([]int(nil), parentEEFromParent...)
-			endEvents = append(endEvents, accEnds...)
-		} else {
-			endEvents = append([]int(nil), accEnds...)
+		if accEnds := h.parentEEAcc[stateKey{tid, pid}]; len(accEnds) > 0 {
+			e.ee = append([]int(nil), accEnds...)
 		}
+		chain = append(chain, e)
 		// Clear the parent's accumulator now that we've consumed it.
 		h.parentEEAcc[stateKey{tid, pid}] = h.parentEEAcc[stateKey{tid, pid}][:0]
 	}
@@ -245,14 +248,19 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	if isCheckpoint {
 		// Only the payload SIZE matters for the bag-size study, so compute it
 		// without serializing (no per-span allocation).
-		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSize(depth, chain, endEvents, deeBytes)
+		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSize(depth, chain, deeBytes)
+		if h.EmitSink != nil {
+			// Pack BEFORE the reset: a checkpoint's own payload describes its
+			// position within its PARENT window (pre-reset anchor + chain).
+			h.EmitSink(tid, sid, PackSBridgeBR(depth, ckpt4, chain, deeBytes))
+		}
 
 		// Reset state for the post-checkpoint snapshot: this span becomes the
-		// new 4-byte window anchor; the breadcrumb chain restarts empty.
+		// new 4-byte window anchor; the breadcrumb chain restarts empty (which
+		// also drops the per-level EE, since EE now rides on chain entries).
 		ckpt4 = [4]byte{}
 		copy(ckpt4[:], fpBytes(sid, 4))
 		chain = nil
-		endEvents = nil
 		deeBytes = nil
 
 		// Re-initialize this span's parent-perspective accumulators.
@@ -260,7 +268,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		h.parentEEAcc[stateKey{tid, sid}] = nil
 	}
 
-	packedLen := sbridgeBRSize(depth, chain, endEvents, deeBytes)
+	packedLen := sbridgeBRSize(depth, chain, deeBytes)
 
 	var baggageBytes int
 	if baggageFound {
@@ -271,7 +279,6 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		depth:     depth,
 		ckpt4:     ckpt4,
 		chain:     chain,
-		endEvents: endEvents,
 		deeBytes:  deeBytes,
 		packedLen: packedLen,
 		emitted:   isCheckpoint,
@@ -302,13 +309,15 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 	}
 
 	// Drain remaining ENDS that we never handed off to a later child:
-	// they become a DEE triple, dropping the last (implicit at reconstruction).
+	// they become a DEE quadruple, dropping the last (implicit at reconstruction).
+	// The quad carries this span's own fingerprint as the owner ID, since the
+	// drained batch has no chain context to recover it from.
 	rem := h.parentEEAcc[key]
 	if len(rem) > 0 {
 		kept := rem[:len(rem)-1]
 		if len(kept) > 0 {
-			triple := EncodeDEETriple(TraceID16(tid), ps.depth, kept)
-			h.enqueueDEE(ev.ServiceID, triple, tid)
+			quad := EncodeDEEQuad(TraceID16(tid), ps.depth, uint32(sid>>32), kept)
+			h.enqueueDEE(ev.ServiceID, quad, tid)
 		}
 		h.parentEEAcc[key] = rem[:0] // clear in place (Python: .clear())
 	}
@@ -320,6 +329,9 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 	if isLeaf && !ps.emitted {
 		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + ps.packedLen
 		ps.emitted = true
+		if h.EmitSink != nil {
+			h.EmitSink(tid, sid, PackSBridgeBR(ps.depth, ps.ckpt4, ps.chain, ps.deeBytes))
+		}
 	} else if !ps.emitted {
 		// Interior non-checkpoint span: never carries _br. In EmitDepth mode
 		// absolute depth rides as a "_d" attribute; in EmitOC mode the window-

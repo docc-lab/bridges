@@ -27,7 +27,8 @@ func main() {
 	storePath := flag.String("store", "", "trace store path (corpus.TraceStore)")
 	cpd := flag.Int("cpd", 4, "checkpoint distance")
 	dropRate := flag.Float64("drop-rate", 0.5, "per-span drop probability (per-trace seeded)")
-	sample := flag.Int("sample", 0, "if >0, reservoir-sample this many random traces")
+	first := flag.Int("first", 0, "if >0, take the FIRST N traces and stop (fast; no full-file read)")
+	sample := flag.Int("sample", 0, "if >0, reservoir-sample this many random traces (reads the whole store)")
 	sampleSeed := flag.Int64("sample-seed", 1, "seed for --sample selection")
 	dropSeed := flag.Int64("drop-seed", 1, "base seed mixed with each trace id for drop decisions")
 	progress := flag.Int("progress", 0, "print a progress line every N traces (0 = silent)")
@@ -37,7 +38,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	traces, err := loadTraces(*storePath, *sample, *sampleSeed)
+	traces, err := loadTraces(*storePath, *first, *sample, *sampleSeed)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load: %v\n", err)
 		os.Exit(1)
@@ -244,8 +245,10 @@ func nextFloat(st uint64) (float64, uint64) {
 	return float64(st>>11) / float64(1<<53), st
 }
 
-// loadTraces reads the store; if sample>0 it reservoir-samples that many traces.
-func loadTraces(path string, sample int, seed int64) ([]corpus.StoredTrace, error) {
+// loadTraces reads the store. first>0 takes the first N traces and stops;
+// otherwise sample>0 reservoir-samples N random traces (reading the whole store);
+// otherwise all traces.
+func loadTraces(path string, first, sample int, seed int64) ([]corpus.StoredTrace, error) {
 	r, err := corpus.OpenTraceStore(path)
 	if err != nil {
 		return nil, err
@@ -255,12 +258,19 @@ func loadTraces(path string, sample int, seed int64) ([]corpus.StoredTrace, erro
 	st := splitmix(uint64(seed))
 	i := 0
 	for {
+		if first > 0 && len(all) >= first {
+			break
+		}
 		tr, err := r.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
+		}
+		if first > 0 {
+			all = append(all, tr)
+			continue
 		}
 		if sample <= 0 {
 			all = append(all, tr)

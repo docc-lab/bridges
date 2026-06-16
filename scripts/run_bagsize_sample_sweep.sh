@@ -26,6 +26,16 @@ SAMPLE_SEED=${SAMPLE_SEED:-1}
 PROGRESS=${PROGRESS:-50000}   # per-cell: print PROGRESS traces=N to the cell's .err every N traces (0 = silent)
 MAXCORES=${MAXCORES:-$(nproc)}
 IFS=', ' read -ra MODES <<< "${MODES:-vanilla pb cgpb sbridge}"   # comma- or space-separated
+IFS=', ' read -ra EXCL <<< "${EXCLUDE:-}"                          # modes to drop, comma- or space-separated
+if [ "${#EXCL[@]}" -gt 0 ]; then
+  keep=()
+  for m in "${MODES[@]}"; do
+    drop=
+    for e in "${EXCL[@]}"; do [ "$m" = "$e" ] && drop=1 && break; done
+    [ -z "$drop" ] && keep+=("$m")
+  done
+  MODES=("${keep[@]}")
+fi
 CPDS=(2 3 4 5 6 7 8)
 OUT=${OUT:-$HOME/bagsize_sample_sweep}
 
@@ -47,24 +57,32 @@ wait
 echo "sweep done in $((SECONDS-t0))s"
 
 # ---- aggregate: corpus-level overhead per cell ----
-python3 - "$OUT" "${MODES[*]}" "${CPDS[*]}" <<'PY' | tee "$OUT/summary.txt"
-import json, sys, os
-out, modes, cpds = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
+python3 - "$OUT" <<'PY' | tee "$OUT/summary.txt"
+import json, sys, os, glob
+out = sys.argv[1]
 def wavg(vals, wts):
     s = sum(wts)
     return (sum(v*w for v, w in zip(vals, wts)) / s) if s else 0.0
+# Discover every cell PRESENT in the dir (not just this run's modes), so a
+# summary after incremental/partial runs includes all modes that have output.
+cells = []
+for f in glob.glob(os.path.join(out, "*_cpd*.json")):
+    mode, _, cpd = os.path.basename(f)[:-5].rpartition("_cpd")
+    try:
+        cells.append((mode, int(cpd), f))
+    except ValueError:
+        continue
+cells.sort(key=lambda c: (c[0], c[1]))
 print(f"{'mode':<9}{'cpd':<4}{'payload_B/span':>15}{'payload_B/ckpt':>16}{'baggage_B/call':>16}")
-for mode in modes:
-    for cpd in cpds:
-        f = os.path.join(out, f"{mode}_cpd{cpd}.json")
-        try:
-            d = json.load(open(f))
-        except Exception:
-            print(f"{mode:<9}{cpd:<4}{'FAIL':>15}"); continue
-        ns, ncs, nbc = d["num_spans"], d["num_checkpoint_spans"], d["num_baggage_calls"]
-        pps = wavg(d["amortized_by_total"], ns)        # payload bytes / span
-        ppc = wavg(d["amortized_by_checkpoint"], ncs)  # payload bytes / checkpoint-span
-        bpc = wavg(d["avg_baggage_call"], nbc)         # baggage bytes / call
-        print(f"{mode:<9}{cpd:<4}{pps:>15.3f}{ppc:>16.3f}{bpc:>16.3f}")
+for mode, cpd, f in cells:
+    try:
+        d = json.load(open(f))
+    except Exception:
+        print(f"{mode:<9}{cpd:<4}{'FAIL':>15}"); continue
+    ns, ncs, nbc = d["num_spans"], d["num_checkpoint_spans"], d["num_baggage_calls"]
+    pps = wavg(d["amortized_by_total"], ns)        # payload bytes / span
+    ppc = wavg(d["amortized_by_checkpoint"], ncs)  # payload bytes / checkpoint-span
+    bpc = wavg(d["avg_baggage_call"], nbc)         # baggage bytes / call
+    print(f"{mode:<9}{cpd:<4}{pps:>15.3f}{ppc:>16.3f}{bpc:>16.3f}")
 PY
 echo "summary -> $OUT/summary.txt"

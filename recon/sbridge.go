@@ -50,14 +50,32 @@ type SBResult struct {
 	Root       *SBNode
 	Unsolvable bool
 	Reason     string
+
+	// Orphan-match accounting (see placeOrphans).
+	OrphanPlaced    int // surviving non-checkpoint spans uniquely matched to a placeholder
+	OrphanAmbiguous int // matched >1 placeholder (truncated-key collision) -> failure
+	OrphanNoPlace   int // matched 0 placeholders (only if a checkpoint was lost; not exercised)
+}
+
+// SBOrphan is a surviving non-checkpoint span carrying real data. own-fp and
+// parent-fp come for free from the real span/parent ids; the span only emits
+// its ordinal + depth. Reconstruction matches it to a unique synthetic
+// placeholder by all four (own-fp, parent-fp, depth, ordinal).
+type SBOrphan struct {
+	SpanID   uint64
+	ParentID uint64
+	Depth    int
+	Ordinal  int
 }
 
 func unsolvable(format string, a ...any) SBResult {
 	return SBResult{Unsolvable: true, Reason: fmt.Sprintf(format, a...)}
 }
 
-// ReconstructSBridge rebuilds the topology of one trace from its emitting spans.
-func ReconstructSBridge(inputs []SBInput, cfg Config) SBResult {
+// ReconstructSBridge rebuilds the topology of one trace from its emitting spans
+// (checkpoint + leaf chains -> the coalesced placeholder graph), then matches
+// each surviving non-checkpoint orphan into a unique placeholder.
+func ReconstructSBridge(inputs []SBInput, orphans []SBOrphan, cfg Config) SBResult {
 	type decoded struct {
 		id uint64
 		br bridge.SBridgeBR
@@ -150,7 +168,67 @@ func ReconstructSBridge(inputs []SBInput, cfg Config) SBResult {
 	if root == nil {
 		return unsolvable("no depth-0 root checkpoint among %d emitting spans", len(inputs))
 	}
-	return SBResult{Root: root}
+	res := SBResult{Root: root}
+	res.placeOrphans(orphans)
+	return res
+}
+
+// node16fp returns a node's 2-byte fingerprint for orphan matching: the low 2
+// bytes of a 16-bit interior fp, or the top 2 bytes of a 32-bit window-anchor
+// (ckpt4). Bare leaves (no recovered fp) return ok=false.
+func node16fp(n *SBNode) (uint16, bool) {
+	switch n.FPBits {
+	case 16:
+		return uint16(n.FP), true
+	case 32:
+		return uint16(n.FP >> 16), true // top 2 of the 4-byte anchor
+	}
+	return 0, false
+}
+
+// placeOrphans matches each surviving non-checkpoint orphan to a synthetic
+// placeholder by the 4-tuple (own-fp, parent-fp, depth, ordinal). The
+// placeholder graph is already coalesced (one position-keyed trie), so a clash
+// is a genuine truncated-key collision, not an un-merged duplicate. Outcomes:
+// unique match -> identify the placeholder with the orphan's id; >=2 -> ambiguity
+// (failure); 0 -> no placeholder (only if a checkpoint was lost). Orphan
+// subgraphs are placed member-by-member, which is equivalent.
+func (res *SBResult) placeOrphans(orphans []SBOrphan) {
+	if res.Root == nil || len(orphans) == 0 {
+		return
+	}
+	type key struct {
+		depth, ord int
+		fp, pfp    uint16
+	}
+	idx := map[key][]*SBNode{}
+	var walk func(n *SBNode, depth int, pfp uint16, pfpOK bool)
+	walk = func(n *SBNode, depth int, pfp uint16, pfpOK bool) {
+		nfp, nfpOK := node16fp(n)
+		// Only unidentified placeholders with a recoverable fp and a fingerprinted
+		// parent are orphan-match candidates (checkpoints/leaves are already known).
+		if n.RealID == 0 && nfpOK && pfpOK {
+			idx[key{depth, n.Ord, nfp, pfp}] = append(idx[key{depth, n.Ord, nfp, pfp}], n)
+		}
+		for _, c := range n.Children {
+			walk(c, depth+1, nfp, nfpOK)
+		}
+	}
+	walk(res.Root, 0, 0, false)
+
+	for _, o := range orphans {
+		k := key{o.Depth, o.Ordinal, uint16(o.SpanID >> 48), uint16(o.ParentID >> 48)}
+		cands := idx[k]
+		switch len(cands) {
+		case 0:
+			res.OrphanNoPlace++
+		case 1:
+			cands[0].RealID = o.SpanID
+			res.OrphanPlaced++
+		default:
+			res.OrphanAmbiguous++
+		}
+	}
 }
 
 // ---- scoring against ground truth ----

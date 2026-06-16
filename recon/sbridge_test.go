@@ -149,10 +149,45 @@ func TestSBridgeReconstructNoDropSingleWindow(t *testing.T) {
 		t.Fatalf("expected 4 emitting spans, got %d", len(inputs))
 	}
 
-	res := ReconstructSBridge(inputs, Config{CPD: cpd})
+	res := ReconstructSBridge(inputs, nil, Config{CPD: cpd})
 	v := ScoreSBridge(res, truthFromSpans(spans))
 	if !v.Correct {
 		t.Fatalf("reconstruction not correct: unsolvable=%v reason=%q", v.Unsolvable, v.Reason)
+	}
+}
+
+// TestSBridgeOrphanMatch feeds the interior survivor as an orphan and checks it
+// uniquely matches its synthetic placeholder (own-fp + parent-fp + depth +
+// ordinal), with zero ambiguity.
+func TestSBridgeOrphanMatch(t *testing.T) {
+	const traceID = 0x00000000cafef00d
+	const (
+		root = 0x1111_0000_0000_0001 // d0 ckpt
+		A    = 0x2222_0000_0000_0002 // d1 interior (no emit) -> orphan
+		A1   = 0x3333_0000_0000_0003 // d2 leaf
+		A2   = 0x4444_0000_0000_0004 // d2 leaf
+	)
+	spans := []tspan{
+		{id: root, parent: 0, start: 0, end: 100},
+		{id: A, parent: root, start: 10, end: 90},
+		{id: A1, parent: A, start: 20, end: 40},
+		{id: A2, parent: A, start: 50, end: 80},
+	}
+	const cpd = 4
+
+	inputs := runSBridge(t, traceID, spans, cpd) // emits root, A1, A2
+	orphans := []SBOrphan{{SpanID: A, ParentID: root, Depth: 1, Ordinal: 1}}
+
+	res := ReconstructSBridge(inputs, orphans, Config{CPD: cpd})
+	if res.OrphanPlaced != 1 || res.OrphanAmbiguous != 0 || res.OrphanNoPlace != 0 {
+		t.Fatalf("orphan stats placed=%d ambiguous=%d noplace=%d, want 1/0/0",
+			res.OrphanPlaced, res.OrphanAmbiguous, res.OrphanNoPlace)
+	}
+	if !hasReal(res.Root, A) {
+		t.Fatalf("orphan A should be identified with its placeholder node")
+	}
+	if v := ScoreSBridgeUnderDrop(res, truthFromSpans(spans)); !v.Correct {
+		t.Fatalf("not correct: %q", v.Reason)
 	}
 }
 
@@ -201,7 +236,7 @@ func TestSBridgeReconstructDropLeaf(t *testing.T) {
 		inputs = append(inputs, in)
 	}
 
-	res := ReconstructSBridge(inputs, Config{CPD: cpd})
+	res := ReconstructSBridge(inputs, nil, Config{CPD: cpd})
 	v := ScoreSBridgeUnderDrop(res, truthFromSpans(spans))
 	if !v.Correct {
 		t.Fatalf("drop-leaf recon not correct: unsolvable=%v reason=%q", v.Unsolvable, v.Reason)
@@ -249,7 +284,7 @@ func TestSBridgeReconstructNoDropMultiWindow(t *testing.T) {
 		t.Fatalf("expected 5 emitting spans, got %d", len(inputs))
 	}
 
-	res := ReconstructSBridge(inputs, Config{CPD: cpd})
+	res := ReconstructSBridge(inputs, nil, Config{CPD: cpd})
 	v := ScoreSBridge(res, truthFromSpans(spans))
 	if !v.Correct {
 		t.Fatalf("reconstruction not correct: unsolvable=%v reason=%q", v.Unsolvable, v.Reason)

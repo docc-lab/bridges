@@ -43,11 +43,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	var nTraces, nUnsolvable, nCorrect int
-	var sumReal, sumEmit int
+	var nTraces, nUnsolvable, nOrphanAmbig, nWrong, nCorrect int
+	var sumEmit, sumOrphans, sumOPlaced, sumOAmbig, sumONoPlace int
 	t0 := time.Now()
 	for i, tr := range traces {
-		payloads, truth := emitTrace(tr, *cpd)
+		payloads, truth, spans := emitTrace(tr, *cpd)
 		dropped := dropSet(tr, *dropRate, *dropSeed, *cpd)
 
 		inputs := make([]recon.SBInput, 0, len(payloads))
@@ -59,23 +59,41 @@ func main() {
 		}
 		sumEmit += len(inputs)
 
-		res := recon.ReconstructSBridge(inputs, recon.Config{CPD: *cpd})
+		// Orphans: surviving non-emitting spans (real ids + emitted ordinal/depth).
+		var orphans []recon.SBOrphan
+		for _, s := range spans {
+			if _, isEmit := payloads[s.id]; isEmit {
+				continue
+			}
+			if _, gone := dropped[s.id]; gone {
+				continue
+			}
+			orphans = append(orphans, recon.SBOrphan{SpanID: s.id, ParentID: s.parent, Depth: s.depth, Ordinal: s.ord})
+		}
+		sumOrphans += len(orphans)
+
+		res := recon.ReconstructSBridge(inputs, orphans, recon.Config{CPD: *cpd})
 		v := recon.ScoreSBridgeUnderDrop(res, truth)
 		nTraces++
+		sumOPlaced += res.OrphanPlaced
+		sumOAmbig += res.OrphanAmbiguous
+		sumONoPlace += res.OrphanNoPlace
 		switch {
 		case v.Unsolvable:
-			nUnsolvable++
-		case v.Correct:
+			nUnsolvable++ // ckpt4 collision
+		case res.OrphanAmbiguous > 0:
+			nOrphanAmbig++ // orphan 4-tuple collision
+		case !v.Correct:
+			nWrong++ // misattachment WITHOUT a flagged collision == design bug
+		default:
 			nCorrect++
-			sumReal += res.CountReal()
 		}
 		if *progress > 0 && (i+1)%*progress == 0 {
-			fmt.Fprintf(os.Stderr, "  %d/%d traces, correct=%d unsolvable=%d (%s)\n",
-				i+1, len(traces), nCorrect, nUnsolvable, time.Since(t0).Round(time.Second))
+			fmt.Fprintf(os.Stderr, "  %d/%d correct=%d ckpt4ambig=%d orphanambig=%d WRONG=%d (%s)\n",
+				i+1, len(traces), nCorrect, nUnsolvable, nOrphanAmbig, nWrong, time.Since(t0).Round(time.Second))
 		}
 	}
 
-	solvable := nTraces - nUnsolvable
 	pct := func(a, b int) float64 {
 		if b == 0 {
 			return 0
@@ -83,21 +101,25 @@ func main() {
 		return 100 * float64(a) / float64(b)
 	}
 	fmt.Printf("=== sbridge topology: cpd=%d drop=%.2f sample=%d ===\n", *cpd, *dropRate, *sample)
-	fmt.Printf("traces=%d  solvable=%d (%.2f%%)  unsolvable=%d (%.2f%%)\n",
-		nTraces, solvable, pct(solvable, nTraces), nUnsolvable, pct(nUnsolvable, nTraces))
-	fmt.Printf("topo_correct=%.4f%% (of solvable)   = %.4f%% (of all)\n",
-		pct(nCorrect, solvable), pct(nCorrect, nTraces))
-	if nCorrect > 0 {
-		fmt.Printf("avg reconstructed real spans/correct trace=%.1f (of %.1f surviving emitters/trace)\n",
-			float64(sumReal)/float64(nCorrect), float64(sumEmit)/float64(nTraces))
-	}
+	fmt.Printf("traces=%d  correct=%d (%.4f%%)\n", nTraces, nCorrect, pct(nCorrect, nTraces))
+	fmt.Printf("failures: ckpt4_ambiguous=%d (%.4f%%)  orphan_ambiguous=%d (%.4f%%)  WRONG[no-collision=BUG]=%d (%.4f%%)\n",
+		nUnsolvable, pct(nUnsolvable, nTraces), nOrphanAmbig, pct(nOrphanAmbig, nTraces), nWrong, pct(nWrong, nTraces))
+	fmt.Printf("orphans:  total=%d  placed=%d  ambiguous=%d  no_placeholder=%d  (avg %.1f orphans, %.1f emitters / trace)\n",
+		sumOrphans, sumOPlaced, sumOAmbig, sumONoPlace, float64(sumOrphans)/float64(nTraces), float64(sumEmit)/float64(nTraces))
+	fmt.Printf("[topo MUST be 100%% unless a key collides; WRONG>0 means the design failed, not the run]\n")
+}
+
+// spanInfo is per-span data needed to build orphan keys (real ids + ordinal/depth).
+type spanInfo struct {
+	id, parent  uint64
+	ord, depth  int
 }
 
 // emitTrace replays one trace through a fresh SBridgeHandler in stored stream
-// order, capturing each emitting span's serialized _br payload, and builds the
-// ground-truth tree (children indexed by 1-based start ordinal — the same
-// ordinal the handler assigns).
-func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth) {
+// order, capturing each emitting span's serialized _br payload, the ground-truth
+// tree (children indexed by 1-based start ordinal — the same ordinal the handler
+// assigns), and per-span (parent, ordinal, depth) for orphan matching.
+func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth, []spanInfo) {
 	h := bridge.NewSBridgeHandler(cpd, nil)
 	// Charge the per-span attributes reconstruction relies on: _d (depth) and
 	// _oc (ordinal chain, for non-checkpoint self-placement). Topology recon
@@ -111,6 +133,8 @@ func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth
 	}
 	truth := recon.SBTruth{ChildByOrd: map[uint64]map[int]uint64{}}
 	nextSeq := map[uint64]int{}
+	var spans []spanInfo
+	parent := map[uint64]uint64{}
 	for _, e := range tr.Events {
 		ev := &bridge.Event{TraceID: tr.TraceID, SpanID: e.SpanID, ParentID: e.ParentID, ServiceID: e.ServiceID}
 		if e.Kind == corpus.KindStart {
@@ -127,13 +151,35 @@ func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth
 			} else {
 				truth.RootID = e.SpanID
 			}
+			parent[e.SpanID] = e.ParentID
+			spans = append(spans, spanInfo{id: e.SpanID, parent: e.ParentID, ord: seq})
 			h.OnStart(ev, seq)
 		} else {
 			h.OnEnd(ev)
 		}
 	}
 	h.EvictTrace(tr.TraceID)
-	return payloads, truth
+
+	// Fill absolute depths (memoized walk up the parent map).
+	depth := map[uint64]int{}
+	var d func(uint64) int
+	d = func(s uint64) int {
+		if v, ok := depth[s]; ok {
+			return v
+		}
+		p := parent[s]
+		if p == 0 {
+			depth[s] = 0
+			return 0
+		}
+		v := d(p) + 1
+		depth[s] = v
+		return v
+	}
+	for i := range spans {
+		spans[i].depth = d(spans[i].id)
+	}
+	return payloads, truth, spans
 }
 
 // dropSet picks the dropped span ids for one trace. CHECKPOINTS (depth%cpd==0)

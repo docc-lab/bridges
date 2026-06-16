@@ -52,6 +52,17 @@ for cpd in "${CPDS[@]}"; do
   done
 done
 while read -r _w cpd r; do
+  out="$OUT/cpd${cpd}_r${r}.json"
+  # Idempotent resume: skip a cell only if its output JSON already exists and is
+  # non-empty. trace_recon writes that file last (after every trace is scored),
+  # so its presence means the cell completed. A killed/OOM'd cell never wrote it
+  # (a stale .err with no TOPO does NOT count as done), so it gets re-run. This
+  # lets a relaunch fill in only the missing/dead cells without redoing finished
+  # ones. Set FORCE=1 to ignore existing outputs and re-run everything.
+  if [ -z "${FORCE:-}" ] && [ -s "$out" ]; then
+    echo "skip cpd=$cpd r=$r (already done: $out)"
+    continue
+  fi
   (
     TRACE_RECON_TOPO=1 TRACE_RECON_CPSAT=1 ./bin/trace_recon_cgprb \
       --corpus "$META" --trace-store "$STORE" --mode cgprb \

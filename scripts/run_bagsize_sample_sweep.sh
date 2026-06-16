@@ -26,16 +26,16 @@ SAMPLE_SEED=${SAMPLE_SEED:-1}
 PROGRESS=${PROGRESS:-50000}   # per-cell: print PROGRESS traces=N to the cell's .err every N traces (0 = silent)
 MAXCORES=${MAXCORES:-$(nproc)}
 IFS=', ' read -ra MODES <<< "${MODES:-vanilla pb cgpb sbridge}"   # comma- or space-separated
-IFS=', ' read -ra EXCL <<< "${EXCLUDE:-}"                          # modes to drop, comma- or space-separated
-if [ "${#EXCL[@]}" -gt 0 ]; then
-  keep=()
-  for m in "${MODES[@]}"; do
-    drop=
-    for e in "${EXCL[@]}"; do [ "$m" = "$e" ] && drop=1 && break; done
-    [ -z "$drop" ] && keep+=("$m")
+IFS=', ' read -ra EXCL <<< "${EXCLUDE:-}"   # exclude whole modes ("sbridge") AND/OR
+                                            # individual cells ("sbridge_cpd2"); comma/space-sep
+is_excluded() {  # $1=mode $2=cpd ; true if "$mode" or "${mode}_cpd${cpd}" is listed
+  [ "${#EXCL[@]}" -eq 0 ] && return 1
+  local e
+  for e in "${EXCL[@]}"; do
+    if [ "$e" = "$1" ] || [ "$e" = "${1}_cpd${2}" ]; then return 0; fi
   done
-  MODES=("${keep[@]}")
-fi
+  return 1
+}
 CPDS=(2 3 4 5 6 7 8)
 OUT=${OUT:-$HOME/bagsize_sample_sweep}
 
@@ -47,6 +47,7 @@ echo "corpus=$CORPUS sample=$SAMPLE seed=$SAMPLE_SEED maxcores=$MAXCORES modes=$
 t0=$SECONDS
 for mode in "${MODES[@]}"; do
   for cpd in "${CPDS[@]}"; do
+    if is_excluded "$mode" "$cpd"; then echo "skip $mode cpd=$cpd (excluded)"; continue; fi
     ( ./bin/trace_sim_go --corpus "$CORPUS" --bagsize --mode "$mode" --checkpoint-distance "$cpd" --progress "$PROGRESS" $SARG \
         -o "$OUT/${mode}_cpd${cpd}.json" 2> "$OUT/${mode}_cpd${cpd}.err"
       echo "done $mode cpd=$cpd" ) &

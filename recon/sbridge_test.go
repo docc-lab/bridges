@@ -177,15 +177,15 @@ func TestSBridgeEdgeIdentify(t *testing.T) {
 
 	inputs := runSBridge(t, traceID, spans, cpd) // emits root, A1, A2
 	survivors := []SBSurvivor{
-		{SpanID: root, ParentID: 0, Ordinal: 0},
-		{SpanID: A, ParentID: root, Ordinal: 1},
-		{SpanID: A1, ParentID: A, Ordinal: 1},
-		{SpanID: A2, ParentID: A, Ordinal: 2},
+		{SpanID: root, ParentID: 0, Ordinal: 0, Depth: 0},
+		{SpanID: A, ParentID: root, Ordinal: 1, Depth: 1},
+		{SpanID: A1, ParentID: A, Ordinal: 1, Depth: 2},
+		{SpanID: A2, ParentID: A, Ordinal: 2, Depth: 2},
 	}
 
 	res := ReconstructSBridge(inputs, survivors, Config{CPD: cpd})
-	if res.Unidentified != 0 {
-		t.Fatalf("unidentified=%d, want 0", res.Unidentified)
+	if res.SeveredAmbiguous != 0 || res.SeveredNoPlace != 0 {
+		t.Fatalf("all connected, want no severed: ambiguous=%d noplace=%d", res.SeveredAmbiguous, res.SeveredNoPlace)
 	}
 	if !hasReal(res.Root, A) {
 		t.Fatalf("interior survivor A should be identified via its real edge")

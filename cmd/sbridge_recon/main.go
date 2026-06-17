@@ -44,8 +44,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	var nTraces, nUnsolvable, nWrong, nCorrect int
-	var sumEmit, sumSurv, sumIdent, sumUnident, sumReal int
+	var nTraces, nUnsolvable, nSevAmbig, nWrong, nCorrect int
+	var sumEmit, sumSurv, sumIdent, sumSevPlaced, sumSevNoPlace, sumReal int
 	t0 := time.Now()
 	for i, tr := range traces {
 		payloads, truth, spans := emitTrace(tr, *cpd)
@@ -60,14 +60,14 @@ func main() {
 		}
 		sumEmit += len(inputs)
 
-		// All survivors (emitters + non-emitters); the reconstructor identifies
-		// connected ones by their real parent->child edges — no placeholder search.
+		// Every surviving span: connected ones attach by their real parent edge,
+		// severed ones (parent dropped) by their (depth, ordinal, own-fp, parent-fp).
 		var survivors []recon.SBSurvivor
 		for _, s := range spans {
 			if _, gone := dropped[s.id]; gone {
 				continue
 			}
-			survivors = append(survivors, recon.SBSurvivor{SpanID: s.id, ParentID: s.parent, Ordinal: s.ord})
+			survivors = append(survivors, recon.SBSurvivor{SpanID: s.id, ParentID: s.parent, Ordinal: s.ord, Depth: s.depth})
 		}
 		sumSurv += len(survivors)
 
@@ -75,19 +75,22 @@ func main() {
 		v := recon.ScoreSBridgeUnderDrop(res, truth)
 		nTraces++
 		sumIdent += res.Identified
-		sumUnident += res.Unidentified
+		sumSevPlaced += res.SeveredPlaced
+		sumSevNoPlace += res.SeveredNoPlace
 		sumReal += res.CountReal()
 		switch {
 		case v.Unsolvable:
 			nUnsolvable++ // ckpt4 collision
+		case res.SeveredAmbiguous > 0:
+			nSevAmbig++ // severed 4-tuple collision
 		case !v.Correct:
-			nWrong++ // misattachment == design bug
+			nWrong++ // misattachment with no flagged collision == design bug
 		default:
 			nCorrect++
 		}
 		if *progress > 0 && (i+1)%*progress == 0 {
-			fmt.Fprintf(os.Stderr, "  %d/%d correct=%d ckpt4ambig=%d WRONG=%d unident=%d (%s)\n",
-				i+1, len(traces), nCorrect, nUnsolvable, nWrong, sumUnident, time.Since(t0).Round(time.Second))
+			fmt.Fprintf(os.Stderr, "  %d/%d correct=%d ckpt4ambig=%d sevambig=%d WRONG=%d (%s)\n",
+				i+1, len(traces), nCorrect, nUnsolvable, nSevAmbig, nWrong, time.Since(t0).Round(time.Second))
 		}
 	}
 
@@ -99,11 +102,11 @@ func main() {
 	}
 	fmt.Printf("=== sbridge topology: cpd=%d drop=%.2f sample=%d ===\n", *cpd, *dropRate, *sample)
 	fmt.Printf("traces=%d  correct=%d (%.4f%%)\n", nTraces, nCorrect, pct(nCorrect, nTraces))
-	fmt.Printf("failures: ckpt4_ambiguous=%d (%.4f%%)  WRONG[no-collision=BUG]=%d (%.4f%%)\n",
-		nUnsolvable, pct(nUnsolvable, nTraces), nWrong, pct(nWrong, nTraces))
-	fmt.Printf("coverage: reconstructed_real_spans=%d of survivors=%d (%.4f%%)   [edge-identified=%d, unidentified-no-witness=%d]\n",
-		sumReal, sumSurv, pct(sumReal, sumSurv), sumIdent, sumUnident)
-	fmt.Printf("[topo MUST be 100%% unless ckpt4 collides; WRONG>0 means the design failed, not the run]\n")
+	fmt.Printf("failures: ckpt4_ambiguous=%d (%.4f%%)  severed_ambiguous=%d (%.4f%%)  WRONG[no-collision=BUG]=%d (%.4f%%)\n",
+		nUnsolvable, pct(nUnsolvable, nTraces), nSevAmbig, pct(nSevAmbig, nTraces), nWrong, pct(nWrong, nTraces))
+	fmt.Printf("coverage: reconstructed_real_spans=%d of survivors=%d (%.4f%%)   [edge=%d, severed-placed=%d, severed-noplace=%d]\n",
+		sumReal, sumSurv, pct(sumReal, sumSurv), sumIdent, sumSevPlaced, sumSevNoPlace)
+	fmt.Printf("[topo MUST be 100%% unless a key collides; WRONG>0 means the design failed, not the run]\n")
 }
 
 // spanInfo is per-span data needed to build orphan keys (real ids + ordinal/depth).
@@ -179,18 +182,22 @@ func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth
 	return payloads, truth, spans
 }
 
-// dropSet picks the dropped span ids for one trace. CHECKPOINTS (depth%cpd==0)
-// are never droppable — they're the protected carriers, exactly as in every
-// other mode (trace_recon protects _br carriers identically). Only non-checkpoint
-// spans are candidates; a per-trace splitmix seed gives an independent uniform
-// draw per candidate (sorted id order), so the decision is order/partition-
-// invariant.
+// dropSet picks the dropped span ids for one trace. CHECKPOINTS are never
+// droppable, and in this design the checkpoint set is { root, every leaf, every
+// depth%cpd==0 node } — they all carry the _br breadcrumb. Only INTERIOR
+// non-leaf, non-depth-checkpoint spans (which carry just _d + _o) are drop
+// candidates. A per-trace splitmix seed gives an independent uniform draw per
+// candidate (sorted id order), so the decision is order/partition-invariant.
 func dropSet(tr corpus.StoredTrace, rate float64, base int64, cpd int) map[uint64]struct{} {
 	parent := map[uint64]uint64{}
+	hasKids := map[uint64]bool{}
 	var ids []uint64
 	for _, e := range tr.Events {
 		if e.Kind == corpus.KindStart {
 			parent[e.SpanID] = e.ParentID
+			if e.ParentID != 0 {
+				hasKids[e.ParentID] = true
+			}
 			ids = append(ids, e.SpanID)
 		}
 	}
@@ -212,7 +219,8 @@ func dropSet(tr corpus.StoredTrace, rate float64, base int64, cpd int) map[uint6
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	cands := make([]uint64, 0, len(ids))
 	for _, id := range ids {
-		if d(id)%cpd != 0 { // skip checkpoints
+		// droppable iff interior: not root, not a leaf, not a depth-checkpoint.
+		if parent[id] != 0 && hasKids[id] && d(id)%cpd != 0 {
 			cands = append(cands, id)
 		}
 	}

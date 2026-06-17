@@ -51,20 +51,22 @@ type SBResult struct {
 	Unsolvable bool
 	Reason     string
 
-	// Edge-identification accounting (see identifyByEdges).
-	Identified   int // survivors placed on a skeleton node via their real parent edge
-	Unidentified int // survivors with an identified parent but no skeleton node at their ordinal
-	// (no emitting descendant witnessed them; expected ~0)
+	// Attachment accounting.
+	Identified      int // survivors attached by their real parent edge (connected)
+	SeveredPlaced   int // severed survivors (parent dropped) uniquely matched by 4-tuple
+	SeveredAmbiguous int // severed survivor matched >1 slot (truncated-key collision) -> fail
+	SeveredNoPlace  int // severed survivor matched 0 slots (shouldn't happen: leaves never drop)
 }
 
-// SBSurvivor is one surviving span's real topology: its id, its real parent, and
-// its 1-based start ordinal under that parent. Used to attach connected
-// survivors to the reconstructed tree by their real edges — no placeholder
-// search, no fingerprint matching.
+// SBSurvivor is one surviving span's real topology: id, real parent, 1-based
+// start ordinal under that parent, and absolute depth. Connected survivors
+// attach by their real edge; severed ones (parent dropped) by the 4-tuple
+// (depth, ordinal, own-fp, parent-fp).
 type SBSurvivor struct {
 	SpanID   uint64
 	ParentID uint64
 	Ordinal  int
+	Depth    int
 }
 
 func unsolvable(format string, a ...any) SBResult {
@@ -169,20 +171,31 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 		return unsolvable("no depth-0 root checkpoint among %d emitting spans", len(inputs))
 	}
 	res := SBResult{Root: root}
-	res.identifyByEdges(survivors)
+	labeled := map[uint64]bool{}
+	collectRealIDs(root, labeled) // checkpoints + leaves placed by their own chains (incl. severed)
+	res.identifyByEdges(survivors, labeled)
+	res.placeSevered(survivors, labeled)
 	return res
 }
 
-// identifyByEdges assigns real span ids to skeleton nodes top-down using the
-// survivors' REAL parent->child edges — no fingerprint matching, no placeholder
-// search. Starting from the root (already identified), a surviving child at
-// ordinal o under an identified node takes the skeleton child at that ordinal.
-// So any survivor connected to a checkpoint/root through surviving edges is
-// placed by its edges alone. A surviving child with no skeleton node at its
-// ordinal (its entire subtree's emitters dropped, so nothing witnessed it) is
-// counted Unidentified (expected ~0). Severed survivors (parent dropped) aren't
-// reached here — they're already positioned by their own chain in the skeleton.
-func (res *SBResult) identifyByEdges(survivors []SBSurvivor) {
+// collectRealIDs records every span id already placed on the skeleton by a chain
+// (the checkpoints and leaves, wherever they sit — connected or severed).
+func collectRealIDs(n *SBNode, into map[uint64]bool) {
+	if n.RealID != 0 {
+		into[n.RealID] = true
+	}
+	for _, c := range n.Children {
+		collectRealIDs(c, into)
+	}
+}
+
+// identifyByEdges attaches CONNECTED interior survivors to the skeleton top-down
+// by their REAL parent->child edges — no fingerprint matching. From the root, a
+// surviving child at ordinal o under an identified node takes the skeleton child
+// at that ordinal. Adds each attached id to labeled; Identified counts the ones
+// it newly placed (previously-unlabeled interior nodes). Survivors whose parent
+// dropped are never reached here — placeSevered handles them.
+func (res *SBResult) identifyByEdges(survivors []SBSurvivor, labeled map[uint64]bool) {
 	if res.Root == nil {
 		return
 	}
@@ -198,22 +211,79 @@ func (res *SBResult) identifyByEdges(survivors []SBSurvivor) {
 		}
 		m[s.Ordinal] = s.SpanID
 	}
+	visited := map[*SBNode]bool{}
 	queue := []*SBNode{res.Root}
 	for len(queue) > 0 {
 		n := queue[0]
 		queue = queue[1:]
-		if n.RealID == 0 {
+		if visited[n] || n.RealID == 0 {
 			continue
 		}
-		res.Identified++
+		visited[n] = true
 		for ord, childID := range kids[n.RealID] {
 			c := n.Children[ord]
 			if c == nil {
-				res.Unidentified++ // connected survivor with no skeleton witness
 				continue
 			}
-			c.RealID = childID
+			if c.RealID == 0 {
+				c.RealID = childID // newly attached interior span
+				res.Identified++
+			}
+			labeled[childID] = true
 			queue = append(queue, c)
+		}
+	}
+}
+
+// node16fp returns a skeleton node's 2-byte fingerprint: an interior fp directly,
+// or the top 2 bytes of a 4-byte window anchor (ckpt4).
+func node16fp(n *SBNode) (uint16, bool) {
+	switch n.FPBits {
+	case 16:
+		return uint16(n.FP), true
+	case 32:
+		return uint16(n.FP >> 16), true
+	}
+	return 0, false
+}
+
+// placeSevered re-attaches survivors whose parent dropped (so edges couldn't
+// reach them) by matching their (depth, ordinal, own-fp, parent-fp) 4-tuple to a
+// unique unlabeled skeleton slot. Because leaves never drop, every dropped
+// interior span is witnessed by a surviving leaf below it, so the slot always
+// exists. >=2 matches -> ambiguous (a truncated-key collision); 0 -> no slot
+// (shouldn't happen).
+func (res *SBResult) placeSevered(survivors []SBSurvivor, labeled map[uint64]bool) {
+	type key struct {
+		depth, ord int
+		fp, pfp    uint16
+	}
+	idx := map[key][]*SBNode{}
+	var walk func(n *SBNode, depth int, pfp uint16, pfpOK bool)
+	walk = func(n *SBNode, depth int, pfp uint16, pfpOK bool) {
+		nfp, nfpOK := node16fp(n)
+		if n.RealID == 0 && nfpOK && pfpOK {
+			idx[key{depth, n.Ord, nfp, pfp}] = append(idx[key{depth, n.Ord, nfp, pfp}], n)
+		}
+		for _, c := range n.Children {
+			walk(c, depth+1, nfp, nfpOK)
+		}
+	}
+	walk(res.Root, 0, 0, false)
+
+	for _, s := range survivors {
+		if labeled[s.SpanID] {
+			continue // attached by edge
+		}
+		k := key{s.Depth, s.Ordinal, uint16(s.SpanID >> 48), uint16(s.ParentID >> 48)}
+		switch cands := idx[k]; len(cands) {
+		case 0:
+			res.SeveredNoPlace++
+		case 1:
+			cands[0].RealID = s.SpanID
+			res.SeveredPlaced++
+		default:
+			res.SeveredAmbiguous++
 		}
 	}
 }

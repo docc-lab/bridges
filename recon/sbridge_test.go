@@ -156,14 +156,14 @@ func TestSBridgeReconstructNoDropSingleWindow(t *testing.T) {
 	}
 }
 
-// TestSBridgeOrphanMatch feeds the interior survivor as an orphan and checks it
-// uniquely matches its synthetic placeholder (own-fp + parent-fp + depth +
-// ordinal), with zero ambiguity.
-func TestSBridgeOrphanMatch(t *testing.T) {
+// TestSBridgeEdgeIdentify feeds the interior survivor via its real parent edge
+// and checks it's identified on the skeleton by that edge (no placeholder
+// search), with nothing left unidentified.
+func TestSBridgeEdgeIdentify(t *testing.T) {
 	const traceID = 0x00000000cafef00d
 	const (
 		root = 0x1111_0000_0000_0001 // d0 ckpt
-		A    = 0x2222_0000_0000_0002 // d1 interior (no emit) -> orphan
+		A    = 0x2222_0000_0000_0002 // d1 interior (no emit)
 		A1   = 0x3333_0000_0000_0003 // d2 leaf
 		A2   = 0x4444_0000_0000_0004 // d2 leaf
 	)
@@ -176,15 +176,19 @@ func TestSBridgeOrphanMatch(t *testing.T) {
 	const cpd = 4
 
 	inputs := runSBridge(t, traceID, spans, cpd) // emits root, A1, A2
-	orphans := []SBOrphan{{SpanID: A, ParentID: root, Depth: 1, Ordinal: 1}}
+	survivors := []SBSurvivor{
+		{SpanID: root, ParentID: 0, Ordinal: 0},
+		{SpanID: A, ParentID: root, Ordinal: 1},
+		{SpanID: A1, ParentID: A, Ordinal: 1},
+		{SpanID: A2, ParentID: A, Ordinal: 2},
+	}
 
-	res := ReconstructSBridge(inputs, orphans, Config{CPD: cpd})
-	if res.OrphanPlaced != 1 || res.OrphanAmbiguous != 0 || res.OrphanNoPlace != 0 {
-		t.Fatalf("orphan stats placed=%d ambiguous=%d noplace=%d, want 1/0/0",
-			res.OrphanPlaced, res.OrphanAmbiguous, res.OrphanNoPlace)
+	res := ReconstructSBridge(inputs, survivors, Config{CPD: cpd})
+	if res.Unidentified != 0 {
+		t.Fatalf("unidentified=%d, want 0", res.Unidentified)
 	}
 	if !hasReal(res.Root, A) {
-		t.Fatalf("orphan A should be identified with its placeholder node")
+		t.Fatalf("interior survivor A should be identified via its real edge")
 	}
 	if v := ScoreSBridgeUnderDrop(res, truthFromSpans(spans)); !v.Correct {
 		t.Fatalf("not correct: %q", v.Reason)

@@ -51,20 +51,19 @@ type SBResult struct {
 	Unsolvable bool
 	Reason     string
 
-	// Orphan-match accounting (see placeOrphans).
-	OrphanPlaced    int // surviving non-checkpoint spans uniquely matched to a placeholder
-	OrphanAmbiguous int // matched >1 placeholder (truncated-key collision) -> failure
-	OrphanNoPlace   int // matched 0 placeholders (only if a checkpoint was lost; not exercised)
+	// Edge-identification accounting (see identifyByEdges).
+	Identified   int // survivors placed on a skeleton node via their real parent edge
+	Unidentified int // survivors with an identified parent but no skeleton node at their ordinal
+	// (no emitting descendant witnessed them; expected ~0)
 }
 
-// SBOrphan is a surviving non-checkpoint span carrying real data. own-fp and
-// parent-fp come for free from the real span/parent ids; the span only emits
-// its ordinal + depth. Reconstruction matches it to a unique synthetic
-// placeholder by all four (own-fp, parent-fp, depth, ordinal).
-type SBOrphan struct {
+// SBSurvivor is one surviving span's real topology: its id, its real parent, and
+// its 1-based start ordinal under that parent. Used to attach connected
+// survivors to the reconstructed tree by their real edges — no placeholder
+// search, no fingerprint matching.
+type SBSurvivor struct {
 	SpanID   uint64
 	ParentID uint64
-	Depth    int
 	Ordinal  int
 }
 
@@ -72,10 +71,11 @@ func unsolvable(format string, a ...any) SBResult {
 	return SBResult{Unsolvable: true, Reason: fmt.Sprintf(format, a...)}
 }
 
-// ReconstructSBridge rebuilds the topology of one trace from its emitting spans
-// (checkpoint + leaf chains -> the coalesced placeholder graph), then matches
-// each surviving non-checkpoint orphan into a unique placeholder.
-func ReconstructSBridge(inputs []SBInput, orphans []SBOrphan, cfg Config) SBResult {
+// ReconstructSBridge rebuilds the topology of one trace. The emitting spans'
+// chains build the skeleton (positioning dropped interior spans by ckpt4 + the
+// breadcrumb shift); then connected survivors are identified on that skeleton by
+// walking their REAL parent->child edges from the root — no placeholder search.
+func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SBResult {
 	type decoded struct {
 		id uint64
 		br bridge.SBridgeBR
@@ -169,64 +169,51 @@ func ReconstructSBridge(inputs []SBInput, orphans []SBOrphan, cfg Config) SBResu
 		return unsolvable("no depth-0 root checkpoint among %d emitting spans", len(inputs))
 	}
 	res := SBResult{Root: root}
-	res.placeOrphans(orphans)
+	res.identifyByEdges(survivors)
 	return res
 }
 
-// node16fp returns a node's 2-byte fingerprint for orphan matching: the low 2
-// bytes of a 16-bit interior fp, or the top 2 bytes of a 32-bit window-anchor
-// (ckpt4). Bare leaves (no recovered fp) return ok=false.
-func node16fp(n *SBNode) (uint16, bool) {
-	switch n.FPBits {
-	case 16:
-		return uint16(n.FP), true
-	case 32:
-		return uint16(n.FP >> 16), true // top 2 of the 4-byte anchor
-	}
-	return 0, false
-}
-
-// placeOrphans matches each surviving non-checkpoint orphan to a synthetic
-// placeholder by the 4-tuple (own-fp, parent-fp, depth, ordinal). The
-// placeholder graph is already coalesced (one position-keyed trie), so a clash
-// is a genuine truncated-key collision, not an un-merged duplicate. Outcomes:
-// unique match -> identify the placeholder with the orphan's id; >=2 -> ambiguity
-// (failure); 0 -> no placeholder (only if a checkpoint was lost). Orphan
-// subgraphs are placed member-by-member, which is equivalent.
-func (res *SBResult) placeOrphans(orphans []SBOrphan) {
-	if res.Root == nil || len(orphans) == 0 {
+// identifyByEdges assigns real span ids to skeleton nodes top-down using the
+// survivors' REAL parent->child edges — no fingerprint matching, no placeholder
+// search. Starting from the root (already identified), a surviving child at
+// ordinal o under an identified node takes the skeleton child at that ordinal.
+// So any survivor connected to a checkpoint/root through surviving edges is
+// placed by its edges alone. A surviving child with no skeleton node at its
+// ordinal (its entire subtree's emitters dropped, so nothing witnessed it) is
+// counted Unidentified (expected ~0). Severed survivors (parent dropped) aren't
+// reached here — they're already positioned by their own chain in the skeleton.
+func (res *SBResult) identifyByEdges(survivors []SBSurvivor) {
+	if res.Root == nil {
 		return
 	}
-	type key struct {
-		depth, ord int
-		fp, pfp    uint16
-	}
-	idx := map[key][]*SBNode{}
-	var walk func(n *SBNode, depth int, pfp uint16, pfpOK bool)
-	walk = func(n *SBNode, depth int, pfp uint16, pfpOK bool) {
-		nfp, nfpOK := node16fp(n)
-		// Only unidentified placeholders with a recoverable fp and a fingerprinted
-		// parent are orphan-match candidates (checkpoints/leaves are already known).
-		if n.RealID == 0 && nfpOK && pfpOK {
-			idx[key{depth, n.Ord, nfp, pfp}] = append(idx[key{depth, n.Ord, nfp, pfp}], n)
+	kids := make(map[uint64]map[int]uint64) // real parent id -> ordinal -> child id
+	for _, s := range survivors {
+		if s.ParentID == 0 {
+			continue
 		}
-		for _, c := range n.Children {
-			walk(c, depth+1, nfp, nfpOK)
+		m := kids[s.ParentID]
+		if m == nil {
+			m = make(map[int]uint64)
+			kids[s.ParentID] = m
 		}
+		m[s.Ordinal] = s.SpanID
 	}
-	walk(res.Root, 0, 0, false)
-
-	for _, o := range orphans {
-		k := key{o.Depth, o.Ordinal, uint16(o.SpanID >> 48), uint16(o.ParentID >> 48)}
-		cands := idx[k]
-		switch len(cands) {
-		case 0:
-			res.OrphanNoPlace++
-		case 1:
-			cands[0].RealID = o.SpanID
-			res.OrphanPlaced++
-		default:
-			res.OrphanAmbiguous++
+	queue := []*SBNode{res.Root}
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		if n.RealID == 0 {
+			continue
+		}
+		res.Identified++
+		for ord, childID := range kids[n.RealID] {
+			c := n.Children[ord]
+			if c == nil {
+				res.Unidentified++ // connected survivor with no skeleton witness
+				continue
+			}
+			c.RealID = childID
+			queue = append(queue, c)
 		}
 	}
 }

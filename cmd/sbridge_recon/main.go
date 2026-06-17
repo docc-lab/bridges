@@ -44,8 +44,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	var nTraces, nUnsolvable, nOrphanAmbig, nWrong, nCorrect int
-	var sumEmit, sumOrphans, sumOPlaced, sumOAmbig, sumONoPlace int
+	var nTraces, nUnsolvable, nWrong, nCorrect int
+	var sumEmit, sumSurv, sumIdent, sumUnident, sumReal int
 	t0 := time.Now()
 	for i, tr := range traces {
 		payloads, truth, spans := emitTrace(tr, *cpd)
@@ -60,38 +60,34 @@ func main() {
 		}
 		sumEmit += len(inputs)
 
-		// Orphans: surviving non-emitting spans (real ids + emitted ordinal/depth).
-		var orphans []recon.SBOrphan
+		// All survivors (emitters + non-emitters); the reconstructor identifies
+		// connected ones by their real parent->child edges — no placeholder search.
+		var survivors []recon.SBSurvivor
 		for _, s := range spans {
-			if _, isEmit := payloads[s.id]; isEmit {
-				continue
-			}
 			if _, gone := dropped[s.id]; gone {
 				continue
 			}
-			orphans = append(orphans, recon.SBOrphan{SpanID: s.id, ParentID: s.parent, Depth: s.depth, Ordinal: s.ord})
+			survivors = append(survivors, recon.SBSurvivor{SpanID: s.id, ParentID: s.parent, Ordinal: s.ord})
 		}
-		sumOrphans += len(orphans)
+		sumSurv += len(survivors)
 
-		res := recon.ReconstructSBridge(inputs, orphans, recon.Config{CPD: *cpd})
+		res := recon.ReconstructSBridge(inputs, survivors, recon.Config{CPD: *cpd})
 		v := recon.ScoreSBridgeUnderDrop(res, truth)
 		nTraces++
-		sumOPlaced += res.OrphanPlaced
-		sumOAmbig += res.OrphanAmbiguous
-		sumONoPlace += res.OrphanNoPlace
+		sumIdent += res.Identified
+		sumUnident += res.Unidentified
+		sumReal += res.CountReal()
 		switch {
 		case v.Unsolvable:
 			nUnsolvable++ // ckpt4 collision
-		case res.OrphanAmbiguous > 0:
-			nOrphanAmbig++ // orphan 4-tuple collision
 		case !v.Correct:
-			nWrong++ // misattachment WITHOUT a flagged collision == design bug
+			nWrong++ // misattachment == design bug
 		default:
 			nCorrect++
 		}
 		if *progress > 0 && (i+1)%*progress == 0 {
-			fmt.Fprintf(os.Stderr, "  %d/%d correct=%d ckpt4ambig=%d orphanambig=%d WRONG=%d (%s)\n",
-				i+1, len(traces), nCorrect, nUnsolvable, nOrphanAmbig, nWrong, time.Since(t0).Round(time.Second))
+			fmt.Fprintf(os.Stderr, "  %d/%d correct=%d ckpt4ambig=%d WRONG=%d unident=%d (%s)\n",
+				i+1, len(traces), nCorrect, nUnsolvable, nWrong, sumUnident, time.Since(t0).Round(time.Second))
 		}
 	}
 
@@ -103,11 +99,11 @@ func main() {
 	}
 	fmt.Printf("=== sbridge topology: cpd=%d drop=%.2f sample=%d ===\n", *cpd, *dropRate, *sample)
 	fmt.Printf("traces=%d  correct=%d (%.4f%%)\n", nTraces, nCorrect, pct(nCorrect, nTraces))
-	fmt.Printf("failures: ckpt4_ambiguous=%d (%.4f%%)  orphan_ambiguous=%d (%.4f%%)  WRONG[no-collision=BUG]=%d (%.4f%%)\n",
-		nUnsolvable, pct(nUnsolvable, nTraces), nOrphanAmbig, pct(nOrphanAmbig, nTraces), nWrong, pct(nWrong, nTraces))
-	fmt.Printf("orphans:  total=%d  placed=%d  ambiguous=%d  no_placeholder=%d  (avg %.1f orphans, %.1f emitters / trace)\n",
-		sumOrphans, sumOPlaced, sumOAmbig, sumONoPlace, float64(sumOrphans)/float64(nTraces), float64(sumEmit)/float64(nTraces))
-	fmt.Printf("[topo MUST be 100%% unless a key collides; WRONG>0 means the design failed, not the run]\n")
+	fmt.Printf("failures: ckpt4_ambiguous=%d (%.4f%%)  WRONG[no-collision=BUG]=%d (%.4f%%)\n",
+		nUnsolvable, pct(nUnsolvable, nTraces), nWrong, pct(nWrong, nTraces))
+	fmt.Printf("coverage: reconstructed_real_spans=%d of survivors=%d (%.4f%%)   [edge-identified=%d, unidentified-no-witness=%d]\n",
+		sumReal, sumSurv, pct(sumReal, sumSurv), sumIdent, sumUnident)
+	fmt.Printf("[topo MUST be 100%% unless ckpt4 collides; WRONG>0 means the design failed, not the run]\n")
 }
 
 // spanInfo is per-span data needed to build orphan keys (real ids + ordinal/depth).

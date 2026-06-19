@@ -111,6 +111,12 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 		h := bridge.NewCGPBBridgeHandler(c.checkpointDistance, bridge.DefaultBloomFPRate)
 		h.EmitDepth = c.emitDepth
 		return h
+	case "cgprb":
+		// The call-graph-preserving PCRB we actually reconstruct in trace_recon
+		// --mode cgprb: PCRB payload (truncated ckpt id + in-window bloom) plus
+		// the window-local HA. Same constructor args/defaults as the recon path
+		// so the byte accounting matches what cpd=8 recon consumed.
+		return bridge.NewCGPRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 	case "sbridge":
 		var logger *bridge.DeeSizeLogger
 		if c.logDee {

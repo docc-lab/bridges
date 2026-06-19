@@ -39,7 +39,8 @@ type SBNode struct {
 	Ord      int    // start ordinal under its parent (0 for the window root)
 	RealID   uint64 // known span id if an emitting span landed here, else 0
 	FP       uint32 // recovered fingerprint
-	FPBits   int    // 32 = window-root ckpt4, 16 = interior 2-byte fp, 0 = none (bare leaf)
+	FPBits   int    // 32 = window-root ckpt4; else = interior fp width (e.g. 16); 0 = none (bare leaf)
+	EE       []int  // this node's witnessed end-block (earlier-sibling ends before it started)
 	Children map[int]*SBNode
 }
 
@@ -50,6 +51,8 @@ type SBResult struct {
 	Root       *SBNode
 	Unsolvable bool
 	Reason     string
+	FPBits     int  // non-checkpoint fp width used (for severed matching)
+	NoOrdinal  bool // severed placement ignores the ordinal (own-fp distinguishes siblings)
 
 	// Attachment accounting.
 	Identified      int // survivors attached by their real parent edge (connected)
@@ -78,13 +81,17 @@ func unsolvable(format string, a ...any) SBResult {
 // breadcrumb shift); then connected survivors are identified on that skeleton by
 // walking their REAL parent->child edges from the root — no placeholder search.
 func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SBResult {
+	fpBits := cfg.FPBits
+	if fpBits <= 0 {
+		fpBits = 16 // legacy 2-byte fp
+	}
 	type decoded struct {
 		id uint64
 		br bridge.SBridgeBR
 	}
 	ds := make([]decoded, 0, len(inputs))
 	for _, in := range inputs {
-		br, err := bridge.DecodeSBridgeBR(in.Payload, cfg.CPD)
+		br, err := bridge.DecodeSBridgeBR(in.Payload, cfg.CPD, fpBits)
 		if err != nil {
 			return unsolvable("decode span %016x: %v", in.SpanID, err)
 		}
@@ -139,10 +146,10 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 			// lv.FP is cur's (the parent's) fingerprint when present; never
 			// overwrite a window root's 4-byte ckpt4 (FPBits 32).
 			if lv.HasFP && cur.FPBits != 32 {
-				if cur.FPBits == 16 && uint16(cur.FP) != lv.FP {
-					return unsolvable("span %016x: conflicting fp (%04x vs %04x)", d.id, uint16(cur.FP), lv.FP)
+				if cur.FPBits == fpBits && cur.FP != lv.FP {
+					return unsolvable("span %016x: conflicting fp (%x vs %x)", d.id, cur.FP, lv.FP)
 				}
-				cur.FP, cur.FPBits = uint32(lv.FP), 16
+				cur.FP, cur.FPBits = lv.FP, fpBits
 			}
 			var child *SBNode
 			if j == len(d.br.Chain)-1 && isCkpt {
@@ -159,6 +166,9 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 				child = newSBNode(lv.Ord)
 			}
 			child.Ord = lv.Ord
+			if len(lv.EE) > 0 { // the ends this child witnessed before it started
+				child.EE = lv.EE
+			}
 			cur.Children[lv.Ord] = child
 			cur = child
 		}
@@ -170,7 +180,7 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 	if root == nil {
 		return unsolvable("no depth-0 root checkpoint among %d emitting spans", len(inputs))
 	}
-	res := SBResult{Root: root}
+	res := SBResult{Root: root, FPBits: fpBits, NoOrdinal: cfg.NoOrdinal}
 	labeled := map[uint64]bool{}
 	collectRealIDs(root, labeled) // checkpoints + leaves placed by their own chains (incl. severed)
 	res.identifyByEdges(survivors, labeled)
@@ -235,16 +245,18 @@ func (res *SBResult) identifyByEdges(survivors []SBSurvivor, labeled map[uint64]
 	}
 }
 
-// node16fp returns a skeleton node's 2-byte fingerprint: an interior fp directly,
-// or the top 2 bytes of a 4-byte window anchor (ckpt4).
-func node16fp(n *SBNode) (uint16, bool) {
-	switch n.FPBits {
-	case 16:
-		return uint16(n.FP), true
-	case 32:
-		return uint16(n.FP >> 16), true
+// nodeFP returns a skeleton node's fingerprint truncated to w bits: an interior
+// fp (already w bits) directly, or the top w bits of a 4-byte window anchor
+// (ckpt4). Used to build the severed-placement key at a uniform width.
+func nodeFP(n *SBNode, w int) (uint32, bool) {
+	switch {
+	case n.FPBits == 0:
+		return 0, false
+	case n.FPBits == 32: // ckpt4: take top w bits
+		return n.FP >> uint(32-w), true
+	default: // interior fp, stored at w bits
+		return n.FP, true
 	}
-	return 0, false
 }
 
 // placeSevered re-attaches survivors whose parent dropped (so edges couldn't
@@ -254,16 +266,29 @@ func node16fp(n *SBNode) (uint16, bool) {
 // exists. >=2 matches -> ambiguous (a truncated-key collision); 0 -> no slot
 // (shouldn't happen).
 func (res *SBResult) placeSevered(survivors []SBSurvivor, labeled map[uint64]bool) {
+	w := res.FPBits
+	if w <= 0 {
+		w = 16
+	}
+	// ordOf zeroes the ordinal when NoOrdinal: severed placement then keys on
+	// (depth, own-fp, parent-fp) only, letting own-fp distinguish siblings.
+	ordOf := func(o int) int {
+		if res.NoOrdinal {
+			return 0
+		}
+		return o
+	}
 	type key struct {
 		depth, ord int
-		fp, pfp    uint16
+		fp, pfp    uint32
 	}
 	idx := map[key][]*SBNode{}
-	var walk func(n *SBNode, depth int, pfp uint16, pfpOK bool)
-	walk = func(n *SBNode, depth int, pfp uint16, pfpOK bool) {
-		nfp, nfpOK := node16fp(n)
+	var walk func(n *SBNode, depth int, pfp uint32, pfpOK bool)
+	walk = func(n *SBNode, depth int, pfp uint32, pfpOK bool) {
+		nfp, nfpOK := nodeFP(n, w)
 		if n.RealID == 0 && nfpOK && pfpOK {
-			idx[key{depth, n.Ord, nfp, pfp}] = append(idx[key{depth, n.Ord, nfp, pfp}], n)
+			k := key{depth, ordOf(n.Ord), nfp, pfp}
+			idx[k] = append(idx[k], n)
 		}
 		for _, c := range n.Children {
 			walk(c, depth+1, nfp, nfpOK)
@@ -271,11 +296,12 @@ func (res *SBResult) placeSevered(survivors []SBSurvivor, labeled map[uint64]boo
 	}
 	walk(res.Root, 0, 0, false)
 
+	topW := func(id uint64) uint32 { return uint32(id >> uint(64-w)) }
 	for _, s := range survivors {
 		if labeled[s.SpanID] {
 			continue // attached by edge
 		}
-		k := key{s.Depth, s.Ordinal, uint16(s.SpanID >> 48), uint16(s.ParentID >> 48)}
+		k := key{s.Depth, ordOf(s.Ordinal), topW(s.SpanID), topW(s.ParentID)}
 		switch cands := idx[k]; len(cands) {
 		case 0:
 			res.SeveredNoPlace++
@@ -351,14 +377,16 @@ func ScoreSBridgeUnderDrop(res SBResult, truth SBTruth) SBVerdict {
 // rejects wrong edges and fp/id mismatches but tolerates truth children that
 // were dropped and so weren't reconstructed.
 func sbWalkPartial(node *SBNode, realID uint64, truth SBTruth) (bool, string) {
-	switch node.FPBits {
-	case 32:
+	switch {
+	case node.FPBits == 0:
+		// bare leaf: no fp to check
+	case node.FPBits == 32:
 		if node.FP != uint32(realID>>32) {
 			return false, fmt.Sprintf("node %016x ckpt4 %08x != %08x", realID, node.FP, uint32(realID>>32))
 		}
-	case 16:
-		if uint16(node.FP) != uint16(realID>>48) {
-			return false, fmt.Sprintf("node %016x fp %04x != %04x", realID, uint16(node.FP), uint16(realID>>48))
+	default: // interior fp at node.FPBits width
+		if want := uint32(realID >> uint(64-node.FPBits)); node.FP != want {
+			return false, fmt.Sprintf("node %016x fp %x != %x (%db)", realID, node.FP, want, node.FPBits)
 		}
 	}
 	kids := truth.ChildByOrd[realID]
@@ -398,14 +426,16 @@ func (r SBResult) CountReal() int {
 }
 
 func sbWalk(node *SBNode, realID uint64, truth SBTruth) (bool, string) {
-	switch node.FPBits {
-	case 32:
+	switch {
+	case node.FPBits == 0:
+		// bare leaf: no fp to check
+	case node.FPBits == 32:
 		if node.FP != uint32(realID>>32) {
 			return false, fmt.Sprintf("node %016x ckpt4 %08x != %08x", realID, node.FP, uint32(realID>>32))
 		}
-	case 16:
-		if uint16(node.FP) != uint16(realID>>48) {
-			return false, fmt.Sprintf("node %016x fp %04x != %04x", realID, uint16(node.FP), uint16(realID>>48))
+	default: // interior fp at node.FPBits width
+		if want := uint32(realID >> uint(64-node.FPBits)); node.FP != want {
+			return false, fmt.Sprintf("node %016x fp %x != %x (%db)", realID, node.FP, want, node.FPBits)
 		}
 	}
 	kids := truth.ChildByOrd[realID]

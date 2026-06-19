@@ -121,6 +121,15 @@ type Config struct {
 	BloomM uint32
 	BloomK uint32
 
+	// FPBits is the S-Bridge non-checkpoint fingerprint width (bits). 0 => 16
+	// (the legacy 2-byte fp). Must match the width the payloads were emitted with.
+	FPBits int
+
+	// NoOrdinal: place severed survivors by (depth, own-fp, parent-fp) only,
+	// dropping the ordinal discriminator (own-fp distinguishes siblings). Pairs
+	// with the handler's OmitOrdinal emission.
+	NoOrdinal bool
+
 	// PrefixLen is the truncated checkpoint-root ID length for PCR mode
 	// (unused by PB).
 	PrefixLen int

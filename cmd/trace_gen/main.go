@@ -43,7 +43,11 @@ type config struct {
 	fanout      int
 	fanoutDist  string
 	fanoutS     float64
+	fanoutMin   int
 	fanoutMax   int
+	slabMeanW     float64 // estimated mean per-node fan-out (floored at fanoutMin), for slab budget sizing
+	spindle       bool
+	spindlePeriod int
 	depthDist   string
 	depthS      float64
 	maxSpans    int
@@ -58,12 +62,15 @@ type config struct {
 func main() {
 	var c config
 	flag.IntVar(&c.n, "n", 1000, "number of traces to generate")
-	flag.StringVar(&c.shape, "shape", "kary", "tree shape: chain | star | kary | skewed | branch (branch uses --fanout-dist)")
+	flag.StringVar(&c.shape, "shape", "kary", "tree shape: chain | star | kary | skewed | branch | spine | deepwide | slab. branch = Galton-Watson with --fanout-dist; spine = ONE deep path (Kesten) + bushes; deepwide = K=--fanout parallel deep paths + bushes; slab = STRESS: per-node fan-out in [--fanout-min,--fanout-max] to absolute --depth, continuation-capped to --max-spans")
 	flag.IntVar(&c.depth, "depth", 4, "max tree depth (chain/kary); mean/cap for --depth-dist")
 	flag.IntVar(&c.fanout, "fanout", 3, "children per node (star/kary); mean for poisson/geometric")
-	flag.StringVar(&c.fanoutDist, "fanout-dist", "fixed", "offspring law for --shape branch: fixed | zipf | poisson | geometric")
+	flag.StringVar(&c.fanoutDist, "fanout-dist", "fixed", "offspring law for --shape branch/spine: fixed | zipf | poisson | geometric | uber (empirical Uber day1 law: chain-dominated + power-law branch tail)")
 	flag.Float64Var(&c.fanoutS, "fanout-s", 1.2, "zipf exponent for --fanout-dist zipf (>1; lower = heavier tail)")
-	flag.IntVar(&c.fanoutMax, "fanout-max", 256, "cap on sampled fan-out per node")
+	flag.IntVar(&c.fanoutMin, "fanout-min", 1, "--shape slab: minimum per-node fan-out (0 allows lineages to die early)")
+	flag.BoolVar(&c.spindle, "spindle", false, "--shape slab: taper the continuation-cap into spindle lobes (width rises to a peak, tapers to a thin neck, then RE-SPINDLES) — realistic spindle texture at any depth, instead of a flat brick")
+	flag.IntVar(&c.spindlePeriod, "spindle-period", 0, "--shape slab --spindle: depth per spindle lobe before re-spindling (0 = one spindle over the whole --depth; smaller = more lobes stacked to reach deep)")
+	flag.IntVar(&c.fanoutMax, "fanout-max", 256, "cap on sampled fan-out per node (--shape slab: also the max of the per-node fan-out range)")
 	flag.StringVar(&c.depthDist, "depth-dist", "fixed", "per-trace max-depth law: fixed | zipf (mostly shallow, rare deep, capped at --depth)")
 	flag.Float64Var(&c.depthS, "depth-s", 1.5, "zipf exponent for --depth-dist zipf (>1)")
 	flag.IntVar(&c.maxSpans, "max-spans", 20000, "hard cap on spans per trace (kary/skewed can explode)")
@@ -95,6 +102,25 @@ func main() {
 
 	fanoutOf := makeFanoutSampler(&c, rng)
 	depthOf := makeDepthSampler(&c, rng)
+	// Estimate the mean per-node fan-out (floored at fanout-min) so the slab
+	// continuation-cap can size traces to the span budget regardless of which
+	// --fanout-dist (heavy-tailed zipf/geometric/uber) feeds it. Uses a throwaway
+	// rng so the generation stream is unperturbed.
+	{
+		er := makeFanoutSampler(&c, rand.New(rand.NewSource(c.seed^0x9e3779b9)))
+		sum := 0
+		for i := 0; i < 8192; i++ {
+			w := er()
+			if w < c.fanoutMin {
+				w = c.fanoutMin
+			}
+			sum += w
+		}
+		c.slabMeanW = float64(sum) / 8192.0
+		if c.slabMeanW < 1 {
+			c.slabMeanW = 1
+		}
+	}
 	traceIDs := make([]uint64, c.n)
 	traces := make([][]span, c.n)
 	for i := 0; i < c.n; i++ {
@@ -124,11 +150,69 @@ func main() {
 		}
 	}
 	total := 0
-	for _, t := range traces {
+	depths := make([]int, len(traces))
+	for i, t := range traces {
 		total += len(t)
+		md := 0
+		for _, s := range t {
+			if s.depth > md {
+				md = s.depth
+			}
+		}
+		depths[i] = md
 	}
+	sort.Ints(depths)
+	dp := func(p float64) int { return depths[int(p*float64(len(depths)-1))] }
 	fmt.Fprintf(os.Stderr, "generated %d traces, %d spans (%s) -> %s [%s]\n",
 		c.n, total, c.shape, c.out, c.formats)
+	fmt.Fprintf(os.Stderr, "  depth: p50=%d p90=%d p99=%d max=%d   spans/trace mean=%d\n",
+		dp(0.50), dp(0.90), dp(0.99), depths[len(depths)-1], total/len(traces))
+
+	// Where does the BRANCHING live? The depth line above is just the spine
+	// length (deepest leaf). cgprb covering ambiguity can only arise at
+	// MULTI-CHILD parents, so report mean span depth and the depth distribution
+	// of those branch points — that, not the spine length, is the dimension
+	// cgprb is actually stressed on.
+	var sumDepth, nSpans int
+	var brDepth, fanouts []int
+	for _, t := range traces {
+		kids := map[uint64]int{}
+		dep := map[uint64]int{}
+		for _, s := range t {
+			sumDepth += s.depth
+			nSpans++
+			dep[s.id] = s.depth
+			if s.parent != 0 {
+				kids[s.parent]++
+			}
+		}
+		for pid, k := range kids {
+			if k >= 2 {
+				brDepth = append(brDepth, dep[pid])
+				fanouts = append(fanouts, k)
+			}
+		}
+	}
+	sort.Ints(brDepth)
+	sort.Ints(fanouts)
+	pct := func(xs []int, p float64) int {
+		if len(xs) == 0 {
+			return 0
+		}
+		return xs[int(p*float64(len(xs)-1))]
+	}
+	sumF := 0
+	for _, f := range fanouts {
+		sumF += f
+	}
+	meanF := 0.0
+	if len(fanouts) > 0 {
+		meanF = float64(sumF) / float64(len(fanouts))
+	}
+	fmt.Fprintf(os.Stderr, "  span-depth mean=%.1f | branch-points: n=%d (%.1f/trace) depth p50=%d p90=%d max=%d | fanout mean=%.2f p90=%d max=%d\n",
+		float64(sumDepth)/float64(nSpans), len(brDepth), float64(len(brDepth))/float64(len(traces)),
+		pct(brDepth, 0.50), pct(brDepth, 0.90), pct(brDepth, 1.0),
+		meanF, pct(fanouts, 0.90), pct(fanouts, 1.0))
 }
 
 func fail(what string, err error) {
@@ -142,20 +226,164 @@ func fail(what string, err error) {
 func genTrace(c *config, rng *rand.Rand, fanoutOf, depthOf func() int) []span {
 	maxDepth := depthOf()
 	spans := []span{{id: rng.Uint64(), svc: uint16(rng.Intn(c.services)), depth: 0}}
-	type frame struct{ idx, depth int }
-	queue := []frame{{0, 0}}
-	for len(queue) > 0 && len(spans) < c.maxSpans {
-		f := queue[0]
-		queue = queue[1:]
-		if f.depth >= maxDepth {
-			continue
+	newChild := func(pid uint64, depth int) int {
+		spans = append(spans, span{id: rng.Uint64(), parent: pid, svc: uint16(rng.Intn(c.services)), depth: depth})
+		return len(spans) - 1
+	}
+	// ordinary (unconditioned) branching subtree rooted at idx, adding spans until
+	// len(spans) reaches cap — naturally terminating per the fan-out law.
+	grow := func(idx, depth, cap int) {
+		type frame struct{ idx, depth int }
+		q := []frame{{idx, depth}}
+		for len(q) > 0 && len(spans) < cap {
+			f := q[0]
+			q = q[1:]
+			if f.depth >= maxDepth {
+				continue
+			}
+			k := offspring(c, f.depth, rng, fanoutOf)
+			for j := 0; j < k && len(spans) < cap; j++ {
+				q = append(q, frame{newChild(spans[f.idx].id, f.depth+1), f.depth + 1})
+			}
 		}
-		k := offspring(c, f.depth, rng, fanoutOf)
-		for j := 0; j < k && len(spans) < c.maxSpans; j++ {
-			spans = append(spans, span{id: rng.Uint64(), parent: spans[f.idx].id,
-				svc: uint16(rng.Intn(c.services)), depth: f.depth + 1})
-			queue = append(queue, frame{len(spans) - 1, f.depth + 1})
+	}
+	if c.shape == "spine" {
+		// Branching process CONDITIONED to reach maxDepth (Kesten spine
+		// decomposition). Build the backbone FIRST (guarantees depth), THEN hang
+		// ordinary realistic subtrees off each backbone node under a per-node span
+		// budget. Realistic per-node fan-out, arbitrary depth, bounded width — even
+		// when the fan-out law is supercritical (the budget caps the bushiness
+		// instead of letting a near-root subtree starve the backbone).
+		prev := 0
+		backbone := []int{0}
+		for d := 1; d <= maxDepth && len(spans) < c.maxSpans; d++ {
+			prev = newChild(spans[prev].id, d)
+			backbone = append(backbone, prev)
 		}
+		perNode := (c.maxSpans - len(spans)) / len(backbone)
+		for _, bi := range backbone {
+			cap := len(spans) + perNode
+			if cap > c.maxSpans {
+				cap = c.maxSpans
+			}
+			for j := 1; j < fanoutOf() && len(spans) < cap; j++ {
+				d := spans[bi].depth + 1
+				grow(newChild(spans[bi].id, d), d, cap)
+			}
+		}
+	} else if c.shape == "deepwide" {
+		// K PARALLEL deep paths (generalized Kesten spine) + realistic bushes. Real
+		// Uber traces are wide AND deep — ~38 leaves reach the deep frontier — which
+		// the single spine (1 deep path) can't represent. Here K = --fanout sets the
+		// number of deep paths and --depth their length, so depth x width are two
+		// independent sweep knobs (the 2D flame-plot axes). Bushes off the backbone
+		// nodes follow the offspring law (use --fanout-dist uber) and supply the
+		// many shallow leaves real traces also have.
+		K := c.fanout
+		if K < 1 {
+			K = 1
+		}
+		backbone := []int{0}
+		for k := 0; k < K && len(spans) < c.maxSpans; k++ {
+			prev := 0 // each deep path is a fresh chain off the root
+			for d := 1; d <= maxDepth && len(spans) < c.maxSpans; d++ {
+				prev = newChild(spans[prev].id, d)
+				backbone = append(backbone, prev)
+			}
+		}
+		perNode := 0
+		if len(backbone) > 0 {
+			perNode = (c.maxSpans - len(spans)) / len(backbone)
+		}
+		for _, bi := range backbone {
+			cap := len(spans) + perNode
+			if cap > c.maxSpans {
+				cap = c.maxSpans
+			}
+			for j := 1; j < fanoutOf() && len(spans) < cap; j++ {
+				d := spans[bi].depth + 1
+				grow(newChild(spans[bi].id, d), d, cap)
+			}
+		}
+	} else if c.shape == "slab" {
+		// STRESS instrument: 2 orthogonal dials — per-node fan-out and absolute
+		// --depth. Each node's fan-out is drawn from the --fanout-dist sampler
+		// (zipf/geometric/uber — heavy-tailed: mostly small chains, occasionally
+		// huge) floored at --fanout-min and capped at --fanout-max, giving genuine
+		// (and occasionally very wide) windows -> cgprb O(W^2). Grown to the absolute
+		// depth. width^depth would explode, so the CONTINUATION frontier is capped at
+		// C = maxSpans/(depth*meanWidth): every node still gets its full fan-out (all
+		// those children are real spans / real wide windows), but only up to C per
+		// level spawn the next level — the rest are real leaves. Fan-out and depth
+		// stay honest; C only sizes how many lineages run full-depth, so spans ~=
+		// maxSpans (the size dial). fanout-min=0 lets lineages die early (smaller,
+		// variable-size traces); >=1 guarantees reaching depth.
+		// Per-depth continuation-cap caps[d] = how many depth-d nodes spawn depth d+1.
+		// Flat -> brick (constant width). Spindle -> right-skewed arch f(d)=d*(D-d)^7
+		// (peak ~ D/8, thin deep tail), scaled so sum(caps)*meanW ~= maxSpans, i.e.
+		// the width profile rises then tapers like a real trace. Either way each node
+		// still draws its full heavy-tailed fan-out (fat windows), only the count that
+		// CONTINUES is shaped.
+		caps := make([]int, maxDepth+1)
+		budgetNodes := float64(c.maxSpans) / c.slabMeanW
+		if c.spindle {
+			// Periodic spindle: within each lobe of L levels the cap follows an arch
+			// x*(L-x)^3 (rise -> peak -> taper), then re-spindles. The neck (phase 0)
+			// is floored to 1 so the lineage never dies — it pinches and re-widens,
+			// stacking lobes to reach any --depth. L = --spindle-period (0 = one lobe
+			// over the whole depth). Scaled so sum(caps)*meanW ~= maxSpans.
+			L := c.spindlePeriod
+			if L < 2 || L > maxDepth {
+				L = maxDepth
+			}
+			Lf := float64(L)
+			f := make([]float64, maxDepth+1)
+			fsum := 0.0
+			for d := 1; d <= maxDepth; d++ {
+				x := float64(d % L) // phase within the current lobe
+				p := Lf - x
+				f[d] = x * p * p * p // x*(L-x)^3 arch, repeating every L
+				fsum += f[d]
+			}
+			for d := 1; d <= maxDepth && fsum > 0; d++ {
+				caps[d] = int(budgetNodes * f[d] / fsum)
+				if caps[d] < 1 {
+					caps[d] = 1 // neck floor: pinch, don't die -> re-spindle
+				}
+			}
+		} else {
+			flat := int(budgetNodes / float64(maxDepth))
+			if flat < 1 {
+				flat = 1
+			}
+			for d := range caps {
+				caps[d] = flat
+			}
+		}
+		frontier := []int{0}
+		for d := 1; d <= maxDepth && len(frontier) > 0 && len(spans) < c.maxSpans; d++ {
+			var next []int
+			for _, fi := range frontier {
+				if len(spans) >= c.maxSpans {
+					break
+				}
+				// per-node fan-out from the (heavy-tailed) --fanout-dist sampler,
+				// floored at --fanout-min: mostly small (chains), occasionally huge.
+				w := fanoutOf()
+				if w < c.fanoutMin {
+					w = c.fanoutMin
+				}
+				for j := 0; j < w && len(spans) < c.maxSpans; j++ {
+					ch := newChild(spans[fi].id, d) // full fan-out: real span, real wide window
+					if len(next) < caps[d] {
+						next = append(next, ch) // only caps[d] per level continue; rest are leaves
+					}
+				}
+			}
+			frontier = next
+		}
+	} else {
+		grow(0, 0, c.maxSpans)
 	}
 
 	kids := map[uint64][]int{}
@@ -185,7 +413,7 @@ func offspring(c *config, depth int, rng *rand.Rand, fanoutOf func() int) int {
 			return 1 + rng.Intn(2*c.fanout+1)
 		}
 		return rng.Intn(c.fanout + 1)
-	case "branch":
+	case "branch", "spine": // spine's off-backbone subtrees branch by the real law
 		return fanoutOf()
 	}
 	return c.fanout
@@ -221,6 +449,35 @@ func makeFanoutSampler(c *config, rng *rand.Rand) func() int {
 	case "geometric":
 		p := 1.0 / (float64(c.fanout) + 1.0) // mean fan-out = c.fanout
 		return func() int { return clamp(geometric(rng, p)) }
+	case "uber":
+		// Empirical offspring law from the unfiltered Uber day1 scan (50k traces,
+		// 46M nodes): chain-dominated with a power-law branch tail.
+		//   P(0=leaf)=39.2%  P(1=chain)=54.2%  P(>=2=branch)=6.6%
+		// Branch counts (k>=2) are heavy-tailed (measured mean~6.9, p50=3, p90=11,
+		// p99=82, max in the thousands) — modeled as 2 + Zipf(uberBranchS), capped
+		// at --fanout-max. NOT Poisson: real branching has a power-law tail, not a
+		// bell. uberBranchS is calibrated to reproduce the measured branch pctls.
+		const (
+			pLeaf       = 0.392
+			pChainEnd   = 0.934 // pLeaf + 0.542
+			uberBranchS = 1.8 // calibrated at fanout-max~256 to branch-mean~6.7 AND total offspring mean~1.0 (critical, like real)
+		)
+		zmax := c.fanoutMax - 2
+		if zmax < 1 {
+			zmax = 1
+		}
+		z := rand.NewZipf(rng, uberBranchS, 1.0, uint64(zmax))
+		return func() int {
+			u := rng.Float64()
+			switch {
+			case u < pLeaf:
+				return 0
+			case u < pChainEnd:
+				return 1
+			default:
+				return 2 + int(z.Uint64())
+			}
+		}
 	default: // fixed
 		return func() int { return c.fanout }
 	}

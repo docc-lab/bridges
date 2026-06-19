@@ -671,6 +671,23 @@ type TopoScore struct {
 	HasDropFanout  bool // trace has >=1 dropped-parent sibling group (a fan-out to recover)
 	ConnCorrect    bool // every bridge anchored to the true nearest surviving ancestor, none lost
 	TopoCorrect    bool // ConnCorrect AND the fan-out structure exactly matches truth
+	// StrictShapeCorrect is TopoCorrect WITHOUT the len>=2 exemption on the
+	// recall check: EVERY dropped-parent orphan whose true parent is a real
+	// branch point (>=2 true children, hence a recoverable HA identity) must be
+	// routed under that exact parent's recovered identity — singletons included.
+	// This closes the blind spot where a width-1 chain (the lone surviving
+	// orphan-child of a dropped branch point) is misrouted onto a sibling branch
+	// point that shares the same surviving anchor: invisible to ConnCorrect (same
+	// nearest survivor) and skipped by the size>=2 recall, yet a genuine shape
+	// error. Width-1 dropped parents (1 true child, no HA identity) are not
+	// identity-checked here — their correctness is the gap length, scored separately.
+	StrictShapeCorrect bool
+
+	// Diagnostics for the strict check: how many lone surviving orphan-children
+	// of dropped branch points were tested, and how many were misrouted. If
+	// SingletonBP==0 the strict check was vacuous on this trace.
+	SingletonBP          int
+	SingletonBPMisrouted int
 }
 
 // ScoreCGPTopology grades reconstructed call-graph topology against the original
@@ -680,8 +697,12 @@ type TopoScore struct {
 // any trace with a dropped fan-out — by design.
 func ScoreCGPTopology(res Result, truth []TruthSpan, dropped map[uint64]struct{}, tid uint64) TopoScore {
 	trueParent := make(map[uint64]uint64, len(truth))
+	trueKids := make(map[uint64]int, len(truth))
 	for _, t := range truth {
 		trueParent[t.SpanID] = t.ParentID
+		if t.ParentID != 0 {
+			trueKids[t.ParentID]++
+		}
 	}
 	nearestSurv := func(id uint64) uint64 {
 		for p := trueParent[id]; p != 0; p = trueParent[p] {
@@ -900,5 +921,30 @@ func ScoreCGPTopology(res Result, truth []TruthSpan, dropped map[uint64]struct{}
 	}
 
 	ts.TopoCorrect = ts.ConnCorrect && fanoutOK
+
+	// Strict recall: same reunification test as above but with NO size>=2
+	// exemption, restricted to dropped parents that are real branch points
+	// (>=2 true children -> recoverable HA identity). A lone surviving
+	// orphan-child must still carry its true parent's recovered identity.
+	strictRecallOK := true
+	for parent, members := range trueGroups {
+		if trueKids[parent] < 2 {
+			continue // width-1 dropped link: no HA identity to route to (gap-scored)
+		}
+		if len(members) < 2 { // the singletons the lenient recall skips
+			ts.SingletonBP++
+		}
+		for _, m := range members {
+			if recFan[m] != parent {
+				strictRecallOK = false
+				if len(members) < 2 {
+					ts.SingletonBPMisrouted++
+				}
+			}
+		}
+	}
+	// TopoCorrect already carries ConnCorrect + precision + the lenient recall;
+	// strict recall is the only added constraint, so AND it on.
+	ts.StrictShapeCorrect = ts.TopoCorrect && strictRecallOK
 	return ts
 }

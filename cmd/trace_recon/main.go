@@ -227,6 +227,9 @@ type harness struct {
 	topoTotal     int64
 	topoConn      int64 // connectivity-correct traces
 	topoCorrect   int64 // topology-correct traces (conn + fan-out)
+	topoStrict    int64 // strict shape-correct traces (singleton routing checked too)
+	topoSingleBP  int64 // lone-orphan branch-point groups tested by the strict check
+	topoSingleMis int64 // of those, misrouted (caught only by the strict check)
 	topoFanTraces int64 // traces with >=1 dropped fan-out
 	topoCorrectF  int64 // topology-correct among the dropped-fan-out traces
 	topoTrueSib   int64
@@ -502,11 +505,13 @@ func (ha *harness) drain() {
 			return 100 * float64(num) / float64(den)
 		}
 		fmt.Fprintf(os.Stderr,
-			"TOPO traces=%d topo_correct=%.4f%% conn_correct=%.4f%% | dropfanout_traces=%d topo_correct_among_them=%.4f%% | sib_recall=%.4f%% (%d/%d) sib_precision=%.4f%% (%d/%d)\n",
-			ha.topoTotal, pct(ha.topoCorrect, ha.topoTotal), pct(ha.topoConn, ha.topoTotal),
+			"TOPO traces=%d topo_correct=%.4f%% strict_shape=%.4f%% conn_correct=%.4f%% | dropfanout_traces=%d topo_correct_among_them=%.4f%% | sib_recall=%.4f%% (%d/%d) sib_precision=%.4f%% (%d/%d)\n",
+			ha.topoTotal, pct(ha.topoCorrect, ha.topoTotal), pct(ha.topoStrict, ha.topoTotal), pct(ha.topoConn, ha.topoTotal),
 			ha.topoFanTraces, pct(ha.topoCorrectF, ha.topoFanTraces),
 			pct(ha.topoRecall, ha.topoTrueSib), ha.topoRecall, ha.topoTrueSib,
 			pct(ha.topoPrec, ha.topoReconSib), ha.topoPrec, ha.topoReconSib)
+		fmt.Fprintf(os.Stderr, "STRICT singleton-branchpoint orphans tested=%d misrouted=%d\n",
+			ha.topoSingleBP, ha.topoSingleMis)
 	}
 }
 
@@ -812,6 +817,11 @@ func (ha *harness) addTopo(ts recon.TopoScore) {
 	if ts.TopoCorrect {
 		ha.topoCorrect++
 	}
+	if ts.StrictShapeCorrect {
+		ha.topoStrict++
+	}
+	ha.topoSingleBP += int64(ts.SingletonBP)
+	ha.topoSingleMis += int64(ts.SingletonBPMisrouted)
 	if ts.HasDropFanout {
 		ha.topoFanTraces++
 		if ts.TopoCorrect {

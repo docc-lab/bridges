@@ -74,17 +74,33 @@ type SBridgeHandler struct {
 	cpd       uint32
 	deeLogger *DeeSizeLogger
 
-	// EmitDepth emits a "_d" attribute on interior non-checkpoint spans. The
-	// _br payload already leads with absolute depth (PackSBridgeBR), so
-	// payload and baggage accounting are unchanged. See docs/depth_emission.md.
-	EmitDepth bool
-
-	// EmitOC emits an "_oc" attribute on interior non-checkpoint spans carrying
-	// the span's window-relative ordinal chain (its path of start ordinals
-	// since the last checkpoint), so a surviving non-checkpoint can self-place.
-	// Used to measure the per-span inflation of carrying the chain everywhere;
-	// checkpoints/leaves already fold the chain into their _br payload.
+	// EmitOC charges the "_o" attribute that every interior span (not a
+	// checkpoint, not a leaf) exports: _o = varint(ordinal) || varint(depth) —
+	// its own start-ordinal under its parent and its absolute depth. That is all
+	// a severed survivor needs to be placed by the (depth, ordinal, own-fp,
+	// parent-fp) 4-tuple; the fingerprints come from its real span/parent ids,
+	// and checkpoints/leaves fold position into their _br instead.
 	EmitOC bool
+
+	// OmitOrdinal drops the ordinal from the interior _o attribute (emit depth
+	// only). A severed survivor then self-places by (depth, own-fp, parent-fp) —
+	// own-fp (from its real id) already distinguishes it from siblings, so the
+	// ordinal is redundant there. Saves the ordinal varint per interior span.
+	OmitOrdinal bool
+
+	// FPBits is the bit width of each non-checkpoint parent fingerprint in the
+	// chain (the top FPBits of the parent span id), bit-packed in the _br fp
+	// section. Default 16 (the legacy 2-byte fp). Narrower = smaller payload but
+	// more recovered-fp collisions (higher reject rate); wider = the reverse. The
+	// 4-byte ckpt4 checkpoint anchor is unaffected.
+	FPBits int
+
+	// TopoOnly drops the Phase-2 (event-ordering) machinery from emission: no
+	// per-level EE sublists in the chain and no DEE batches. Topology (ckpt4,
+	// chain ordinals + fingerprints, _o) is untouched, so the call-graph shape
+	// still reconstructs exactly — you just give up event-ordering recovery in
+	// exchange for a smaller _br payload and zero DEE baggage.
+	TopoOnly bool
 
 	// EmitSink, when non-nil, receives the actual serialized _br payload at each
 	// emit point (checkpoint OnStart, leaf OnEnd) — the faithful bytes a span
@@ -92,6 +108,14 @@ type SBridgeHandler struct {
 	// serialization cost. Used by reconstruction tests / trace_recon --mode
 	// sbridge to feed the decoder real payloads.
 	EmitSink func(traceID, spanID uint64, payload []byte)
+
+	// DEESink, when non-nil, receives every delayed-end-event quad the moment
+	// it's generated, tagged with its origin trace id. In reality a DEE rides a
+	// future request and is hunted down cross-trace; since that's functionally
+	// equivalent, this accumulates them inline into a per-trace-id side store so
+	// reconstruction can look them up directly. Opt-in (nil on the bag-size path,
+	// which still uses the cross-trace deeQueue for cost accounting).
+	DEESink func(traceID uint64, quad []byte)
 
 	state            map[stateKey]*sbState
 	parentEventCount map[stateKey]int
@@ -126,6 +150,7 @@ func NewSBridgeHandler(checkpointDistance int, deeLogger *DeeSizeLogger) *SBridg
 	}
 	return &SBridgeHandler{
 		cpd:              uint32(checkpointDistance),
+		FPBits:           16, // legacy 2-byte non-checkpoint fp; override to sweep
 		deeLogger:        deeLogger,
 		state:            make(map[stateKey]*sbState),
 		parentEventCount: make(map[stateKey]int),
@@ -223,11 +248,13 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		copy(chain, parentChain)
 		e := bcEntry{ord: seqStart}
 		if parentDepth%int(h.cpd) != 0 { // parent is not a checkpoint
-			e.fp = uint16(pid >> 48)
+			e.fp = uint32(pid >> uint(64-h.FPBits)) // top FPBits of the parent id
 			e.hasFp = true
 		}
-		if accEnds := h.parentEEAcc[stateKey{tid, pid}]; len(accEnds) > 0 {
-			e.ee = append([]int(nil), accEnds...)
+		if !h.TopoOnly { // EE is Phase-2 only
+			if accEnds := h.parentEEAcc[stateKey{tid, pid}]; len(accEnds) > 0 {
+				e.ee = append([]int(nil), accEnds...)
+			}
 		}
 		chain = append(chain, e)
 		// Clear the parent's accumulator now that we've consumed it.
@@ -248,11 +275,11 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	if isCheckpoint {
 		// Only the payload SIZE matters for the bag-size study, so compute it
 		// without serializing (no per-span allocation).
-		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSize(depth, chain, deeBytes)
+		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSize(depth, chain, deeBytes, h.FPBits)
 		if h.EmitSink != nil {
 			// Pack BEFORE the reset: a checkpoint's own payload describes its
 			// position within its PARENT window (pre-reset anchor + chain).
-			h.EmitSink(tid, sid, PackSBridgeBR(depth, ckpt4, chain, deeBytes))
+			h.EmitSink(tid, sid, PackSBridgeBR(depth, ckpt4, chain, deeBytes, h.FPBits))
 		}
 
 		// Reset state for the post-checkpoint snapshot: this span becomes the
@@ -268,7 +295,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		h.parentEEAcc[stateKey{tid, sid}] = nil
 	}
 
-	packedLen := sbridgeBRSize(depth, chain, deeBytes)
+	packedLen := sbridgeBRSize(depth, chain, deeBytes, h.FPBits)
 
 	var baggageBytes int
 	if baggageFound {
@@ -299,67 +326,58 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 		return EndResult{}
 	}
 
-	// Append our start_seq to PARENT's accumulator.
+	// Append our start_seq to PARENT's accumulator (Phase-2 only).
 	if startSeq, exists := h.childSeqStart[key]; exists {
 		delete(h.childSeqStart, key)
-		if ev.ParentID != 0 {
+		if !h.TopoOnly && ev.ParentID != 0 {
 			pk := stateKey{tid, ev.ParentID}
 			h.parentEEAcc[pk] = append(h.parentEEAcc[pk], startSeq)
 		}
 	}
-
 	// Drain remaining ENDS that we never handed off to a later child:
 	// they become a DEE quadruple, dropping the last (implicit at reconstruction).
 	// The quad carries this span's own fingerprint as the owner ID, since the
-	// drained batch has no chain context to recover it from.
-	rem := h.parentEEAcc[key]
-	if len(rem) > 0 {
-		kept := rem[:len(rem)-1]
-		if len(kept) > 0 {
-			quad := EncodeDEEQuad(TraceID16(tid), ps.depth, uint32(sid>>32), kept)
-			h.enqueueDEE(ev.ServiceID, quad, tid)
+	// drained batch has no chain context to recover it from. Skipped in TopoOnly
+	// (no EE accumulation -> nothing to drain, and DEE is Phase-2 only).
+	if !h.TopoOnly {
+		rem := h.parentEEAcc[key]
+		if len(rem) > 0 {
+			kept := rem[:len(rem)-1]
+			if len(kept) > 0 {
+				quad := EncodeDEEQuad(TraceID16(tid), ps.depth, uint32(sid>>32), kept)
+				h.enqueueDEE(ev.ServiceID, quad, tid)
+				if h.DEESink != nil {
+					h.DEESink(tid, quad)
+				}
+			}
+			h.parentEEAcc[key] = rem[:0] // clear in place (Python: .clear())
 		}
-		h.parentEEAcc[key] = rem[:0] // clear in place (Python: .clear())
 	}
 	// State survives until EvictTrace: clock-skew children may start after
 	// their parent's end and need to find parent state alive.
 
 	isLeaf := !ps.hasChildren
-	var emitBytes, depthBytes, ocBytes int
+	var emitBytes, ocBytes int
 	if isLeaf && !ps.emitted {
 		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + ps.packedLen
 		ps.emitted = true
 		if h.EmitSink != nil {
-			h.EmitSink(tid, sid, PackSBridgeBR(ps.depth, ps.ckpt4, ps.chain, ps.deeBytes))
+			h.EmitSink(tid, sid, PackSBridgeBR(ps.depth, ps.ckpt4, ps.chain, ps.deeBytes, h.FPBits))
 		}
-	} else if !ps.emitted {
-		// Interior non-checkpoint span: never carries _br. In EmitDepth mode
-		// absolute depth rides as a "_d" attribute; in EmitOC mode the window-
-		// relative ordinal chain rides as an "_oc" attribute (self-placement).
-		if h.EmitDepth {
-			depthBytes = DepthKeyBytes + VarintLen(ps.depth)
-		}
-		if h.EmitOC {
-			// Orphan self-placement breadcrumb: the 4-byte window anchor plus
-			// the ordinal+fingerprint chain from the last checkpoint to here.
-			ocBytes = OcKeyBytes + 4 + ordinalChainBytes(ps.chain)
-		}
-	}
-	return EndResult{EmitBytes: emitBytes, DepthBytes: depthBytes, OcBytes: ocBytes}
-}
-
-// ordinalChainBytes is the compact serialized size of a span's window-relative
-// breadcrumb chain: per level, one varint for the start ordinal plus the
-// propagating parent's fingerprint bytes (2 when present).
-func ordinalChainBytes(chain []bcEntry) int {
-	n := 0
-	for i := range chain {
-		n += VarintLen(chain[i].ord)
-		if chain[i].hasFp {
-			n += 2
+	} else if !ps.emitted && h.EmitOC {
+		// Interior span (not a checkpoint, not a leaf): exports
+		// _o = varint(ordinal) || varint(depth) — its own start-ordinal under its
+		// parent (the last breadcrumb entry's ordinal) and its absolute depth.
+		ocBytes = OcKeyBytes + VarintLen(ps.depth)
+		if !h.OmitOrdinal { // include the start-ordinal unless relaxed away
+			ord := 0
+			if n := len(ps.chain); n > 0 {
+				ord = ps.chain[n-1].ord
+			}
+			ocBytes += VarintLen(ord)
 		}
 	}
-	return n
+	return EndResult{EmitBytes: emitBytes, OcBytes: ocBytes}
 }
 
 func (h *SBridgeHandler) EvictTrace(traceID uint64) {

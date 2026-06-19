@@ -87,16 +87,6 @@ func TestEmitDepthAccounting(t *testing.T) {
 			h.EmitDepth = true
 			return h
 		}, map[string]int{"aaaa000000000003": 3}},
-		{"sb_cpd1", func() Handler {
-			h := NewSBridgeHandler(1, nil)
-			h.EmitDepth = true
-			return h
-		}, map[string]int{}},
-		{"sb_cpd3", func() Handler {
-			h := NewSBridgeHandler(3, nil)
-			h.EmitDepth = true
-			return h
-		}, map[string]int{"aaaa000000000003": 3}},
 	}
 
 	for _, c := range cases {
@@ -152,14 +142,6 @@ func mustHandlerByName(t *testing.T, name string, emitDepth bool) Handler {
 		return h
 	case "cgpb_cpd3":
 		h := NewCGPBBridgeHandler(3, DefaultBloomFPRate)
-		h.EmitDepth = emitDepth
-		return h
-	case "sb_cpd1":
-		h := NewSBridgeHandler(1, nil)
-		h.EmitDepth = emitDepth
-		return h
-	case "sb_cpd3":
-		h := NewSBridgeHandler(3, nil)
 		h.EmitDepth = emitDepth
 		return h
 	}

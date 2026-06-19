@@ -26,9 +26,9 @@ func TestDecodeSBridgeBRRoundTrip(t *testing.T) {
 		EncodeDEEQuad([16]byte{}, 5, 0x11223344, []int{7})...,
 	)
 
-	payload := PackSBridgeBR(3, ckpt, chain, dee)
+	payload := PackSBridgeBR(3, ckpt, chain, dee, 16)
 
-	got, err := DecodeSBridgeBR(payload, cpd)
+	got, err := DecodeSBridgeBR(payload, cpd, 16)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -51,13 +51,32 @@ func TestDecodeSBridgeBRRoundTrip(t *testing.T) {
 	}
 
 	// Empty payload edge: depth 0, no chain, no dee.
-	empty := PackSBridgeBR(0, [4]byte{}, nil, nil)
-	be, err := DecodeSBridgeBR(empty, cpd)
+	empty := PackSBridgeBR(0, [4]byte{}, nil, nil, 16)
+	be, err := DecodeSBridgeBR(empty, cpd, 16)
 	if err != nil {
 		t.Fatalf("decode empty: %v", err)
 	}
 	if be.Depth != 0 || len(be.Chain) != 0 || len(be.DEE) != 0 {
 		t.Errorf("empty decode = %+v, want zero-ish", be)
+	}
+
+	// Sub-byte and wide fp widths must round-trip the bit-packed fp section.
+	for _, w := range []int{8, 10, 12, 16, 20, 24} {
+		mask := uint32((1 << uint(w)) - 1)
+		ch := []bcEntry{
+			{ord: 1},                                          // depth1, no fp
+			{ord: 2, fp: 0xABCDEF & mask, hasFp: true},        // depth2
+			{ord: 3, fp: 0x123456 & mask, hasFp: true},        // depth3
+		}
+		p := PackSBridgeBR(3, ckpt, ch, nil, w)
+		d, err := DecodeSBridgeBR(p, cpd, w)
+		if err != nil {
+			t.Fatalf("w=%d decode: %v", w, err)
+		}
+		if d.Chain[1].FP != (0xABCDEF&mask) || d.Chain[2].FP != (0x123456&mask) {
+			t.Errorf("w=%d: fps round-tripped to %x,%x want %x,%x", w,
+				d.Chain[1].FP, d.Chain[2].FP, 0xABCDEF&mask, 0x123456&mask)
+		}
 	}
 
 	// DecodeDEEQuads standalone on the same dee blob.

@@ -16,7 +16,7 @@ import (
 type SBChainLevel struct {
 	Depth int    // absolute depth of this level's span
 	Ord   int    // start ordinal of this span under its parent
-	FP    uint16 // parent fingerprint (top 2 bytes of the parent span ID)
+	FP    uint32 // parent fingerprint (top fpBits of the parent span ID)
 	HasFP bool   // false when the parent is the checkpoint root (its identity is Ckpt4)
 	EE    []int  // start ordinals of earlier siblings that ended before this span started
 }
@@ -72,49 +72,57 @@ func (c *cursor) take(n int) []byte {
 
 func (c *cursor) done() bool { return c.err == nil && c.i >= len(c.b) }
 
-// DecodeSBridgeBR parses an _br payload produced by PackSBridgeBR. cpd is the
-// checkpoint distance the payload was emitted with; it's required because the
-// presence of a level's 2-byte parent fingerprint is implicit (written iff the
-// parent is non-checkpoint), so we recompute HasFP from the level depth.
-func DecodeSBridgeBR(b []byte, cpd int) (SBridgeBR, error) {
+// DecodeSBridgeBR parses an _br payload produced by PackSBridgeBR (structure of
+// arrays). cpd is the checkpoint distance and fpBits the non-checkpoint
+// fingerprint width the payload was emitted with — both are needed because
+// per-level depth and fp presence are derived (not stored), and the fps are
+// bit-packed at fpBits.
+func DecodeSBridgeBR(b []byte, cpd, fpBits int) (SBridgeBR, error) {
 	if cpd < 1 {
 		return SBridgeBR{}, errors.New("cpd must be >= 1")
 	}
 	c := &cursor{b: b}
 	var br SBridgeBR
 	br.Depth = c.uvarint()
-	copy(br.Ckpt4[:], c.take(4))
-	n := c.uvarint()
+	L := c.uvarint()
 	if c.err != nil {
 		return br, c.err
 	}
-	br.Chain = make([]SBChainLevel, 0, n)
-	for k := 0; k < n; k++ {
-		var lv SBChainLevel
-		lv.Depth = c.uvarint()
-		if one := c.uvarint(); one != 1 {
-			// The legacy per-depth "count" field; S-Bridge always emits 1.
-			if c.err == nil {
-				c.err = fmt.Errorf("level %d: expected count 1, got %d", k, one)
-			}
+	br.Chain = make([]SBChainLevel, L)
+	start := chainStartDepth(br.Depth, L)
+	// ORDINALS — and derive each level's depth + fp presence.
+	nFP := 0
+	for i := 0; i < L; i++ {
+		br.Chain[i].Depth = start + i
+		br.Chain[i].Ord = c.uvarint()
+		br.Chain[i].HasFP = (br.Chain[i].Depth-1)%cpd != 0 // parent non-checkpoint
+		if br.Chain[i].HasFP {
+			nFP++
 		}
-		lv.Ord = c.uvarint()
-		// fp present iff the parent (at lv.Depth-1) is not a checkpoint.
-		lv.HasFP = (lv.Depth-1)%cpd != 0
-		if lv.HasFP {
-			fp := c.take(2)
-			if c.err == nil {
-				lv.FP = uint16(fp[0])<<8 | uint16(fp[1])
-			}
+	}
+	// FPS — ckpt4 leads, then nFP bit-packed fpBits-wide fingerprints.
+	copy(br.Ckpt4[:], c.take(4))
+	fpBytes := c.take((nFP*fpBits + 7) / 8)
+	if c.err != nil {
+		return br, c.err
+	}
+	fps := unpackBits(fpBytes, nFP, fpBits)
+	fi := 0
+	for i := 0; i < L; i++ {
+		if br.Chain[i].HasFP {
+			br.Chain[i].FP = fps[fi]
+			fi++
 		}
+	}
+	// END-EVENTS — per level: varint(n) then n ordinals.
+	for i := 0; i < L; i++ {
 		m := c.uvarint()
 		if m > 0 {
-			lv.EE = make([]int, 0, m)
+			br.Chain[i].EE = make([]int, 0, m)
 			for j := 0; j < m; j++ {
-				lv.EE = append(lv.EE, c.uvarint())
+				br.Chain[i].EE = append(br.Chain[i].EE, c.uvarint())
 			}
 		}
-		br.Chain = append(br.Chain, lv)
 		if c.err != nil {
 			return br, c.err
 		}

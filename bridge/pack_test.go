@@ -157,14 +157,16 @@ func TestPackSBridgeBR(t *testing.T) {
 		{ord: 7, fp: 0xabcd, hasFp: true},
 		{ord: 2, fp: 0xdef0, hasFp: true, ee: []int{4, 5}},
 	}
-	got1 := hex.EncodeToString(PackSBridgeBR(5, ckpt, chain, []byte{0xaa, 0xbb, 0xcc}))
-	// 05 | 11223344 | 03 | [03 01 0a 00] [04 01 07 abcd 00] [05 01 02 def0 02 0405] | aabbcc
-	want1 := "05112233440303010a00040107abcd00050102def0020405aabbcc"
+	got1 := hex.EncodeToString(PackSBridgeBR(5, ckpt, chain, []byte{0xaa, 0xbb, 0xcc}, 16))
+	// SoA: 05(depth) 03(L) | ords[0a 07 02] | ckpt4[11223344] fps[abcd def0] |
+	//      EE[00 00 02 0405] | dee[aabbcc]
+	want1 := "05030a070211223344abcddef00000020405aabbcc"
 	if got1 != want1 {
 		t.Errorf("p1: got %s, want %s", got1, want1)
 	}
 
-	got2 := hex.EncodeToString(PackSBridgeBR(0, zeros4, nil, nil))
+	got2 := hex.EncodeToString(PackSBridgeBR(0, zeros4, nil, nil, 16))
+	// 00(depth) 00(L) 00000000(ckpt4)
 	want2 := "000000000000"
 	if got2 != want2 {
 		t.Errorf("p2: got %s, want %s", got2, want2)
@@ -181,8 +183,8 @@ func TestPackSBridgeBR(t *testing.T) {
 		{3, []bcEntry{{ord: 1, ee: []int{1, 2, 3}}, {ord: 99, fp: 0x1234, hasFp: true}}, nil},
 	}
 	for i, c := range cases {
-		gotSize := sbridgeBRSize(c.depth, c.chain, c.dee)
-		wantSize := len(PackSBridgeBR(c.depth, ckpt, c.chain, c.dee))
+		gotSize := sbridgeBRSize(c.depth, c.chain, c.dee, 16)
+		wantSize := len(PackSBridgeBR(c.depth, ckpt, c.chain, c.dee, 16))
 		if gotSize != wantSize {
 			t.Errorf("case %d: sbridgeBRSize=%d != len(pack)=%d", i, gotSize, wantSize)
 		}

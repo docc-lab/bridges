@@ -175,7 +175,7 @@ func TraceIDHexTo16Bytes(s string) [16]byte {
 // hundreds of millions of spans in a corpus.
 type bcEntry struct {
 	ord   int
-	fp    uint16 // big-endian first 2 bytes of the propagating parent's span ID
+	fp    uint32 // top FPBits of the propagating parent's span ID (non-checkpoint fp)
 	hasFp bool
 	// ee is this level's delayed-end-event sub-list: the start ordinals of the
 	// spans that ENDED in the gap just before this level's span started (i.e. its
@@ -192,18 +192,29 @@ type bcEntry struct {
 // (and including) the span itself.
 func chainStartDepth(depth, chainLen int) int { return depth - chainLen + 1 }
 
+// countFPs returns how many chain levels carry a (non-checkpoint) fingerprint.
+func countFPs(chain []bcEntry) int {
+	k := 0
+	for i := range chain {
+		if chain[i].hasFp {
+			k++
+		}
+	}
+	return k
+}
+
 // sbridgeBRSize returns the serialized size of an S-Bridge _br payload WITHOUT
 // allocating it — used in the per-span hot path (only the byte count matters
 // for the bag-size study). It matches PackSBridgeBR byte-for-byte in length.
-func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte) int {
-	start := chainStartDepth(depth, len(chain))
-	size := VarintLen(depth) + 4 + VarintLen(len(chain))
-	for i := range chain {
-		size += VarintLen(start+i) + VarintLen(1) + VarintLen(maxInt(chain[i].ord, 0))
-		if chain[i].hasFp {
-			size += 2
-		}
-		// per-level EE sub-list: varint(n) then n ordinals (varint(0) when empty).
+// fpBits is the bit width of each non-checkpoint parent fingerprint.
+func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte, fpBits int) int {
+	size := VarintLen(depth) + VarintLen(len(chain))
+	for i := range chain { // ordinals section
+		size += VarintLen(maxInt(chain[i].ord, 0))
+	}
+	size += 4                                   // ckpt4 leads the fp section
+	size += (countFPs(chain)*fpBits + 7) / 8    // bit-packed non-checkpoint fps
+	for i := range chain {                      // end-events section
 		size += VarintLen(len(chain[i].ee))
 		for _, s := range chain[i].ee {
 			size += VarintLen(s)
@@ -213,37 +224,85 @@ func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte) int {
 	return size
 }
 
-// PackSBridgeBR packs the S-Bridge baggage payload from a flat breadcrumb
-// chain: varint(depth), the 4-byte checkpoint-root anchor, varint(N), then per
-// level varint(depth_i) varint(1) varint(ordinal) [2-byte parent fingerprint]
-// varint(ee_n) ee_n*varint(ordinal), then the trailing dee_bytes blob. The
-// end-event list is carried PER LEVEL (positionally aligned with the chain), so
-// a level with no ends serializes a single varint(0); this replaces the old
-// single flat trailing endEvents block.
+// PackSBridgeBR packs the S-Bridge baggage payload as a structure-of-arrays so
+// the fingerprints form a contiguous run that can be bit-packed at an arbitrary
+// width:
+//
+//	varint(depth) ‖ varint(L)
+//	  ORDINALS:    L × varint(ord)
+//	  FPS:         ckpt4(4 bytes) ‖ packed (k × fpBits) non-checkpoint fps
+//	  END-EVENTS:  L × ( varint(n) ‖ n × varint(seq) )
+//	  dee_bytes
+//
+// Per-level depth and the legacy count field are dropped — depth is derivable
+// from (depth, L, position) and fp presence from depth%cpd, so the decoder
+// recomputes both. fpBits is the width of each non-checkpoint parent fingerprint
+// (the 4-byte ckpt4 checkpoint fp is unaffected).
 func PackSBridgeBR(
 	depth int,
 	ckpt4 [4]byte,
 	chain []bcEntry,
 	deeBytes []byte,
+	fpBits int,
 ) []byte {
-	start := chainStartDepth(depth, len(chain))
-	out := make([]byte, 0, sbridgeBRSize(depth, chain, deeBytes))
+	out := make([]byte, 0, sbridgeBRSize(depth, chain, deeBytes, fpBits))
 	out = binary.AppendUvarint(out, uint64(maxInt(depth, 0)))
-	out = append(out, ckpt4[:]...)
 	out = binary.AppendUvarint(out, uint64(len(chain)))
-	for i := range chain {
-		out = binary.AppendUvarint(out, uint64(maxInt(start+i, 0)))
-		out = binary.AppendUvarint(out, 1)
+	for i := range chain { // ORDINALS
 		out = binary.AppendUvarint(out, uint64(maxInt(chain[i].ord, 0)))
+	}
+	out = append(out, ckpt4[:]...) // FPS: ckpt4 first, then packed fps
+	fps := make([]uint32, 0, len(chain))
+	for i := range chain {
 		if chain[i].hasFp {
-			out = append(out, byte(chain[i].fp>>8), byte(chain[i].fp))
+			fps = append(fps, chain[i].fp)
 		}
+	}
+	out = appendPackedBits(out, fps, fpBits)
+	for i := range chain { // END-EVENTS
 		out = binary.AppendUvarint(out, uint64(len(chain[i].ee)))
 		for _, s := range chain[i].ee {
 			out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))
 		}
 	}
 	out = append(out, deeBytes...)
+	return out
+}
+
+// appendPackedBits packs each value's low w bits, MSB-first, into a contiguous
+// bit stream appended to out (ceil(len(vals)*w/8) bytes).
+func appendPackedBits(out []byte, vals []uint32, w int) []byte {
+	if w <= 0 || len(vals) == 0 {
+		return out
+	}
+	buf := make([]byte, (len(vals)*w+7)/8)
+	pos := 0
+	for _, v := range vals {
+		for b := w - 1; b >= 0; b-- {
+			if v&(1<<uint(b)) != 0 {
+				buf[pos>>3] |= 0x80 >> uint(pos&7)
+			}
+			pos++
+		}
+	}
+	return append(out, buf...)
+}
+
+// unpackBits reads count values of w bits each (MSB-first) from b.
+func unpackBits(b []byte, count, w int) []uint32 {
+	out := make([]uint32, count)
+	pos := 0
+	for i := 0; i < count; i++ {
+		var v uint32
+		for j := 0; j < w; j++ {
+			v <<= 1
+			if pos>>3 < len(b) && b[pos>>3]&(0x80>>uint(pos&7)) != 0 {
+				v |= 1
+			}
+			pos++
+		}
+		out[i] = v
+	}
 	return out
 }
 

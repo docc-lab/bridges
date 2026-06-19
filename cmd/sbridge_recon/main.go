@@ -2,15 +2,19 @@
 // store, under per-trace-seeded random span drops, and reports how often the
 // surviving payloads rebuild the exact call-graph shape + fingerprints.
 //
-// This is the topology milestone: no event-structure (ordering) yet, so it runs
-// each trace through a fresh SBridgeHandler (chains + ckpt4 are per-trace; the
-// cross-trace DEE queue only affects payload SIZE, not topology). Random
-// sampling (--sample) keeps it quick on the full day-1 store.
+// It reconstructs both phases: topology (call-graph shape + fingerprints) and,
+// where topology rebuilt exactly, the event structure (ordering) — gathering each
+// parent's start order (ordinals) and end order (EE blocks + the inline DEE
+// side-store), running the bottom-up timestamp sweep, and scoring the result
+// against the corpus total-order two ways: exact event-order and critical-path.
+// Each trace runs through a fresh SBridgeHandler. Random sampling (--sample)
+// keeps it quick on the full day-1 store.
 //
 //	sbridge_recon --store day1.store --cpd 4 --drop-rate 0.5 --sample 10000
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -31,24 +35,25 @@ func main() {
 	sample := flag.Int("sample", 0, "if >0, reservoir-sample this many random traces (reads the whole store)")
 	sampleSeed := flag.Int64("sample-seed", 1, "seed for --sample selection")
 	dropSeed := flag.Int64("drop-seed", 1, "base seed mixed with each trace id for drop decisions")
+	topoOnly := flag.Bool("topo-only", false, "emit topology only (no EE/DEE); reconstruct + score the call-graph shape, skip the event-structure phase")
+	fpBits := flag.Int("fp-bits", 16, "non-checkpoint fingerprint width in bits (emit + recon must match)")
+	noOrdinal := flag.Bool("no-ordinal", false, "drop the interior ordinal: emit _o=depth only, place severed survivors by (depth, own-fp, parent-fp)")
 	progress := flag.Int("progress", 0, "print a progress line every N traces (0 = silent)")
+	timing := flag.String("timing", "", "write per-trace topology recon_ns to this CSV and print a TIMING summary (topology + structure phases, µs)")
 	flag.Parse()
 	if *storePath == "" {
 		fmt.Fprintln(os.Stderr, "error: --store required")
 		os.Exit(2)
 	}
 
-	traces, err := loadTraces(*storePath, *first, *sample, *sampleSeed)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load: %v\n", err)
-		os.Exit(1)
-	}
-
 	var nTraces, nUnsolvable, nSevAmbig, nWrong, nCorrect int
 	var sumEmit, sumSurv, sumIdent, sumSevPlaced, sumSevNoPlace, sumReal int
+	var nStruct, nAccepted, nEventOK, nCPOK, nDeeAmbig int // Phase-2 (event structure) tally
+	var topoNanos, structNanos []int64                    // per-trace recon times (with --timing)
+	var sumParents, sumEndOK int                          // per-parent end-order recovery (accepted traces only)
 	t0 := time.Now()
-	for i, tr := range traces {
-		payloads, truth, spans := emitTrace(tr, *cpd)
+	process := func(i int, tr corpus.StoredTrace) {
+		payloads, truth, spans, dees := emitTrace(tr, *cpd, *topoOnly, *fpBits, *noOrdinal)
 		dropped := dropSet(tr, *dropRate, *dropSeed, *cpd)
 
 		inputs := make([]recon.SBInput, 0, len(payloads))
@@ -71,7 +76,11 @@ func main() {
 		}
 		sumSurv += len(survivors)
 
-		res := recon.ReconstructSBridge(inputs, survivors, recon.Config{CPD: *cpd})
+		tRec := time.Now()
+		res := recon.ReconstructSBridge(inputs, survivors, recon.Config{CPD: *cpd, FPBits: *fpBits, NoOrdinal: *noOrdinal})
+		if *timing != "" {
+			topoNanos = append(topoNanos, time.Since(tRec).Nanoseconds())
+		}
 		v := recon.ScoreSBridgeUnderDrop(res, truth)
 		nTraces++
 		sumIdent += res.Identified
@@ -88,9 +97,72 @@ func main() {
 		default:
 			nCorrect++
 		}
+
+		// Phase 2 — event structure — only meaningful when the topology rebuilt
+		// exactly. Build true timestamps over EVERY span (survivors and dropped),
+		// reconstruct the ordering, and score it against the corpus total-order.
+		// Skipped under --topo-only (no EE/DEE were emitted).
+		if !*topoOnly && v.Correct && !v.Unsolvable && res.SeveredAmbiguous == 0 {
+			endPos := make(map[uint64]int64, len(spans))
+			for _, s := range spans {
+				endPos[s.id] = s.endSeq
+			}
+			tStruct := time.Now()
+			sr := recon.ScoreStructure(res, truth, endPos, dees)
+			if *timing != "" {
+				structNanos = append(structNanos, time.Since(tStruct).Nanoseconds())
+			}
+			nStruct++
+			if sr.DEEAmbiguous {
+				nDeeAmbig++ // ambiguous DEE -> trace REJECTED, not reconstructed
+			} else {
+				nAccepted++
+				sumParents += sr.NParents
+				sumEndOK += sr.EndOrderOK
+				if sr.EventOrderOK {
+					nEventOK++
+				}
+				if sr.CriticalPath {
+					nCPOK++
+				}
+			}
+		}
+
 		if *progress > 0 && (i+1)%*progress == 0 {
-			fmt.Fprintf(os.Stderr, "  %d/%d correct=%d ckpt4ambig=%d sevambig=%d WRONG=%d (%s)\n",
-				i+1, len(traces), nCorrect, nUnsolvable, nSevAmbig, nWrong, time.Since(t0).Round(time.Second))
+			fmt.Fprintf(os.Stderr, "  %d done | topo correct=%d ckpt4ambig=%d sevambig=%d WRONG=%d | struct accepted=%d rejected=%d eventOK=%d cpOK=%d (%s)\n",
+				i+1, nCorrect, nUnsolvable, nSevAmbig, nWrong, nAccepted, nDeeAmbig, nEventOK, nCPOK, time.Since(t0).Round(time.Second))
+		}
+	}
+
+	// A full run STREAMS the store one trace at a time (bounded memory — the
+	// unfiltered day-1 store is far larger than RAM). --first / --sample buffer
+	// only their small subset.
+	if *first <= 0 && *sample <= 0 {
+		r, err := corpus.OpenTraceStore(*storePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+			os.Exit(1)
+		}
+		defer r.Close()
+		for i := 0; ; i++ {
+			tr, err := r.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "read: %v\n", err)
+				os.Exit(1)
+			}
+			process(i, tr)
+		}
+	} else {
+		traces, err := loadTraces(*storePath, *first, *sample, *sampleSeed)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load: %v\n", err)
+			os.Exit(1)
+		}
+		for i, tr := range traces {
+			process(i, tr)
 		}
 	}
 
@@ -107,35 +179,107 @@ func main() {
 	fmt.Printf("coverage: reconstructed_real_spans=%d of survivors=%d (%.4f%%)   [edge=%d, severed-placed=%d, severed-noplace=%d]\n",
 		sumReal, sumSurv, pct(sumReal, sumSurv), sumIdent, sumSevPlaced, sumSevNoPlace)
 	fmt.Printf("[topo MUST be 100%% unless a key collides; WRONG>0 means the design failed, not the run]\n")
+	if *topoOnly {
+		fmt.Printf("--- structure: SKIPPED (--topo-only; no EE/DEE emitted) ---\n")
+		fmt.Printf("total ambiguity (ckpt4 + severed)=%d (%.4f%% of all traces)\n",
+			nUnsolvable+nSevAmbig, pct(nUnsolvable+nSevAmbig, nTraces))
+	} else {
+		fmt.Printf("--- structure (event ordering; %d topo-correct, %d REJECTED for DEE ambiguity, %d accepted) ---\n",
+			nStruct, nDeeAmbig, nAccepted)
+		fmt.Printf("rejected (DEE ambiguous)=%d (%.4f%% of topo-correct)\n", nDeeAmbig, pct(nDeeAmbig, nStruct))
+		fmt.Printf("of ACCEPTED traces (order vs order): full_event_order_correct=%d (%.4f%%)   critical_path_correct=%d (%.4f%%)\n",
+			nEventOK, pct(nEventOK, nAccepted), nCPOK, pct(nCPOK, nAccepted))
+		fmt.Printf("per-parent END-ORDER recovered=%d of %d multi-child parents (%.4f%%)\n",
+			sumEndOK, sumParents, pct(sumEndOK, sumParents))
+		totalAmbig := nUnsolvable + nSevAmbig + nDeeAmbig
+		fmt.Printf("total ambiguity (ckpt4 + severed + DEE, all counted wrong)=%d (%.4f%% of all traces)\n",
+			totalAmbig, pct(totalAmbig, nTraces))
+	}
+
+	if *timing != "" {
+		timingSummary("topology", topoNanos)
+		timingSummary("structure", structNanos)
+		if err := writeTimingCSV(*timing, topoNanos); err != nil {
+			fmt.Fprintf(os.Stderr, "timing csv: %v\n", err)
+		}
+	}
 }
 
-// spanInfo is per-span data needed to build orphan keys (real ids + ordinal/depth).
+// timingSummary prints a percentile summary of per-trace recon times (µs),
+// matching trace_recon's TIMING line for cross-scheme comparison.
+func timingSummary(label string, ns []int64) {
+	if len(ns) == 0 {
+		return
+	}
+	s := append([]int64(nil), ns...)
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	var total int64
+	for _, v := range s {
+		total += v
+	}
+	us := func(v int64) float64 { return float64(v) / 1000 }
+	pctl := func(p float64) int64 { return s[int(p*float64(len(s)-1))] }
+	fmt.Printf("TIMING[%s] traces=%d total=%s mean=%.2fus p50=%.2f p90=%.2f p99=%.2f max=%.2f (us)\n",
+		label, len(s), time.Duration(total).Round(time.Millisecond),
+		us(total/int64(len(s))), us(pctl(0.50)), us(pctl(0.90)), us(pctl(0.99)), us(s[len(s)-1]))
+}
+
+// writeTimingCSV writes one recon_ns per line (for offline distribution compare).
+func writeTimingCSV(path string, ns []int64) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	fmt.Fprintln(w, "recon_ns")
+	for _, v := range ns {
+		fmt.Fprintln(w, v)
+	}
+	return w.Flush()
+}
+
+// spanInfo is per-span data needed to build orphan keys (real ids + ordinal/depth)
+// and to score the event structure (the span's real start/end timestamps).
 type spanInfo struct {
-	id, parent  uint64
-	ord, depth  int
+	id, parent uint64
+	ord, depth int
+	endSeq     int64 // index of this span's END event in the corpus total-order (tie-broken)
 }
 
 // emitTrace replays one trace through a fresh SBridgeHandler in stored stream
 // order, capturing each emitting span's serialized _br payload, the ground-truth
 // tree (children indexed by 1-based start ordinal — the same ordinal the handler
 // assigns), and per-span (parent, ordinal, depth) for orphan matching.
-func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth, []spanInfo) {
+func emitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool) (map[uint64][]byte, recon.SBTruth, []spanInfo, [][]byte) {
 	h := bridge.NewSBridgeHandler(cpd, nil)
-	// Charge the per-span attributes reconstruction relies on: _d (depth) and
-	// _oc (ordinal chain, for non-checkpoint self-placement). Topology recon
-	// works either way (the chain carries position), but this keeps the cost
-	// accounting honest for what a real sbridge deployment would emit.
-	h.EmitDepth = true
+	// Interior spans export _o = varint(ordinal)||varint(depth); charge it so the
+	// cost accounting matches a real sbridge deployment. (Reconstruction itself
+	// uses the survivors' real ordinal/depth, not the decoded bytes.)
 	h.EmitOC = true
+	h.TopoOnly = topoOnly // drop EE/DEE; topology emission is unchanged
+	h.OmitOrdinal = noOrdinal
+	if fpBits > 0 {
+		h.FPBits = fpBits
+	}
 	payloads := map[uint64][]byte{}
 	h.EmitSink = func(_ /*tid*/, sid uint64, payload []byte) {
 		payloads[sid] = append([]byte(nil), payload...)
 	}
+	// DEEs are accumulated inline into a per-trace side store (functionally
+	// equivalent to hunting them down on a future cross-trace request).
+	var dees [][]byte
+	h.DEESink = func(_ uint64, q []byte) { dees = append(dees, append([]byte(nil), q...)) }
 	truth := recon.SBTruth{ChildByOrd: map[uint64]map[int]uint64{}}
 	nextSeq := map[uint64]int{}
 	var spans []spanInfo
 	parent := map[uint64]uint64{}
-	for _, e := range tr.Events {
+	// END-event position in the trace's total-ordered (tie-broken) event stream.
+	// This — not the raw end timestamp — is the ground-truth end order: the events
+	// are already canonically ordered (the same order the handler builds EE/DEE
+	// from), so ties have one well-defined position, no invented tiebreak.
+	endPos := map[uint64]int64{}
+	for i, e := range tr.Events {
 		ev := &bridge.Event{TraceID: tr.TraceID, SpanID: e.SpanID, ParentID: e.ParentID, ServiceID: e.ServiceID}
 		if e.Kind == corpus.KindStart {
 			seq := 0
@@ -155,6 +299,7 @@ func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth
 			spans = append(spans, spanInfo{id: e.SpanID, parent: e.ParentID, ord: seq})
 			h.OnStart(ev, seq)
 		} else {
+			endPos[e.SpanID] = int64(i)
 			h.OnEnd(ev)
 		}
 	}
@@ -178,8 +323,9 @@ func emitTrace(tr corpus.StoredTrace, cpd int) (map[uint64][]byte, recon.SBTruth
 	}
 	for i := range spans {
 		spans[i].depth = d(spans[i].id)
+		spans[i].endSeq = endPos[spans[i].id]
 	}
-	return payloads, truth, spans
+	return payloads, truth, spans, dees
 }
 
 // dropSet picks the dropped span ids for one trace. CHECKPOINTS are never

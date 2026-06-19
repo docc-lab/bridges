@@ -263,7 +263,18 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 	// its baggage amortization depends on trace density — a sample under-amortizes
 	// it; pb/cgpb/vanilla are per-trace and unbiased under sampling.
 	var selected map[uint64]struct{}
-	if cfg.sampleCount > 0 && cfg.sampleCount < len(traceOrder) {
+	if cfg.first > 0 && cfg.first < len(traceOrder) {
+		// First N contiguous traces: keeps S-bridge's cross-trace DEE density
+		// realistic (consecutive traces feed each other's queues), and we stop
+		// reading as soon as all N finalize.
+		traceOrder = traceOrder[:cfg.first]
+		spanCounts = spanCounts[:cfg.first]
+		selected = make(map[uint64]struct{}, len(traceOrder))
+		for _, tid := range traceOrder {
+			selected[tid] = struct{}{}
+		}
+		fmt.Fprintf(os.Stderr, "first: simulating first %d traces (contiguous)\n", len(traceOrder))
+	} else if cfg.sampleCount > 0 && cfg.sampleCount < len(traceOrder) {
 		idx := make([]int, len(traceOrder))
 		for i := range idx {
 			idx[i] = i
@@ -308,6 +319,10 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 			parentID:  ce.ParentID,
 			serviceID: ce.ServiceID,
 		})
+		// --first: stop as soon as all selected traces have finalized.
+		if cfg.first > 0 && s.completed >= len(traceOrder) {
+			break
+		}
 	}
 	return s.finalize()
 }

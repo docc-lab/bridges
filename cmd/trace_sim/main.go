@@ -36,10 +36,14 @@ type config struct {
 	deeLogBytes        int
 	emitDepth          bool
 	emitOC             bool
+	topoOnly           bool
+	fpBits             int
+	noOrdinal          bool
 	prefixLen          int
 	bloomFP            float64
 	sampleCount        int   // corpus mode: if >0, simulate a RANDOM sample of this many traces (seeded)
 	sampleSeed         int64 // seed for the random sample
+	first              int   // corpus mode: if >0, simulate only the FIRST N traces (contiguous), stop early
 	progressN          int   // corpus mode: print a PROGRESS line every N completed traces (0 = off)
 }
 
@@ -54,10 +58,14 @@ func parseFlags() config {
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
 	flag.IntVar(&c.sampleCount, "sample", 0, "Corpus mode: if >0, simulate a RANDOM sample of this many traces (uniform over the trace order, seeded by --sample-seed). Same seed => same sample (match the recon sweep's --sample/--sample-seed for overhead-vs-accuracy on identical traces).")
 	flag.Int64Var(&c.sampleSeed, "sample-seed", 1, "Seed for --sample trace selection")
+	flag.IntVar(&c.first, "first", 0, "Corpus mode: simulate only the FIRST N traces (contiguous in trace order), stopping the read once they finalize. Unlike --sample this keeps S-bridge's cross-trace DEE density realistic.")
 	flag.IntVar(&c.progressN, "progress", 0, "Corpus mode: print a PROGRESS line to stderr every N completed traces (0 = silent)")
 	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
 	flag.BoolVar(&c.emitDepth, "emit-depth", true, "Emit absolute depth: varint(depth) replaces varint(depthMod) in _br payloads, and interior non-checkpoint spans carry a _d attribute (see docs/depth_emission.md). Default on: reconstruction relies on per-span depth, so its cost must be charged. Pass --emit-depth=false for the legacy depthMod accounting.")
 	flag.BoolVar(&c.emitOC, "emit-oc", true, "S-bridge: emit an _oc attribute (window-relative ordinal chain) on interior non-checkpoint spans so a surviving non-checkpoint can self-place. Default on: sbridge reconstruction needs per-span ordinal position, so charge it. (No effect on non-sbridge modes.)")
+	flag.BoolVar(&c.topoOnly, "topo-only", false, "S-bridge: emit topology only — drop the per-level EE sublists and DEE batches (Phase-2 ordering). Smaller _br payload, no DEE baggage; reconstructs call-graph shape but not event order.")
+	flag.IntVar(&c.fpBits, "fp-bits", 16, "S-bridge: non-checkpoint fingerprint width in bits (bit-packed in the _br fp section). Default 16 (legacy 2-byte). Narrower = smaller payload, higher reject rate.")
+	flag.BoolVar(&c.noOrdinal, "no-ordinal", false, "S-bridge: drop the ordinal from interior _o (emit depth only); severed survivors self-place by (depth, own-fp, parent-fp).")
 	flag.BoolVar(&c.logDee, "log-dee", false, "S-bridge: log DEE pickup/queue events to stderr")
 	flag.IntVar(&c.deeLogBytes, "dee-log-bytes", 10000, "Threshold for --log-dee")
 	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
@@ -113,8 +121,12 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 			}
 		}
 		h := bridge.NewSBridgeHandler(c.checkpointDistance, logger)
-		h.EmitDepth = c.emitDepth
 		h.EmitOC = c.emitOC
+		h.TopoOnly = c.topoOnly
+		h.OmitOrdinal = c.noOrdinal
+		if c.fpBits > 0 {
+			h.FPBits = c.fpBits
+		}
 		return h
 	}
 	fmt.Fprintf(os.Stderr, "unknown mode %q\n", c.mode)

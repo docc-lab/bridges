@@ -149,7 +149,14 @@ func EstimateParameters(n int, p float64) (m, k uint32) {
 		// A prime modulus gives the double-hashing probe schedule a full period
 		// (gcd(step,m)=1), so the k probes can't collapse onto a few colliding
 		// bits at small m — recovering the nominal FPR without growing capacity.
-		m = nextPrime(m)
+		up := nextPrime(m)
+		if PrimeMByteCap && (up+7)/8 > (m+7)/8 {
+			// Rounding up would spill into another byte; drop to the previous
+			// prime instead so the on-wire byte count never exceeds the raw size.
+			m = prevPrime(m)
+		} else {
+			m = up
+		}
 	}
 	kFloat := math.Ceil(float64(m) / float64(n) * ln2)
 	if kFloat < 1 {
@@ -159,9 +166,14 @@ func EstimateParameters(n int, p float64) (m, k uint32) {
 	return
 }
 
-// PrimeM, when true, rounds the bloom bit count up to the next prime in
+// PrimeM, when true, rounds the bloom bit count to a prime in
 // EstimateParameters (see the prime-modulus note there). Off by default.
 var PrimeM bool
+
+// PrimeMByteCap, when set alongside PrimeM, keeps the prime modulus within the
+// raw size's byte budget: round up to the next prime unless that would use more
+// bytes, in which case round down to the previous prime. Zero byte overhead.
+var PrimeMByteCap bool
 
 func isPrime(n uint32) bool {
 	if n < 2 {
@@ -181,6 +193,16 @@ func isPrime(n uint32) bool {
 func nextPrime(n uint32) uint32 {
 	for !isPrime(n) {
 		n++
+	}
+	return n
+}
+
+func prevPrime(n uint32) uint32 {
+	for n >= 2 && !isPrime(n) {
+		n--
+	}
+	if n < 2 {
+		return 2
 	}
 	return n
 }

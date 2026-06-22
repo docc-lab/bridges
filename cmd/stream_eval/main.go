@@ -66,10 +66,12 @@ func main() {
 	flag.Int64Var(&sbDropSeed, "sb-drop-seed", 1, "S-Bridge per-trace drop base seed (matches sbridge_recon --drop-seed)")
 	flag.Int64Var(&cgDropSeed, "cg-drop-seed", 1, "cgprb per-trace drop base seed (matches trace_recon --seed under --per-trace-drop-seed)")
 	flag.IntVar(&workers, "workers", runtime.NumCPU(), "parallel workers")
-	var primeM bool
-	flag.BoolVar(&primeM, "prime-m", false, "round bloom bit count up to the next prime (fixes small-m double-hash clustering)")
+	var primeM, primeMByteCap bool
+	flag.BoolVar(&primeM, "prime-m", false, "round bloom bit count to a prime (fixes small-m double-hash clustering)")
+	flag.BoolVar(&primeMByteCap, "prime-m-bytecap", false, "with --prime-m: keep the prime within the raw size's byte budget (down to prev prime if up would add a byte)")
 	flag.Parse()
 	bloom.PrimeM = primeM // set before any bloom sizing (emit + recon must match)
+	bloom.PrimeMByteCap = primeMByteCap
 	if workers < 1 {
 		workers = 1
 	}

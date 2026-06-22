@@ -24,10 +24,12 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"bridges/bloom"
 	"bridges/bridge"
 	"bridges/corpus"
 	"bridges/gen"
@@ -64,14 +66,18 @@ func main() {
 	flag.Int64Var(&sbDropSeed, "sb-drop-seed", 1, "S-Bridge per-trace drop base seed (matches sbridge_recon --drop-seed)")
 	flag.Int64Var(&cgDropSeed, "cg-drop-seed", 1, "cgprb per-trace drop base seed (matches trace_recon --seed under --per-trace-drop-seed)")
 	flag.IntVar(&workers, "workers", runtime.NumCPU(), "parallel workers")
+	var primeM bool
+	flag.BoolVar(&primeM, "prime-m", false, "round bloom bit count up to the next prime (fixes small-m double-hash clustering)")
 	flag.Parse()
+	bloom.PrimeM = primeM // set before any bloom sizing (emit + recon must match)
 	if workers < 1 {
 		workers = 1
 	}
 	// Slab budget sizing (one config constant, shared by all traces/workers).
 	c.SlabMeanW = gen.EstimateMeanFanout(&c)
 	// cgprb recon config: same constructor/defaults as trace_recon --mode cgprb.
-	cgCfg := recon.NewPCRBConfig(cpd, bridge.DefaultPCRPrefixLen, bridge.DefaultBloomFPRate)
+	// Bloom FP target overridable via env (must match the emit side) for sweeping.
+	cgCfg := recon.NewPCRBConfig(cpd, bridge.DefaultPCRPrefixLen, bloomFPTarget())
 	sbCfg := recon.Config{CPD: cpd, FPBits: fpBits}
 
 	t0 := time.Now()
@@ -125,6 +131,7 @@ type stats struct {
 	sbStruct, sbAccepted, sbDeeAmbig, sbEventOK, sbCPOK int
 	// cgprb
 	cgTopoCorrect, cgStrict, cgMisattached, cgAmbiguous, cgAmbiguousBad int
+	cgMisattachAnc                                                      int // of cgMisattached, anchor is a true ancestor (band-math); complement = non-ancestor (bloom-FP/cross-branch)
 	// per-trace recon timing (ns) and span counts, for distributions
 	sbTopoNs, sbStructNs, cgNs, spansPer []int64
 	// per-trace amortized recon time (ns/span), for per-span distributions
@@ -146,6 +153,7 @@ func (a *stats) add(b *stats) {
 	a.cgTopoCorrect += b.cgTopoCorrect
 	a.cgStrict += b.cgStrict
 	a.cgMisattached += b.cgMisattached
+	a.cgMisattachAnc += b.cgMisattachAnc
 	a.cgAmbiguous += b.cgAmbiguous
 	a.cgAmbiguousBad += b.cgAmbiguousBad
 	a.sbTopoNs = append(a.sbTopoNs, b.sbTopoNs...)
@@ -213,6 +221,9 @@ func (a *stats) report(c gen.Config, cpd int, drop float64, fpBits, n int, baseS
 	fmt.Printf("  topo_correct=%d (%.4f%%)  strict_shape=%d (%.4f%%)  misattached=%d  ambiguous=%d (of which misattached=%d)\n",
 		a.cgTopoCorrect, pct(a.cgTopoCorrect, a.nTraces), a.cgStrict, pct(a.cgStrict, a.nTraces),
 		a.cgMisattached, a.cgAmbiguous, a.cgAmbiguousBad)
+	fmt.Printf("  misattach split: ancestor(band-math)=%d (%.1f%%)  non-ancestor(bloom-FP/cross-branch)=%d (%.1f%%)\n",
+		a.cgMisattachAnc, pct(a.cgMisattachAnc, a.cgMisattached),
+		a.cgMisattached-a.cgMisattachAnc, pct(a.cgMisattached-a.cgMisattachAnc, a.cgMisattached))
 	fmt.Printf("--- per-solver recon timing (per trace, µs) ---\n")
 	for _, e := range []struct {
 		name string
@@ -487,8 +498,22 @@ type cgColl struct {
 	br               []byte
 }
 
+var cgp2DumpOnce sync.Once
+
+// bloomFPTarget returns the bloom false-positive target used to size the CGP-RB
+// blooms on BOTH the emit and reconstruction sides (they must match). Defaults to
+// bridge.DefaultBloomFPRate; override with TRACE_RECON_BLOOMFP to sweep geometry.
+func bloomFPTarget() float64 {
+	if v := os.Getenv("TRACE_RECON_BLOOMFP"); v != "" {
+		if p, err := strconv.ParseFloat(v, 64); err == nil && p > 0 && p < 1 {
+			return p
+		}
+	}
+	return bridge.DefaultBloomFPRate
+}
+
 func evalCGPRB(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.Config, cpd int, rate float64, dropSeed int64, nspans int) {
-	h := bridge.NewCGPRBBridgeHandler(cpd, bridge.DefaultPCRPrefixLen, bridge.DefaultBloomFPRate)
+	h := bridge.NewCGPRBBridgeHandler(cpd, bridge.DefaultPCRPrefixLen, bloomFPTarget())
 	h.Capture = true
 	var spans []cgColl
 	idx := map[uint64]int{}
@@ -557,7 +582,12 @@ func evalCGPRB(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.Con
 		survivors = append(survivors, sp)
 	}
 	tc := time.Now()
-	res := recon.ReconstructCGPRB(survivors, cfg)
+	var res recon.Result
+	if os.Getenv("TRACE_RECON_CGP2") == "1" {
+		res = recon.ReconstructCGP2(survivors, cfg) // from-scratch reconstructor
+	} else {
+		res = recon.ReconstructCGPRB(survivors, cfg)
+	}
 	cgNs := time.Since(tc).Nanoseconds()
 	st.cgNs = append(st.cgNs, cgNs)
 	if nspans > 0 {
@@ -565,6 +595,26 @@ func evalCGPRB(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.Con
 	}
 	topo := recon.ScoreCGPTopology(res, truth, dropped, tid)
 	sc := recon.ScorePCR(res, truth, dropped)
+	if os.Getenv("TRACE_RECON_CGP2DUMP") == "1" && len(res.ReconParent) > 0 {
+		cgp2DumpOnce.Do(func() { recon.DumpCGP2Edges(survivors, truth, res, dropped) })
+	}
+	if os.Getenv("TRACE_RECON_CGP2ISO") == "1" {
+		iso := recon.ScoreCGP2Iso(res, truth, dropped)
+		fmt.Fprintf(os.Stderr, "CGP2ISO realNodes=%d edgeExact=%d edgeAnonOK=%d edgeWrong=%d | survNodes=%d survExact=%d | namedSyn=%d namedExact=%d\n",
+			iso.RealNodes, iso.EdgeExact, iso.EdgeAnonOK, iso.EdgeWrong, iso.SurvNodes, iso.SurvExact, iso.NamedSyn, iso.NamedExact)
+	}
+	if os.Getenv("TRACE_RECON_CGP2WRONGDEPTH") == "1" && len(res.ReconParent) > 0 {
+		recon.DumpCGP2WrongDepths(truth, res, dropped, cpd)
+	}
+	if os.Getenv("TRACE_RECON_CGP2GPD") == "1" && len(res.ReconParent) > 0 {
+		ex, gd, gdw, gs, gsw, cSum, cN := recon.GrandparentDecomp(survivors, truth, res, dropped, cpd)
+		fmt.Fprintf(os.Stderr, "CGP2GPD exposed=%d gDrop=%d gDropWrong=%d gSurv=%d gSurvWrong=%d cousinSum=%d cousinN=%d\n", ex, gd, gdw, gs, gsw, cSum, cN)
+	}
+	if os.Getenv("TRACE_RECON_CGP2SURVCHK") == "1" && len(res.ReconParent) > 0 {
+		bad, holeInv, wrongSurv, miss, missPS, tot, _ := recon.CheckSurvivorSyntheticEdges(survivors, res)
+		fmt.Fprintf(os.Stderr, "CGP2SURVCHK total=%d badSynthetic=%d holeInvented=%d wrongSurvivor=%d missing=%d missingParentSurvived=%d\n",
+			tot, bad, holeInv, wrongSurv, miss, missPS)
+	}
 	if topo.TopoCorrect {
 		st.cgTopoCorrect++
 	}
@@ -572,6 +622,7 @@ func evalCGPRB(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.Con
 		st.cgStrict++
 	}
 	st.cgMisattached += sc.Misattached
+	st.cgMisattachAnc += sc.MisattachAncestor
 	st.cgAmbiguous += sc.Ambiguous
 	st.cgAmbiguousBad += sc.AmbiguousBad
 }

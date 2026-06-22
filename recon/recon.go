@@ -260,6 +260,24 @@ type Result struct {
 	// is reported separately from the main census.
 	OrphansPlaced  int
 	OrphanOpenEnds int
+
+	// ReconParent is the FULL reconstructed tree: node id -> parent node id, over
+	// every survivor plus every recovered synthetic (named fan-outs and anonymous
+	// gap-fillers). Set by the from-scratch reconstructor (ReconstructCGP2); nil
+	// for the bridge-based engines. Named synthetics carry the recovered dropped
+	// span's true id; anonymous gap-fillers are listed in ReconAnon.
+	ReconParent map[uint64]uint64
+
+	// ReconAnon is the set of anonymous synthetic node ids — gap-fillers with NO
+	// recovered identity. Distinguished EXPLICITLY (not by a numeric id range,
+	// which cannot be disjoint from uniform 64-bit span ids). A node id is a real
+	// span (survivor or named synthetic) iff it is NOT in this set.
+	ReconAnon map[uint64]bool
+
+	// ReconHAFanouts is the set of node ids that are HA-witnessed fan-outs (known
+	// to have >=2 children). A named synthetic may be an exact parent, an HA
+	// fan-out, or both; this set marks the HA-witnessed ones.
+	ReconHAFanouts map[uint64]bool
 }
 
 // ReconstructPB reattaches orphaned spans using P-Bridge payloads. This is
@@ -582,6 +600,14 @@ type Score struct {
 	AnchorAncestor int
 	GapCorrect     int // synthetic count == true dropped spans in between
 	Misattached    int // reconnected but anchor wrong (bloom FP / ambiguity)
+	// MisattachAncestor: of the Misattached, those whose chosen anchor is still
+	// a TRUE ancestor of the orphan (just not the nearest survivor) — i.e. a
+	// band-math / synthetic-miscount error, NOT a bloom violation. The
+	// complement (Misattached-MisattachAncestor) chose a NON-ancestor: bloom
+	// false positive or cross-branch. This split decides whether the resonance
+	// is curable by bloom corroboration (non-ancestor) or lives in PCRS's
+	// lattice (ancestor).
+	MisattachAncestor int
 	Unanchored     int
 	Synthetic      int // total synthetic spans created
 	Borrowed       int // bridges built via the membership-based bloom fallback
@@ -681,14 +707,17 @@ func scorePB(res Result, truth []TruthSpan, dropped map[uint64]struct{}, absent 
 			}
 		} else {
 			sc.Misattached++
+			if isAncestor {
+				sc.MisattachAncestor++
+			}
 			if b.Ambiguous {
 				sc.AmbiguousBad++
 			}
 			if debugScore {
 				fmt.Fprintf(os.Stderr,
-					"misattach: orphan=%016x d=%d got_anchor=%016x (d=%d, ambig=%t, syn=%d) want_anchor=%016x (d=%d, gap=%d)\n",
+					"misattach: orphan=%016x d=%d got_anchor=%016x (d=%d, ambig=%t, syn=%d, isancestor=%t, via=%016x) want_anchor=%016x (d=%d, gap=%d)\n",
 					b.OrphanID, depth[b.OrphanID],
-					b.AnchorID, depth[b.AnchorID], b.Ambiguous, b.Synthetic,
+					b.AnchorID, depth[b.AnchorID], b.Ambiguous, b.Synthetic, isAncestor, b.ViaCarrier,
 					trueAnchor, depth[trueAnchor], gap)
 			}
 		}

@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	mathbits "math/bits"
 )
 
 const (
@@ -144,12 +145,44 @@ func EstimateParameters(n int, p float64) (m, k uint32) {
 		mFloat = 1
 	}
 	m = uint32(mFloat)
+	if PrimeM {
+		// A prime modulus gives the double-hashing probe schedule a full period
+		// (gcd(step,m)=1), so the k probes can't collapse onto a few colliding
+		// bits at small m — recovering the nominal FPR without growing capacity.
+		m = nextPrime(m)
+	}
 	kFloat := math.Ceil(float64(m) / float64(n) * ln2)
 	if kFloat < 1 {
 		kFloat = 1
 	}
 	k = uint32(kFloat)
 	return
+}
+
+// PrimeM, when true, rounds the bloom bit count up to the next prime in
+// EstimateParameters (see the prime-modulus note there). Off by default.
+var PrimeM bool
+
+func isPrime(n uint32) bool {
+	if n < 2 {
+		return false
+	}
+	if n%2 == 0 {
+		return n == 2
+	}
+	for d := uint32(3); d*d <= n; d += 2 {
+		if n%d == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func nextPrime(n uint32) uint32 {
+	for !isPrime(n) {
+		n++
+	}
+	return n
 }
 
 // Filter is a bloom filter with m bits and k hash functions. Add/Test derive
@@ -189,6 +222,16 @@ func (f *Filter) K() uint32 { return f.k }
 
 // ByteSize returns the raw byte size of the bit array (i.e. the on-wire size).
 func (f *Filter) ByteSize() int { return len(f.bits) }
+
+// PopCount returns the number of set bits — the filter's current fill, used to
+// estimate actual load and the realized false-positive rate.
+func (f *Filter) PopCount() int {
+	n := 0
+	for _, b := range f.bits {
+		n += mathbits.OnesCount8(b)
+	}
+	return n
+}
 
 // Add inserts data into the filter.
 func (f *Filter) Add(data []byte) {

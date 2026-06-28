@@ -1,18 +1,59 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"os"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"bridges/bridge"
 	"bridges/corpus"
 	"bridges/loader"
 )
+
+// streamWriter appends one CSV record per finalized trace to disk, so the
+// per-trace metrics never have to be held in memory all at once. It is safe for
+// concurrent use (the sharded runner has W workers writing through it). The
+// leading header documents the schema and run parameters for the post-processor.
+type streamWriter struct {
+	mu sync.Mutex
+	w  *bufio.Writer
+	f  *os.File
+}
+
+func newStreamWriter(path string, cpd int, emitDepth, emitOC bool) (*streamWriter, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	w := bufio.NewWriterSize(f, 1<<20)
+	fmt.Fprintf(w, "#cpd=%d emit_depth=%t emit_oc=%t\n", cpd, emitDepth, emitOC)
+	fmt.Fprintln(w, "tid,num_spans,num_ckpt_spans,ckpt_sum,ckpt_max,n_bag,bag_sum,bag_max,n_depth,depth_sum,n_oc,oc_sum")
+	return &streamWriter{w: w, f: f}, nil
+}
+
+func (sw *streamWriter) writeRec(tid uint64, m *TraceMetrics) {
+	sw.mu.Lock()
+	fmt.Fprintf(sw.w, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+		tid, m.NumSpans, m.NumCheckpointSpans, m.CheckpointSum, m.CheckpointMax,
+		m.NumBaggageCalls, m.BaggageSum, m.BaggageMax,
+		m.NumDepthSpans, m.DepthSum, m.NumOcSpans, m.OcSum)
+	sw.mu.Unlock()
+}
+
+func (sw *streamWriter) close() error {
+	if err := sw.w.Flush(); err != nil {
+		sw.f.Close()
+		return err
+	}
+	return sw.f.Close()
+}
 
 func btoi(b bool) int {
 	if b {
@@ -113,21 +154,47 @@ type simState struct {
 	metricsByTID map[uint64]*TraceMetrics
 	traceOrder   []uint64
 	openByTID    map[uint64]int
-	nextSeq      map[seqKey]int
+	// nextSeq[traceID][parentID] = child start-ordinal counter. Nested by trace
+	// so a trace's counters can be freed in one delete on finalize — otherwise
+	// they accumulate one entry per (trace, parent) for the whole run.
+	nextSeq map[uint64]map[uint64]int
 
 	progressN int       // print a PROGRESS line every N completed traces (0 = off)
 	t0        time.Time // start time for the progress elapsed
 	completed int       // traces finished so far
+
+	// Sharded mode only: when gCompleted != nil, completions are counted into
+	// this shared atomic (across all workers) and PROGRESS prints off it at
+	// gProgressN, instead of the per-state `completed` counter. nil in the
+	// single-threaded path, so its behavior is unchanged.
+	gCompleted *int64
+	gProgressN int
+
+	// Streaming mode: when stream != nil, per-trace metrics are allocated lazily
+	// (on first event) and written + freed on finalize instead of being retained
+	// for a final JSON dump — bounding resident memory to the in-flight trace
+	// set. spanCountByTID supplies each trace's span count for that lazy alloc.
+	stream         *streamWriter
+	spanCountByTID map[uint64]int
 }
 
-type seqKey struct{ traceID, parentID uint64 }
 
-func newSimState(traceOrder []uint64, spanCounts []int) *simState {
+func newSimState(traceOrder []uint64, spanCounts []int, stream *streamWriter) *simState {
 	s := &simState{
 		metricsByTID: make(map[uint64]*TraceMetrics, len(traceOrder)),
 		traceOrder:   traceOrder,
 		openByTID:    make(map[uint64]int, len(traceOrder)),
-		nextSeq:      make(map[seqKey]int),
+		nextSeq:      make(map[uint64]map[uint64]int),
+		stream:       stream,
+	}
+	if stream != nil {
+		// Lazy: keep only a tid->span-count index up front; per-trace metrics and
+		// openByTID entries are created on first event and freed on finalize.
+		s.spanCountByTID = make(map[uint64]int, len(traceOrder))
+		for i, tid := range traceOrder {
+			s.spanCountByTID[tid] = spanCounts[i]
+		}
+		return s
 	}
 	for i, tid := range traceOrder {
 		s.metricsByTID[tid] = newTraceMetrics(spanCounts[i])
@@ -148,13 +215,23 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 		ServiceID: e.serviceID,
 	}
 	m := s.metricsByTID[e.traceID]
+	if m == nil && s.stream != nil { // streaming: allocate on first event seen
+		sc := s.spanCountByTID[e.traceID]
+		m = newTraceMetrics(sc)
+		s.metricsByTID[e.traceID] = m
+		s.openByTID[e.traceID] = 2 * sc
+	}
 
 	if e.kind == bridge.KindStart {
 		seqNum := 0
 		if e.parentID != 0 {
-			k := seqKey{e.traceID, e.parentID}
-			seqNum = s.nextSeq[k] + 1
-			s.nextSeq[k] = seqNum
+			pm := s.nextSeq[e.traceID]
+			if pm == nil {
+				pm = make(map[uint64]int)
+				s.nextSeq[e.traceID] = pm
+			}
+			seqNum = pm[e.parentID] + 1
+			pm[e.parentID] = seqNum
 		}
 		r := h.OnStart(ev, seqNum)
 		if dumpPerSpans {
@@ -215,10 +292,23 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 	if s.openByTID[e.traceID] == 0 {
 		h.EvictTrace(e.traceID)
 		delete(s.openByTID, e.traceID)
-		s.completed++
-		if s.progressN > 0 && s.completed%s.progressN == 0 {
-			fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds\n",
-				s.completed, int(time.Since(s.t0).Seconds()))
+		delete(s.nextSeq, e.traceID) // free this trace's child-ordinal counters
+		if s.stream != nil { // streaming: emit this trace's record and free it
+			s.stream.writeRec(e.traceID, m)
+			delete(s.metricsByTID, e.traceID)
+		}
+		if s.gCompleted != nil { // sharded: count into the shared atomic
+			n := atomic.AddInt64(s.gCompleted, 1)
+			if s.gProgressN > 0 && n%int64(s.gProgressN) == 0 {
+				fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds\n",
+					n, int(time.Since(s.t0).Seconds()))
+			}
+		} else {
+			s.completed++
+			if s.progressN > 0 && s.completed%s.progressN == 0 {
+				fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds\n",
+					s.completed, int(time.Since(s.t0).Seconds()))
+			}
 		}
 	}
 }
@@ -241,7 +331,7 @@ func runInterleavedJSON(traces []loader.Trace, h bridge.Handler) []TraceMetrics 
 		traceOrder[i] = t.TraceID
 		spanCounts[i] = len(t.Spans)
 	}
-	s := newSimState(traceOrder, spanCounts)
+	s := newSimState(traceOrder, spanCounts, nil)
 
 	for _, e := range events {
 		s.onEvent(h, e)
@@ -252,9 +342,12 @@ func runInterleavedJSON(traces []loader.Trace, h bridge.Handler) []TraceMetrics 
 // runInterleavedFromCorpus streams events.bin and dispatches each event.
 // Corpus is already globally sorted by the same key as Python's sort_events,
 // so no sort happens here — pure streaming dispatch.
-func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h bridge.Handler, cfg config) []TraceMetrics {
-	traceOrder := append([]uint64(nil), meta.TraceOrder...)
-	spanCounts := make([]int, len(meta.SpanCounts))
+// selectTraces resolves which traces to simulate (and in what order) from the
+// corpus meta and the --first/--sample flags, returning the trace order, their
+// span counts, and a membership set (nil = all traces).
+func selectTraces(meta *corpus.Meta, cfg config) (traceOrder []uint64, spanCounts []int, selected map[uint64]struct{}) {
+	traceOrder = append([]uint64(nil), meta.TraceOrder...)
+	spanCounts = make([]int, len(meta.SpanCounts))
 	for i, c := range meta.SpanCounts {
 		spanCounts[i] = int(c)
 	}
@@ -262,7 +355,6 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 	// other traces are skipped). NOTE: S-bridge's DEE queue is cross-trace, so
 	// its baggage amortization depends on trace density — a sample under-amortizes
 	// it; pb/cgpb/vanilla are per-trace and unbiased under sampling.
-	var selected map[uint64]struct{}
 	if cfg.first > 0 && cfg.first < len(traceOrder) {
 		// First N contiguous traces: keeps S-bridge's cross-trace DEE density
 		// realistic (consecutive traces feed each other's queues), and we stop
@@ -293,7 +385,12 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 		traceOrder, spanCounts = so, sc
 		fmt.Fprintf(os.Stderr, "sample: simulating %d random traces (seed %d)\n", len(traceOrder), cfg.sampleSeed)
 	}
-	s := newSimState(traceOrder, spanCounts)
+	return
+}
+
+func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h bridge.Handler, cfg config, stream *streamWriter) []TraceMetrics {
+	traceOrder, spanCounts, selected := selectTraces(meta, cfg)
+	s := newSimState(traceOrder, spanCounts, stream)
 	s.progressN, s.t0 = cfg.progressN, time.Now()
 
 	for {
@@ -324,5 +421,103 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 			break
 		}
 	}
+	if stream != nil {
+		return nil // records were streamed to disk; nothing retained to dump
+	}
 	return s.finalize()
+}
+
+// runShardedFromCorpus is the parallel-across-traces variant of
+// runInterleavedFromCorpus, for modes with NO cross-trace state (pb, cgpb, pcr,
+// pcrb, cgprb, vanilla — anything without S-bridge's DEE queue). Traces are
+// sharded by tid % workers; each worker owns its shard end-to-end with its own
+// handler instance and its own simState (own openByTID/nextSeq/metrics), so
+// nothing mutable is shared — only the per-trace metrics, partitioned across
+// shards, summing to the same total memory as the single-threaded path. A single
+// reader routes each event to its owner's channel (bounded → backpressure).
+// makeH must return a FRESH, independent handler on each call.
+func runShardedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, makeH func() bridge.Handler, cfg config, workers int, stream *streamWriter) []TraceMetrics {
+	traceOrder, spanCounts, selected := selectTraces(meta, cfg)
+	W := workers
+	if W < 1 {
+		W = 1
+	}
+	wof := func(tid uint64) int { return int(tid % uint64(W)) }
+
+	// Per-shard trace order + span counts (preserves global order within a shard).
+	subOrder := make([][]uint64, W)
+	subCounts := make([][]int, W)
+	for i, tid := range traceOrder {
+		w := wof(tid)
+		subOrder[w] = append(subOrder[w], tid)
+		subCounts[w] = append(subCounts[w], spanCounts[i])
+	}
+
+	var gCompleted int64
+	t0 := time.Now()
+	states := make([]*simState, W)
+	handlers := make([]bridge.Handler, W)
+	chans := make([]chan streamEvent, W)
+	var wg sync.WaitGroup
+	for w := 0; w < W; w++ {
+		s := newSimState(subOrder[w], subCounts[w], stream)
+		s.gCompleted, s.gProgressN, s.t0 = &gCompleted, cfg.progressN, t0
+		states[w] = s
+		handlers[w] = makeH()
+		chans[w] = make(chan streamEvent, 4096)
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			s, h := states[w], handlers[w]
+			for e := range chans[w] {
+				s.onEvent(h, e)
+			}
+		}(w)
+	}
+
+	target := int64(len(traceOrder))
+	early := cfg.first > 0 || cfg.sampleCount > 0
+	for {
+		ce, err := er.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			fmt.Fprintf(os.Stderr, "corpus read error: %v\n", err)
+			os.Exit(1)
+		}
+		if selected != nil {
+			if _, ok := selected[ce.TraceID]; !ok {
+				continue
+			}
+		}
+		chans[wof(ce.TraceID)] <- streamEvent{
+			ts:        ce.TS,
+			kind:      bridge.Kind(ce.Kind),
+			depth:     int(ce.Depth),
+			traceID:   ce.TraceID,
+			spanID:    ce.SpanID,
+			parentID:  ce.ParentID,
+			serviceID: ce.ServiceID,
+		}
+		// Early stop for --first/--sample: once every selected trace has
+		// finalized, all their events are consumed, so nothing else matters.
+		if early && atomic.LoadInt64(&gCompleted) >= target {
+			break
+		}
+	}
+	for w := 0; w < W; w++ {
+		close(chans[w])
+	}
+	wg.Wait()
+
+	if stream != nil {
+		return nil // streamed to disk; per-worker maps were emptied on finalize
+	}
+	// Reassemble metrics in the global selected order (the JSON's row order).
+	out := make([]TraceMetrics, len(traceOrder))
+	for i, tid := range traceOrder {
+		out[i] = *states[wof(tid)].metricsByTID[tid]
+	}
+	return out
 }

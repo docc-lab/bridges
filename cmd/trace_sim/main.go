@@ -45,6 +45,8 @@ type config struct {
 	sampleSeed         int64 // seed for the random sample
 	first              int   // corpus mode: if >0, simulate only the FIRST N traces (contiguous), stop early
 	progressN          int   // corpus mode: print a PROGRESS line every N completed traces (0 = off)
+	workers            int   // corpus mode: parallel worker count (trace sharding; non-sbridge modes only)
+	streamMetrics      string // corpus mode: stream per-trace metrics CSV here instead of holding all in RAM
 }
 
 func parseFlags() config {
@@ -60,6 +62,8 @@ func parseFlags() config {
 	flag.Int64Var(&c.sampleSeed, "sample-seed", 1, "Seed for --sample trace selection")
 	flag.IntVar(&c.first, "first", 0, "Corpus mode: simulate only the FIRST N traces (contiguous in trace order), stopping the read once they finalize. Unlike --sample this keeps S-bridge's cross-trace DEE density realistic.")
 	flag.IntVar(&c.progressN, "progress", 0, "Corpus mode: print a PROGRESS line to stderr every N completed traces (0 = silent)")
+	flag.IntVar(&c.workers, "workers", 1, "Corpus mode: parallel workers, sharding traces by tid%workers (1 = single-threaded). Only for modes with no cross-trace state (pb/cgpb/pcr/pcrb/cgprb/vanilla); sbridge is forced to 1 (its DEE queue is cross-trace).")
+	flag.StringVar(&c.streamMetrics, "stream-metrics", "", "Corpus mode: stream per-trace metrics as CSV to this file (one row per trace, written + freed on finalize) instead of holding them all in RAM. Bounds memory to the in-flight trace set; post-process into the bagsize JSON with `trace_sim csv2json <csv> <out.json>`. Replaces -o (no JSON written directly).")
 	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
 	flag.BoolVar(&c.emitDepth, "emit-depth", true, "Emit absolute depth: varint(depth) replaces varint(depthMod) in _br payloads, and interior non-checkpoint spans carry a _d attribute (see docs/depth_emission.md). Default on: reconstruction relies on per-span depth, so its cost must be charged. Pass --emit-depth=false for the legacy depthMod accounting.")
 	flag.BoolVar(&c.emitOC, "emit-oc", true, "S-bridge: emit an _oc attribute (window-relative ordinal chain) on interior non-checkpoint spans so a surviving non-checkpoint can self-place. Default on: sbridge reconstruction needs per-span ordinal position, so charge it. (No effect on non-sbridge modes.)")
@@ -68,7 +72,7 @@ func parseFlags() config {
 	flag.BoolVar(&c.noOrdinal, "no-ordinal", false, "S-bridge: drop the ordinal from interior _o (emit depth only); severed survivors self-place by (depth, own-fp, parent-fp).")
 	flag.BoolVar(&c.logDee, "log-dee", false, "S-bridge: log DEE pickup/queue events to stderr")
 	flag.IntVar(&c.deeLogBytes, "dee-log-bytes", 10000, "Threshold for --log-dee")
-	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "PCR mode: truncated checkpoint-root span ID length in bytes (1-8)")
+	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "truncated checkpoint-root span ID length in bytes (1-8); PCR/PCRB/CGPRB prefix and the S-bridge window anchor. 8 = full-width.")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "PCRB mode: target bloom false-positive rate (pb/cgpb keep the legacy default)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <input_dir>\n", os.Args[0])
@@ -84,8 +88,12 @@ func parseFlags() config {
 		}
 		c.inputDir = flag.Arg(0)
 	}
-	if c.outputPath == "" {
-		fmt.Fprintln(os.Stderr, "error: -o/--output required")
+	if c.streamMetrics != "" && c.corpusDir == "" {
+		fmt.Fprintln(os.Stderr, "error: --stream-metrics requires corpus mode (--corpus)")
+		os.Exit(2)
+	}
+	if c.outputPath == "" && c.streamMetrics == "" {
+		fmt.Fprintln(os.Stderr, "error: -o/--output required (or use --stream-metrics)")
 		os.Exit(2)
 	}
 	if !c.bagsize {
@@ -133,6 +141,9 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 		if c.fpBits > 0 {
 			h.FPBits = c.fpBits
 		}
+		if c.prefixLen > 0 {
+			h.CkptBytes = c.prefixLen // checkpoint-root anchor width (shared --prefix-len knob)
+		}
 		return h
 	}
 	fmt.Fprintf(os.Stderr, "unknown mode %q\n", c.mode)
@@ -141,6 +152,10 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "csv2json" {
+		runCSV2JSON(os.Args[2:])
+		return
+	}
 	c := parseFlags()
 
 	var metrics []TraceMetrics
@@ -148,6 +163,13 @@ func main() {
 		metrics = runFromCorpus(c)
 	} else {
 		metrics = runFromJSON(c)
+	}
+
+	if c.streamMetrics != "" {
+		// Per-trace records were streamed to the CSV; nothing to dump here.
+		// Post-process with cmd/bagsize_csv2json to get the bagsize JSON.
+		fmt.Fprintf(os.Stderr, "Streamed per-trace metrics to %s\n", c.streamMetrics)
+		return
 	}
 
 	if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth, c.emitOC); err != nil {
@@ -215,18 +237,48 @@ func runFromCorpus(c config) []TraceMetrics {
 		len(meta.TraceOrder), len(meta.Services), time.Since(t0).Round(time.Millisecond))
 
 	t1 := time.Now()
-	h := makeHandler(c,
-		func(id uint16) string {
-			if int(id) < len(meta.Services) {
-				return meta.Services[id]
-			}
-			return ""
-		},
-		// JSON path-style source-file resolution isn't available from corpus
-		// alone; fall back to "<traceIDhex>.json". DEE log uses this only for
-		// human-readable annotation.
-		func(tid uint64) string { return fmt.Sprintf("%016x.json", tid) })
-	metrics := runInterleavedFromCorpus(er, meta, h, c)
+	svcFn := func(id uint16) string {
+		if int(id) < len(meta.Services) {
+			return meta.Services[id]
+		}
+		return ""
+	}
+	// JSON path-style source-file resolution isn't available from corpus alone;
+	// fall back to "<traceIDhex>.json". DEE log uses this only for annotation.
+	srcFn := func(tid uint64) string { return fmt.Sprintf("%016x.json", tid) }
+
+	W := c.workers
+	if W < 1 {
+		W = 1
+	}
+	if W > 1 && c.mode == "sbridge" {
+		fmt.Fprintln(os.Stderr, "warning: --workers > 1 ignored for sbridge (cross-trace DEE state is order-dependent); running single-threaded")
+		W = 1
+	}
+
+	var stream *streamWriter
+	if c.streamMetrics != "" {
+		sw, err := newStreamWriter(c.streamMetrics, c.checkpointDistance, c.emitDepth, c.emitOC)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "open stream-metrics file: %v\n", err)
+			os.Exit(1)
+		}
+		stream = sw
+	}
+
+	var metrics []TraceMetrics
+	if W > 1 {
+		fmt.Fprintf(os.Stderr, "sharded: %d workers (parallel across traces)\n", W)
+		metrics = runShardedFromCorpus(er, meta, func() bridge.Handler { return makeHandler(c, svcFn, srcFn) }, c, W, stream)
+	} else {
+		metrics = runInterleavedFromCorpus(er, meta, makeHandler(c, svcFn, srcFn), c, stream)
+	}
+	if stream != nil {
+		if err := stream.close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close stream-metrics file: %v\n", err)
+			os.Exit(1)
+		}
+	}
 	fmt.Fprintf(os.Stderr, "Simulated in %s\n", time.Since(t1).Round(time.Millisecond))
 	return metrics
 }

@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"bridges/bloom"
 	"bridges/bridge"
 	"bridges/corpus"
 	"bridges/loader"
@@ -116,7 +117,12 @@ func parseFlags() config {
 		fmt.Fprintf(os.Stderr, "       %s --corpus <corpus_dir> [flags]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
+	var primeM, primeMByteCap bool
+	flag.BoolVar(&primeM, "prime-m", false, "size blooms with a prime bit count (fixes small-m double-hash clustering; affects emit + recon together)")
+	flag.BoolVar(&primeMByteCap, "prime-m-bytecap", false, "with --prime-m: keep the prime within the raw size's byte budget")
 	flag.Parse()
+	bloom.PrimeM = primeM // set before any handler/config sizing (emit + recon must match)
+	bloom.PrimeMByteCap = primeMByteCap
 	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" {
 		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, pcrs, or cgprb (got %q)\n", c.mode)
 		os.Exit(2)

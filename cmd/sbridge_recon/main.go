@@ -37,6 +37,7 @@ func main() {
 	dropSeed := flag.Int64("drop-seed", 1, "base seed mixed with each trace id for drop decisions")
 	topoOnly := flag.Bool("topo-only", false, "emit topology only (no EE/DEE); reconstruct + score the call-graph shape, skip the event-structure phase")
 	fpBits := flag.Int("fp-bits", 16, "non-checkpoint fingerprint width in bits (emit + recon must match)")
+	prefixLen := flag.Int("prefix-len", 4, "checkpoint-root window-anchor width in bytes (1-8; emit + recon must match). 8 = full-width.")
 	noOrdinal := flag.Bool("no-ordinal", false, "drop the interior ordinal: emit _o=depth only, place severed survivors by (depth, own-fp, parent-fp)")
 	progress := flag.Int("progress", 0, "print a progress line every N traces (0 = silent)")
 	timing := flag.String("timing", "", "write per-trace topology recon_ns to this CSV and print a TIMING summary (topology + structure phases, µs)")
@@ -53,7 +54,7 @@ func main() {
 	var sumParents, sumEndOK int                          // per-parent end-order recovery (accepted traces only)
 	t0 := time.Now()
 	process := func(i int, tr corpus.StoredTrace) {
-		payloads, truth, spans, dees := emitTrace(tr, *cpd, *topoOnly, *fpBits, *noOrdinal)
+		payloads, truth, spans, dees := emitTrace(tr, *cpd, *topoOnly, *fpBits, *noOrdinal, *prefixLen)
 		dropped := dropSet(tr, *dropRate, *dropSeed, *cpd)
 
 		inputs := make([]recon.SBInput, 0, len(payloads))
@@ -77,7 +78,7 @@ func main() {
 		sumSurv += len(survivors)
 
 		tRec := time.Now()
-		res := recon.ReconstructSBridge(inputs, survivors, recon.Config{CPD: *cpd, FPBits: *fpBits, NoOrdinal: *noOrdinal})
+		res := recon.ReconstructSBridge(inputs, survivors, recon.Config{CPD: *cpd, FPBits: *fpBits, NoOrdinal: *noOrdinal, PrefixLen: *prefixLen})
 		if *timing != "" {
 			topoNanos = append(topoNanos, time.Since(tRec).Nanoseconds())
 		}
@@ -251,7 +252,7 @@ type spanInfo struct {
 // order, capturing each emitting span's serialized _br payload, the ground-truth
 // tree (children indexed by 1-based start ordinal — the same ordinal the handler
 // assigns), and per-span (parent, ordinal, depth) for orphan matching.
-func emitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool) (map[uint64][]byte, recon.SBTruth, []spanInfo, [][]byte) {
+func emitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool, ckptBytes int) (map[uint64][]byte, recon.SBTruth, []spanInfo, [][]byte) {
 	h := bridge.NewSBridgeHandler(cpd, nil)
 	// Interior spans export _o = varint(ordinal)||varint(depth); charge it so the
 	// cost accounting matches a real sbridge deployment. (Reconstruction itself
@@ -261,6 +262,9 @@ func emitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdi
 	h.OmitOrdinal = noOrdinal
 	if fpBits > 0 {
 		h.FPBits = fpBits
+	}
+	if ckptBytes > 0 {
+		h.CkptBytes = ckptBytes
 	}
 	payloads := map[uint64][]byte{}
 	h.EmitSink = func(_ /*tid*/, sid uint64, payload []byte) {

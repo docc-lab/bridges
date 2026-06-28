@@ -85,8 +85,8 @@ const (
 type DEECandidate struct {
 	ID        uint64
 	Survived  bool
-	RealID    uint64 // top4 used for the match when Survived
-	FP        uint32 // recovered fp (top fpBits of the span id) when lost
+	RealID    uint64 // top-fpBits used for the match when Survived
+	FP        uint64 // recovered fp (top fpBits of the span id, right-aligned) when lost
 	Depth     int
 	ChildOrds map[int]bool
 	EE        map[int]bool // ends already witnessed (a child cannot also be a DEE leftover)
@@ -97,7 +97,7 @@ type DEECandidate struct {
 // the owner fingerprint at that depth; then content-pruning rejects any whose
 // existing EE can't coexist with the DEE (a seq already witnessed, or a seq that
 // isn't one of the candidate's children). >=2 survivors -> ambiguous (wrong).
-func AttributeDEE(ownerFP uint32, depth int, seqs []int, cands []DEECandidate, fpBits int) (idx int, st DEEStatus) {
+func AttributeDEE(ownerFP uint64, depth int, seqs []int, cands []DEECandidate, fpBits int) (idx int, st DEEStatus) {
 	if fpBits <= 0 {
 		fpBits = 16
 	}
@@ -108,10 +108,10 @@ func AttributeDEE(ownerFP uint32, depth int, seqs []int, cands []DEECandidate, f
 			continue
 		}
 		if c.Survived {
-			if uint32(c.RealID>>32) != ownerFP {
+			if c.RealID>>uint(64-fpBits) != ownerFP { // top-fpBits of the real id vs owner fp
 				continue
 			}
-		} else if c.FP != ownerFP>>uint(32-fpBits) { // recovered fpBits-wide fp vs top-fpBits of owner fp
+		} else if c.FP != ownerFP { // recovered fp vs owner fp (both top-fpBits, right-aligned)
 			continue
 		}
 		ok := true

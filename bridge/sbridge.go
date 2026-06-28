@@ -92,8 +92,14 @@ type SBridgeHandler struct {
 	// chain (the top FPBits of the parent span id), bit-packed in the _br fp
 	// section. Default 16 (the legacy 2-byte fp). Narrower = smaller payload but
 	// more recovered-fp collisions (higher reject rate); wider = the reverse. The
-	// 4-byte ckpt4 checkpoint anchor is unaffected.
+	// checkpoint-root anchor (CkptBytes) is independent.
 	FPBits int
+
+	// CkptBytes is the truncated checkpoint-root span ID width (1-8 bytes) used
+	// as each window's anchor — the S-Bridge analogue of PCR/CGPRB's prefix-len.
+	// Default 4 (the legacy 4-byte anchor). 8 = the full span ID (collision-free
+	// window stitching); narrower trades payload for ckpt-anchor collision risk.
+	CkptBytes int
 
 	// TopoOnly drops the Phase-2 (event-ordering) machinery from emission: no
 	// per-level EE sublists in the chain and no DEE batches. Topology (ckpt4,
@@ -128,20 +134,13 @@ type SBridgeHandler struct {
 
 type sbState struct {
 	depth    int
-	ckpt4    [4]byte   // window anchor: 4-byte truncated checkpoint-root span ID
+	ckpt     [8]byte   // window anchor: full checkpoint-root span ID (truncated to CkptBytes on the wire)
 	chain    []bcEntry // breadcrumb: per-level (ordinal, parent fingerprint, EE sub-list) since the last checkpoint
 	deeBytes []byte
 
 	packedLen   int // cached len of pack_sbridge_br applied to the fields above
 	emitted     bool
 	hasChildren bool
-}
-
-// fpBytes returns the first n bytes of the big-endian span ID — a truncated
-// fingerprint, used for the 4-byte checkpoint-root window anchor.
-func fpBytes(id uint64, n int) []byte {
-	b := BigEndian8(id)
-	return append([]byte(nil), b[:n]...)
 }
 
 func NewSBridgeHandler(checkpointDistance int, deeLogger *DeeSizeLogger) *SBridgeHandler {
@@ -151,6 +150,7 @@ func NewSBridgeHandler(checkpointDistance int, deeLogger *DeeSizeLogger) *SBridg
 	return &SBridgeHandler{
 		cpd:              uint32(checkpointDistance),
 		FPBits:           16, // legacy 2-byte non-checkpoint fp; override to sweep
+		CkptBytes:        4,  // legacy 4-byte checkpoint-root anchor; override to sweep
 		deeLogger:        deeLogger,
 		state:            make(map[stateKey]*sbState),
 		parentEventCount: make(map[stateKey]int),
@@ -216,7 +216,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	// Initial values pulled from parent's state (or zeroed for root).
 	var (
 		depth               int
-		ckpt4               [4]byte
+		ckpt                [8]byte
 		chain               []bcEntry
 		parentDEEFromParent []byte
 	)
@@ -226,7 +226,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		var parentChain []bcEntry
 		if parentState != nil {
 			parentDepth = parentState.depth
-			ckpt4 = parentState.ckpt4
+			ckpt = parentState.ckpt
 			parentChain = parentState.chain
 			parentDEEFromParent = parentState.deeBytes
 		}
@@ -248,7 +248,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		copy(chain, parentChain)
 		e := bcEntry{ord: seqStart}
 		if parentDepth%int(h.cpd) != 0 { // parent is not a checkpoint
-			e.fp = uint32(pid >> uint(64-h.FPBits)) // top FPBits of the parent id
+			e.fp = pid >> uint(64-h.FPBits) // top FPBits of the parent id, right-aligned
 			e.hasFp = true
 		}
 		if !h.TopoOnly { // EE is Phase-2 only
@@ -275,18 +275,18 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	if isCheckpoint {
 		// Only the payload SIZE matters for the bag-size study, so compute it
 		// without serializing (no per-span allocation).
-		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSize(depth, chain, deeBytes, h.FPBits)
+		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSize(depth, chain, deeBytes, h.FPBits, h.CkptBytes)
 		if h.EmitSink != nil {
 			// Pack BEFORE the reset: a checkpoint's own payload describes its
 			// position within its PARENT window (pre-reset anchor + chain).
-			h.EmitSink(tid, sid, PackSBridgeBR(depth, ckpt4, chain, deeBytes, h.FPBits))
+			h.EmitSink(tid, sid, PackSBridgeBR(depth, ckpt, h.CkptBytes, chain, deeBytes, h.FPBits))
 		}
 
 		// Reset state for the post-checkpoint snapshot: this span becomes the
-		// new 4-byte window anchor; the breadcrumb chain restarts empty (which
-		// also drops the per-level EE, since EE now rides on chain entries).
-		ckpt4 = [4]byte{}
-		copy(ckpt4[:], fpBytes(sid, 4))
+		// new window anchor (its full span ID, truncated to CkptBytes on the
+		// wire); the breadcrumb chain restarts empty (which also drops the
+		// per-level EE, since EE now rides on chain entries).
+		ckpt = BigEndian8(sid)
 		chain = nil
 		deeBytes = nil
 
@@ -295,7 +295,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		h.parentEEAcc[stateKey{tid, sid}] = nil
 	}
 
-	packedLen := sbridgeBRSize(depth, chain, deeBytes, h.FPBits)
+	packedLen := sbridgeBRSize(depth, chain, deeBytes, h.FPBits, h.CkptBytes)
 
 	var baggageBytes int
 	if baggageFound {
@@ -304,7 +304,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 
 	h.state[stateKey{tid, sid}] = &sbState{
 		depth:     depth,
-		ckpt4:     ckpt4,
+		ckpt:      ckpt,
 		chain:     chain,
 		deeBytes:  deeBytes,
 		packedLen: packedLen,
@@ -344,7 +344,7 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 		if len(rem) > 0 {
 			kept := rem[:len(rem)-1]
 			if len(kept) > 0 {
-				quad := EncodeDEEQuad(TraceID16(tid), ps.depth, uint32(sid>>32), kept)
+				quad := EncodeDEEQuad(TraceID16(tid), ps.depth, sid>>uint(64-h.FPBits), h.FPBits, kept)
 				h.enqueueDEE(ev.ServiceID, quad, tid)
 				if h.DEESink != nil {
 					h.DEESink(tid, quad)
@@ -362,7 +362,7 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + ps.packedLen
 		ps.emitted = true
 		if h.EmitSink != nil {
-			h.EmitSink(tid, sid, PackSBridgeBR(ps.depth, ps.ckpt4, ps.chain, ps.deeBytes, h.FPBits))
+			h.EmitSink(tid, sid, PackSBridgeBR(ps.depth, ps.ckpt, h.CkptBytes, ps.chain, ps.deeBytes, h.FPBits))
 		}
 	} else if !ps.emitted && h.EmitOC {
 		// Interior span (not a checkpoint, not a leaf): exports

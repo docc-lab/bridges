@@ -16,24 +16,27 @@ import (
 type SBChainLevel struct {
 	Depth int    // absolute depth of this level's span
 	Ord   int    // start ordinal of this span under its parent
-	FP    uint32 // parent fingerprint (top fpBits of the parent span ID)
-	HasFP bool   // false when the parent is the checkpoint root (its identity is Ckpt4)
+	FP    uint64 // parent fingerprint (top fpBits of the parent span ID, right-aligned)
+	HasFP bool   // false when the parent is the checkpoint root (its identity is Ckpt)
 	EE    []int  // start ordinals of earlier siblings that ended before this span started
 }
 
-// SBridgeBR is a fully decoded S-Bridge _br payload.
+// SBridgeBR is a fully decoded S-Bridge _br payload. Ckpt holds the
+// checkpoint-root window anchor, left-aligned in an [8]byte (only the leading
+// CkptBytes are meaningful; the rest are zero).
 type SBridgeBR struct {
 	Depth int
-	Ckpt4 [4]byte
+	Ckpt  [8]byte
 	Chain []SBChainLevel
 	DEE   []DEEQuad // the trailing dee_bytes, parsed into quads
 }
 
-// DEEQuad is one decoded delayed-end-event quadruple.
+// DEEQuad is one decoded delayed-end-event quadruple. OwnerFP is the owner's
+// top-fpBits fingerprint, right-aligned (same encoding as a chain fp).
 type DEEQuad struct {
 	TraceID16 [16]byte
 	Depth     int
-	OwnerFP   uint32
+	OwnerFP   uint64
 	Seqs      []int
 }
 
@@ -73,13 +76,16 @@ func (c *cursor) take(n int) []byte {
 func (c *cursor) done() bool { return c.err == nil && c.i >= len(c.b) }
 
 // DecodeSBridgeBR parses an _br payload produced by PackSBridgeBR (structure of
-// arrays). cpd is the checkpoint distance and fpBits the non-checkpoint
-// fingerprint width the payload was emitted with — both are needed because
-// per-level depth and fp presence are derived (not stored), and the fps are
-// bit-packed at fpBits.
-func DecodeSBridgeBR(b []byte, cpd, fpBits int) (SBridgeBR, error) {
+// arrays). cpd is the checkpoint distance, fpBits the non-checkpoint fingerprint
+// width, and ckptBytes the checkpoint-root anchor width the payload was emitted
+// with — all needed because per-level depth and fp presence are derived (not
+// stored), the fps are bit-packed at fpBits, and the anchor occupies ckptBytes.
+func DecodeSBridgeBR(b []byte, cpd, fpBits, ckptBytes int) (SBridgeBR, error) {
 	if cpd < 1 {
 		return SBridgeBR{}, errors.New("cpd must be >= 1")
+	}
+	if ckptBytes < 1 || ckptBytes > 8 {
+		return SBridgeBR{}, errors.New("ckptBytes must be in 1..8")
 	}
 	c := &cursor{b: b}
 	var br SBridgeBR
@@ -100,8 +106,8 @@ func DecodeSBridgeBR(b []byte, cpd, fpBits int) (SBridgeBR, error) {
 			nFP++
 		}
 	}
-	// FPS — ckpt4 leads, then nFP bit-packed fpBits-wide fingerprints.
-	copy(br.Ckpt4[:], c.take(4))
+	// FPS — the ckpt anchor leads, then nFP bit-packed fpBits-wide fingerprints.
+	copy(br.Ckpt[:], c.take(ckptBytes))
 	fpBytes := c.take((nFP*fpBits + 7) / 8)
 	if c.err != nil {
 		return br, c.err
@@ -128,8 +134,10 @@ func DecodeSBridgeBR(b []byte, cpd, fpBits int) (SBridgeBR, error) {
 		}
 	}
 	// Whatever remains is the dee_bytes blob: a sequence of self-delimiting quads.
+	// Each carries the owner fp in ceil(fpBits/8) bytes (matching the emit width).
+	ownerBytes := (fpBits + 7) / 8
 	for !c.done() {
-		q, err := decodeDEEQuadAt(c)
+		q, err := decodeDEEQuadAt(c, ownerBytes)
 		if err != nil {
 			return br, err
 		}
@@ -139,11 +147,16 @@ func DecodeSBridgeBR(b []byte, cpd, fpBits int) (SBridgeBR, error) {
 }
 
 // DecodeDEEQuads parses a concatenation of DEE quadruples (e.g. a drained queue).
-func DecodeDEEQuads(b []byte) ([]DEEQuad, error) {
+// fpBits is the fingerprint width the quads were emitted with (sets owner width).
+func DecodeDEEQuads(b []byte, fpBits int) ([]DEEQuad, error) {
+	ownerBytes := (fpBits + 7) / 8
+	if ownerBytes < 1 {
+		ownerBytes = 1
+	}
 	c := &cursor{b: b}
 	var out []DEEQuad
 	for !c.done() {
-		q, err := decodeDEEQuadAt(c)
+		q, err := decodeDEEQuadAt(c, ownerBytes)
 		if err != nil {
 			return out, err
 		}
@@ -152,13 +165,17 @@ func DecodeDEEQuads(b []byte) ([]DEEQuad, error) {
 	return out, c.err
 }
 
-func decodeDEEQuadAt(c *cursor) (DEEQuad, error) {
+func decodeDEEQuadAt(c *cursor, ownerBytes int) (DEEQuad, error) {
 	var q DEEQuad
 	copy(q.TraceID16[:], c.take(16))
 	q.Depth = c.uvarint()
-	fp := c.take(4)
+	fp := c.take(ownerBytes)
 	if c.err == nil {
-		q.OwnerFP = binary.BigEndian.Uint32(fp)
+		var v uint64
+		for _, b := range fp { // big-endian, right-aligned
+			v = v<<8 | uint64(b)
+		}
+		q.OwnerFP = v
 	}
 	n := c.uvarint()
 	if n > 0 {

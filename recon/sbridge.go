@@ -38,8 +38,9 @@ type SBInput struct {
 type SBNode struct {
 	Ord      int    // start ordinal under its parent (0 for the window root)
 	RealID   uint64 // known span id if an emitting span landed here, else 0
-	FP       uint32 // recovered fingerprint
-	FPBits   int    // 32 = window-root ckpt4; else = interior fp width (e.g. 16); 0 = none (bare leaf)
+	FP       uint64 // recovered fingerprint, right-aligned to its top FPBits of the span id
+	FPBits   int    // width in bits of FP: window root = ckpt-anchor bits (CkptBytes*8), interior fp width (e.g. 16), or 0 = none (bare leaf)
+	IsRoot   bool   // this node is a window anchor (its FP is the checkpoint-root prefix, never overwritten by an interior fp)
 	EE       []int  // this node's witnessed end-block (earlier-sibling ends before it started)
 	Children map[int]*SBNode
 }
@@ -85,44 +86,55 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 	if fpBits <= 0 {
 		fpBits = 16 // legacy 2-byte fp
 	}
+	ckptBytes := cfg.PrefixLen
+	if ckptBytes <= 0 {
+		ckptBytes = 4 // legacy 4-byte checkpoint-root anchor
+	}
+	ckptBits := ckptBytes * 8
 	type decoded struct {
 		id uint64
 		br bridge.SBridgeBR
 	}
 	ds := make([]decoded, 0, len(inputs))
 	for _, in := range inputs {
-		br, err := bridge.DecodeSBridgeBR(in.Payload, cfg.CPD, fpBits)
+		br, err := bridge.DecodeSBridgeBR(in.Payload, cfg.CPD, fpBits, ckptBytes)
 		if err != nil {
 			return unsolvable("decode span %016x: %v", in.SpanID, err)
 		}
 		ds = append(ds, decoded{id: in.SpanID, br: br})
 	}
 
-	// Ambiguous ckpt4: two DISTINCT checkpoints whose ids share a 4-byte
+	// ckptKey is a span id truncated to the checkpoint-root anchor width (top
+	// ckptBits), the value used to key windows. ckptKeyOf reads the same value
+	// back from a decoded anchor (left-aligned in an [8]byte).
+	ckptKey := func(id uint64) uint64 { return id >> uint(64-ckptBits) }
+	ckptKeyOf := func(c [8]byte) uint64 { return binary.BigEndian.Uint64(c[:]) >> uint(64-ckptBits) }
+
+	// Ambiguous anchor: two DISTINCT checkpoints whose ids share a ckptBytes-byte
 	// truncation can't be told apart as window anchors -> the trace is
-	// unsolvable (practically never happens, but guard it rather than misbuild).
-	ckptByTop4 := map[uint32]uint64{}
+	// unsolvable (vanishes at full width; guard it rather than misbuild).
+	ckptByTop := map[uint64]uint64{}
 	for _, d := range ds {
 		if d.br.Depth%cfg.CPD == 0 {
-			t4 := uint32(d.id >> 32)
-			if prev, ok := ckptByTop4[t4]; ok && prev != d.id {
-				return unsolvable("ambiguous ckpt4 %08x: checkpoints %016x and %016x", t4, prev, d.id)
+			t := ckptKey(d.id)
+			if prev, ok := ckptByTop[t]; ok && prev != d.id {
+				return unsolvable("ambiguous ckpt anchor %0*x: checkpoints %016x and %016x", ckptBytes*2, t, prev, d.id)
 			}
-			ckptByTop4[t4] = d.id
+			ckptByTop[t] = d.id
 		}
 	}
 
-	// One node per window anchor (its 4-byte ckpt4 identity). A checkpoint span
-	// is BOTH a terminal in its parent window's chains and the root of its own
-	// window, so its parent-window placement reuses the very same node object
-	// (getWindow by top4(id)) — that unification IS the stitch.
-	windowRoot := map[uint32]*SBNode{}
-	getWindow := func(x uint32) *SBNode {
+	// One node per window anchor (its ckptBytes-byte truncated identity). A
+	// checkpoint span is BOTH a terminal in its parent window's chains and the
+	// root of its own window, so its parent-window placement reuses the very same
+	// node object (getWindow by ckptKey(id)) — that unification IS the stitch.
+	windowRoot := map[uint64]*SBNode{}
+	getWindow := func(x uint64) *SBNode {
 		if n, ok := windowRoot[x]; ok {
 			return n
 		}
 		n := newSBNode(0)
-		n.FP, n.FPBits = x, 32
+		n.FP, n.FPBits, n.IsRoot = x, ckptBits, true
 		windowRoot[x] = n
 		return n
 	}
@@ -132,7 +144,7 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 		isCkpt := d.br.Depth%cfg.CPD == 0
 		if isCkpt && d.br.Depth == 0 {
 			// Trace root: its own window anchor, no parent window to place into.
-			n := getWindow(uint32(d.id >> 32))
+			n := getWindow(ckptKey(d.id))
 			if n.RealID != 0 && n.RealID != d.id {
 				return unsolvable("root collision: %016x vs %016x", n.RealID, d.id)
 			}
@@ -140,12 +152,12 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 			root = n
 			continue
 		}
-		// Place this span in its window (its payload ckpt4) by walking the chain.
-		cur := getWindow(binary.BigEndian.Uint32(d.br.Ckpt4[:]))
+		// Place this span in its window (its payload anchor) by walking the chain.
+		cur := getWindow(ckptKeyOf(d.br.Ckpt))
 		for j, lv := range d.br.Chain {
 			// lv.FP is cur's (the parent's) fingerprint when present; never
-			// overwrite a window root's 4-byte ckpt4 (FPBits 32).
-			if lv.HasFP && cur.FPBits != 32 {
+			// overwrite a window root's anchor prefix.
+			if lv.HasFP && !cur.IsRoot {
 				if cur.FPBits == fpBits && cur.FP != lv.FP {
 					return unsolvable("span %016x: conflicting fp (%x vs %x)", d.id, cur.FP, lv.FP)
 				}
@@ -154,7 +166,7 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 			var child *SBNode
 			if j == len(d.br.Chain)-1 && isCkpt {
 				// Terminal checkpoint: its node IS the root of its own window.
-				child = getWindow(uint32(d.id >> 32))
+				child = getWindow(ckptKey(d.id))
 			}
 			if existing, ok := cur.Children[lv.Ord]; ok {
 				if child != nil && existing != child {
@@ -246,14 +258,17 @@ func (res *SBResult) identifyByEdges(survivors []SBSurvivor, labeled map[uint64]
 }
 
 // nodeFP returns a skeleton node's fingerprint truncated to w bits: an interior
-// fp (already w bits) directly, or the top w bits of a 4-byte window anchor
-// (ckpt4). Used to build the severed-placement key at a uniform width.
-func nodeFP(n *SBNode, w int) (uint32, bool) {
+// fp (already w bits) directly, or the top w bits of a window anchor. Used to
+// build the severed-placement key at a uniform width.
+func nodeFP(n *SBNode, w int) (uint64, bool) {
 	switch {
 	case n.FPBits == 0:
 		return 0, false
-	case n.FPBits == 32: // ckpt4: take top w bits
-		return n.FP >> uint(32-w), true
+	case n.IsRoot: // window anchor (ckptBits wide): project to the top w bits
+		if n.FPBits >= w {
+			return n.FP >> uint(n.FPBits-w), true
+		}
+		return n.FP, true // anchor narrower than w: best effort (degenerate config)
 	default: // interior fp, stored at w bits
 		return n.FP, true
 	}
@@ -280,11 +295,11 @@ func (res *SBResult) placeSevered(survivors []SBSurvivor, labeled map[uint64]boo
 	}
 	type key struct {
 		depth, ord int
-		fp, pfp    uint32
+		fp, pfp    uint64
 	}
 	idx := map[key][]*SBNode{}
-	var walk func(n *SBNode, depth int, pfp uint32, pfpOK bool)
-	walk = func(n *SBNode, depth int, pfp uint32, pfpOK bool) {
+	var walk func(n *SBNode, depth int, pfp uint64, pfpOK bool)
+	walk = func(n *SBNode, depth int, pfp uint64, pfpOK bool) {
 		nfp, nfpOK := nodeFP(n, w)
 		if n.RealID == 0 && nfpOK && pfpOK {
 			k := key{depth, ordOf(n.Ord), nfp, pfp}
@@ -296,7 +311,7 @@ func (res *SBResult) placeSevered(survivors []SBSurvivor, labeled map[uint64]boo
 	}
 	walk(res.Root, 0, 0, false)
 
-	topW := func(id uint64) uint32 { return uint32(id >> uint(64-w)) }
+	topW := func(id uint64) uint64 { return id >> uint(64-w) }
 	for _, s := range survivors {
 		if labeled[s.SpanID] {
 			continue // attached by edge
@@ -377,15 +392,8 @@ func ScoreSBridgeUnderDrop(res SBResult, truth SBTruth) SBVerdict {
 // rejects wrong edges and fp/id mismatches but tolerates truth children that
 // were dropped and so weren't reconstructed.
 func sbWalkPartial(node *SBNode, realID uint64, truth SBTruth) (bool, string) {
-	switch {
-	case node.FPBits == 0:
-		// bare leaf: no fp to check
-	case node.FPBits == 32:
-		if node.FP != uint32(realID>>32) {
-			return false, fmt.Sprintf("node %016x ckpt4 %08x != %08x", realID, node.FP, uint32(realID>>32))
-		}
-	default: // interior fp at node.FPBits width
-		if want := uint32(realID >> uint(64-node.FPBits)); node.FP != want {
+	if node.FPBits > 0 { // window anchor (ckptBits) or interior fp — both right-aligned at FPBits
+		if want := realID >> uint(64-node.FPBits); node.FP != want {
 			return false, fmt.Sprintf("node %016x fp %x != %x (%db)", realID, node.FP, want, node.FPBits)
 		}
 	}
@@ -426,15 +434,8 @@ func (r SBResult) CountReal() int {
 }
 
 func sbWalk(node *SBNode, realID uint64, truth SBTruth) (bool, string) {
-	switch {
-	case node.FPBits == 0:
-		// bare leaf: no fp to check
-	case node.FPBits == 32:
-		if node.FP != uint32(realID>>32) {
-			return false, fmt.Sprintf("node %016x ckpt4 %08x != %08x", realID, node.FP, uint32(realID>>32))
-		}
-	default: // interior fp at node.FPBits width
-		if want := uint32(realID >> uint(64-node.FPBits)); node.FP != want {
+	if node.FPBits > 0 { // window anchor (ckptBits) or interior fp — both right-aligned at FPBits
+		if want := realID >> uint(64-node.FPBits); node.FP != want {
 			return false, fmt.Sprintf("node %016x fp %x != %x (%db)", realID, node.FP, want, node.FPBits)
 		}
 	}

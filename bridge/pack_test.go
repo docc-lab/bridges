@@ -145,8 +145,8 @@ func TestTraceIDHexTo16Bytes(t *testing.T) {
 }
 
 func TestPackSBridgeBR(t *testing.T) {
-	ckpt := [4]byte{0x11, 0x22, 0x33, 0x44} // 4-byte window anchor (truncated root)
-	zeros4 := [4]byte{}
+	ckpt := [8]byte{0x11, 0x22, 0x33, 0x44} // span ID; only the leading ckptBytes (4) go on the wire
+	zeros4 := [8]byte{}
 
 	// A 3-level breadcrumb chain for a span at depth 5 (levels at depths 3,4,5).
 	// The first level's parent is the checkpoint (no 2-byte fp); the deeper
@@ -157,7 +157,7 @@ func TestPackSBridgeBR(t *testing.T) {
 		{ord: 7, fp: 0xabcd, hasFp: true},
 		{ord: 2, fp: 0xdef0, hasFp: true, ee: []int{4, 5}},
 	}
-	got1 := hex.EncodeToString(PackSBridgeBR(5, ckpt, chain, []byte{0xaa, 0xbb, 0xcc}, 16))
+	got1 := hex.EncodeToString(PackSBridgeBR(5, ckpt, 4, chain, []byte{0xaa, 0xbb, 0xcc}, 16))
 	// SoA: 05(depth) 03(L) | ords[0a 07 02] | ckpt4[11223344] fps[abcd def0] |
 	//      EE[00 00 02 0405] | dee[aabbcc]
 	want1 := "05030a070211223344abcddef00000020405aabbcc"
@@ -165,7 +165,7 @@ func TestPackSBridgeBR(t *testing.T) {
 		t.Errorf("p1: got %s, want %s", got1, want1)
 	}
 
-	got2 := hex.EncodeToString(PackSBridgeBR(0, zeros4, nil, nil, 16))
+	got2 := hex.EncodeToString(PackSBridgeBR(0, zeros4, 4, nil, nil, 16))
 	// 00(depth) 00(L) 00000000(ckpt4)
 	want2 := "000000000000"
 	if got2 != want2 {
@@ -183,8 +183,8 @@ func TestPackSBridgeBR(t *testing.T) {
 		{3, []bcEntry{{ord: 1, ee: []int{1, 2, 3}}, {ord: 99, fp: 0x1234, hasFp: true}}, nil},
 	}
 	for i, c := range cases {
-		gotSize := sbridgeBRSize(c.depth, c.chain, c.dee, 16)
-		wantSize := len(PackSBridgeBR(c.depth, ckpt, c.chain, c.dee, 16))
+		gotSize := sbridgeBRSize(c.depth, c.chain, c.dee, 16, 4)
+		wantSize := len(PackSBridgeBR(c.depth, ckpt, 4, c.chain, c.dee, 16))
 		if gotSize != wantSize {
 			t.Errorf("case %d: sbridgeBRSize=%d != len(pack)=%d", i, gotSize, wantSize)
 		}
@@ -206,7 +206,7 @@ func TestEncodeDEEQuad(t *testing.T) {
 	}
 	for _, c := range cases {
 		tid := TraceIDHexTo16Bytes(c.traceHex)
-		got := hex.EncodeToString(EncodeDEEQuad(tid, c.depth, c.ownerFP, c.seqs))
+		got := hex.EncodeToString(EncodeDEEQuad(tid, c.depth, uint64(c.ownerFP), 32, c.seqs)) // fpBits=32 => 4-byte owner
 		if got != c.want {
 			t.Errorf("EncodeDEEQuad(%s,%d,%#x,%v) = %s, want %s", c.traceHex, c.depth, c.ownerFP, c.seqs, got, c.want)
 		}

@@ -85,7 +85,7 @@ func ScoreStructure(res SBResult, truth SBTruth, endPos map[uint64]int64, deeQua
 			cand := DEECandidate{ID: trueID, Survived: n.RealID != 0, RealID: n.RealID,
 				Depth: depth, ChildOrds: childOrds, EE: witnessed}
 			if !cand.Survived {
-				cand.FP = n.FP // recovered fpBits-wide fp for a dropped parent
+				cand.FP, _ = nodeFP(n, res.FPBits) // recovered fpBits-wide fp for a dropped parent
 			}
 			cands = append(cands, cand)
 		}
@@ -97,7 +97,7 @@ func ScoreStructure(res SBResult, truth SBTruth, endPos map[uint64]int64, deeQua
 	deeByParent := map[uint64][]int{}
 	ambiguous := false
 	for _, q := range deeQuads {
-		quads, err := bridge.DecodeDEEQuads(q)
+		quads, err := bridge.DecodeDEEQuads(q, res.FPBits)
 		if err != nil {
 			continue
 		}

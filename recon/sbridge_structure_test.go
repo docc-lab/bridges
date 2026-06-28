@@ -84,7 +84,7 @@ func driveSBridgeCapture(t *testing.T, traceID uint64, spans []tspan, cpd int) (
 // TestAttributeDEE: two lost parents with COLLIDING 2-byte fps at the same
 // depth. Fingerprint alone can't tell them apart, but the DEE contents can.
 func TestAttributeDEE(t *testing.T) {
-	const ownerFP = uint32(0xabcd1234) // top2 = 0xabcd
+	const ownerFP = uint64(0xabcd) // owner fp at fpBits=16: top-2-bytes, right-aligned
 	p := DEECandidate{ID: 1, FP: 0xabcd, Depth: 3,
 		ChildOrds: map[int]bool{1: true, 2: true, 3: true}, EE: map[int]bool{1: true}}
 	q := DEECandidate{ID: 2, FP: 0xabcd, Depth: 3, // same fp, same depth (collision)
@@ -134,7 +134,7 @@ func TestGatherEndOrder(t *testing.T) {
 	// gather root's children (depth-1 chain levels) + their EE blocks
 	var children []SBChild
 	for _, p := range payloads {
-		br, err := bridge.DecodeSBridgeBR(p, cpd, 16)
+		br, err := bridge.DecodeSBridgeBR(p, cpd, 16, 4)
 		if err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -149,12 +149,12 @@ func TestGatherEndOrder(t *testing.T) {
 	// root's DEE from the side-store (owner-fp = top4(root), depth 0)
 	var dee []int
 	for _, q := range dees {
-		qs, err := bridge.DecodeDEEQuads(q)
+		qs, err := bridge.DecodeDEEQuads(q, 16) // capture uses the default fpBits=16
 		if err != nil {
 			t.Fatalf("decode dee: %v", err)
 		}
 		for _, dq := range qs {
-			if dq.OwnerFP == uint32(root>>32) && dq.Depth == 0 {
+			if dq.OwnerFP == root>>uint(64-16) && dq.Depth == 0 { // top-fpBits of the root, right-aligned
 				dee = append(dee, dq.Seqs...)
 			}
 		}

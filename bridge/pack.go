@@ -175,7 +175,7 @@ func TraceIDHexTo16Bytes(s string) [16]byte {
 // hundreds of millions of spans in a corpus.
 type bcEntry struct {
 	ord   int
-	fp    uint32 // top FPBits of the propagating parent's span ID (non-checkpoint fp)
+	fp    uint64 // top FPBits of the propagating parent's span ID (non-checkpoint fp), right-aligned
 	hasFp bool
 	// ee is this level's delayed-end-event sub-list: the start ordinals of the
 	// spans that ENDED in the gap just before this level's span started (i.e. its
@@ -206,13 +206,14 @@ func countFPs(chain []bcEntry) int {
 // sbridgeBRSize returns the serialized size of an S-Bridge _br payload WITHOUT
 // allocating it — used in the per-span hot path (only the byte count matters
 // for the bag-size study). It matches PackSBridgeBR byte-for-byte in length.
-// fpBits is the bit width of each non-checkpoint parent fingerprint.
-func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte, fpBits int) int {
+// fpBits is the bit width of each non-checkpoint parent fingerprint; ckptBytes
+// is the truncated checkpoint-root anchor width (1-8 bytes).
+func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte, fpBits, ckptBytes int) int {
 	size := VarintLen(depth) + VarintLen(len(chain))
 	for i := range chain { // ordinals section
 		size += VarintLen(maxInt(chain[i].ord, 0))
 	}
-	size += 4                                   // ckpt4 leads the fp section
+	size += ckptBytes                           // ckpt anchor leads the fp section
 	size += (countFPs(chain)*fpBits + 7) / 8    // bit-packed non-checkpoint fps
 	for i := range chain {                      // end-events section
 		size += VarintLen(len(chain[i].ee))
@@ -230,29 +231,30 @@ func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte, fpBits int) int 
 //
 //	varint(depth) ‖ varint(L)
 //	  ORDINALS:    L × varint(ord)
-//	  FPS:         ckpt4(4 bytes) ‖ packed (k × fpBits) non-checkpoint fps
+//	  FPS:         ckpt(ckptBytes) ‖ packed (k × fpBits) non-checkpoint fps
 //	  END-EVENTS:  L × ( varint(n) ‖ n × varint(seq) )
 //	  dee_bytes
 //
 // Per-level depth and the legacy count field are dropped — depth is derivable
 // from (depth, L, position) and fp presence from depth%cpd, so the decoder
 // recomputes both. fpBits is the width of each non-checkpoint parent fingerprint
-// (the 4-byte ckpt4 checkpoint fp is unaffected).
+// and ckptBytes the checkpoint-root anchor width (the two are independent).
 func PackSBridgeBR(
 	depth int,
-	ckpt4 [4]byte,
+	ckpt [8]byte,
+	ckptBytes int,
 	chain []bcEntry,
 	deeBytes []byte,
 	fpBits int,
 ) []byte {
-	out := make([]byte, 0, sbridgeBRSize(depth, chain, deeBytes, fpBits))
+	out := make([]byte, 0, sbridgeBRSize(depth, chain, deeBytes, fpBits, ckptBytes))
 	out = binary.AppendUvarint(out, uint64(maxInt(depth, 0)))
 	out = binary.AppendUvarint(out, uint64(len(chain)))
 	for i := range chain { // ORDINALS
 		out = binary.AppendUvarint(out, uint64(maxInt(chain[i].ord, 0)))
 	}
-	out = append(out, ckpt4[:]...) // FPS: ckpt4 first, then packed fps
-	fps := make([]uint32, 0, len(chain))
+	out = append(out, ckpt[:ckptBytes]...) // FPS: ckpt anchor first, then packed fps
+	fps := make([]uint64, 0, len(chain))
 	for i := range chain {
 		if chain[i].hasFp {
 			fps = append(fps, chain[i].fp)
@@ -269,9 +271,9 @@ func PackSBridgeBR(
 	return out
 }
 
-// appendPackedBits packs each value's low w bits, MSB-first, into a contiguous
-// bit stream appended to out (ceil(len(vals)*w/8) bytes).
-func appendPackedBits(out []byte, vals []uint32, w int) []byte {
+// appendPackedBits packs each value's low w bits (w up to 64), MSB-first, into a
+// contiguous bit stream appended to out (ceil(len(vals)*w/8) bytes).
+func appendPackedBits(out []byte, vals []uint64, w int) []byte {
 	if w <= 0 || len(vals) == 0 {
 		return out
 	}
@@ -279,7 +281,7 @@ func appendPackedBits(out []byte, vals []uint32, w int) []byte {
 	pos := 0
 	for _, v := range vals {
 		for b := w - 1; b >= 0; b-- {
-			if v&(1<<uint(b)) != 0 {
+			if v&(uint64(1)<<uint(b)) != 0 {
 				buf[pos>>3] |= 0x80 >> uint(pos&7)
 			}
 			pos++
@@ -288,12 +290,12 @@ func appendPackedBits(out []byte, vals []uint32, w int) []byte {
 	return append(out, buf...)
 }
 
-// unpackBits reads count values of w bits each (MSB-first) from b.
-func unpackBits(b []byte, count, w int) []uint32 {
-	out := make([]uint32, count)
+// unpackBits reads count values of w bits each (w up to 64, MSB-first) from b.
+func unpackBits(b []byte, count, w int) []uint64 {
+	out := make([]uint64, count)
 	pos := 0
 	for i := 0; i < count; i++ {
-		var v uint32
+		var v uint64
 		for j := 0; j < w; j++ {
 			v <<= 1
 			if pos>>3 < len(b) && b[pos>>3]&(0x80>>uint(pos&7)) != 0 {
@@ -308,23 +310,30 @@ func unpackBits(b []byte, count, w int) []uint32 {
 
 // EncodeDEEQuad encodes one delayed-end-event quadruple:
 //
-//	16-byte trace_id || varint(depth) || 4-byte owner_fp || varint(n) || n * varint(start_seq)
+//	16-byte trace_id || varint(depth) || ownerBytes × owner_fp || varint(n) || n * varint(start_seq)
 //
-// owner_fp is the top 4 bytes of the owning span's ID (same width as the ckpt4
-// window anchor). Unlike the in-baggage EE list — whose owner is recoverable for
+// owner_fp is the top fpBits of the owning span's ID, right-aligned, written in
+// ownerBytes = ceil(fpBits/8) big-endian bytes (so it scales with --fp-bits up
+// to the full 8). Unlike the in-baggage EE list — whose owner is recoverable for
 // free from the breadcrumb chain — a drained DEE batch carries no chain context,
-// so (trace_id, depth) alone can't pick the owner among same-depth spans in the
-// trace, and there's no surrounding path to narrow candidates the way a 2-byte
-// chain fp can. The full 4-byte fingerprint pins it on its own.
-func EncodeDEEQuad(traceID16 [16]byte, depth int, ownerFP uint32, seqs []int) []byte {
-	size := 16 + VarintLen(depth) + 4 + VarintLen(len(seqs))
+// so (trace_id, depth) alone can't pick the owner among same-depth spans, and
+// there's no surrounding path to narrow candidates the way a chain fp can. The
+// wider the owner fp, the more decisively it pins the owner on its own.
+func EncodeDEEQuad(traceID16 [16]byte, depth int, ownerFP uint64, fpBits int, seqs []int) []byte {
+	ownerBytes := (fpBits + 7) / 8
+	if ownerBytes < 1 {
+		ownerBytes = 1
+	}
+	size := 16 + VarintLen(depth) + ownerBytes + VarintLen(len(seqs))
 	for _, s := range seqs {
 		size += VarintLen(s)
 	}
 	out := make([]byte, 0, size)
 	out = append(out, traceID16[:]...)
 	out = binary.AppendUvarint(out, uint64(maxInt(depth, 0)))
-	out = append(out, byte(ownerFP>>24), byte(ownerFP>>16), byte(ownerFP>>8), byte(ownerFP))
+	for i := ownerBytes - 1; i >= 0; i-- { // big-endian, low ownerBytes of the right-aligned fp
+		out = append(out, byte(ownerFP>>uint(8*i)))
+	}
 	out = binary.AppendUvarint(out, uint64(len(seqs)))
 	for _, s := range seqs {
 		out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))

@@ -61,6 +61,8 @@ func main() {
 	flag.IntVar(&cpd, "cpd", 8, "checkpoint distance (both schemes)")
 	flag.Float64Var(&dropRate, "drop-rate", 0.5, "per-span drop probability (per-trace seeded)")
 	flag.IntVar(&fpBits, "fp-bits", 16, "S-Bridge non-checkpoint fingerprint width in bits")
+	var prefixLen int
+	flag.IntVar(&prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "checkpoint-root width in bytes (1-8): CGPRB prefix and S-Bridge window anchor. 8 = full-width.")
 	flag.IntVar(&n, "n", 1000, "number of traces to generate+evaluate")
 	flag.Int64Var(&baseSeed, "base-seed", 1, "base seed; trace i uses rng seeded base-seed+i")
 	flag.Int64Var(&sbDropSeed, "sb-drop-seed", 1, "S-Bridge per-trace drop base seed (matches sbridge_recon --drop-seed)")
@@ -79,8 +81,8 @@ func main() {
 	c.SlabMeanW = gen.EstimateMeanFanout(&c)
 	// cgprb recon config: same constructor/defaults as trace_recon --mode cgprb.
 	// Bloom FP target overridable via env (must match the emit side) for sweeping.
-	cgCfg := recon.NewPCRBConfig(cpd, bridge.DefaultPCRPrefixLen, bloomFPTarget())
-	sbCfg := recon.Config{CPD: cpd, FPBits: fpBits}
+	cgCfg := recon.NewPCRBConfig(cpd, prefixLen, bloomFPTarget())
+	sbCfg := recon.Config{CPD: cpd, FPBits: fpBits, PrefixLen: prefixLen}
 
 	t0 := time.Now()
 	results := make([]stats, workers)
@@ -102,6 +104,28 @@ func main() {
 				depthOf := gen.MakeDepthSampler(&c, rng)
 				tid := rng.Uint64()
 				spans := gen.Trace(&c, rng, fanoutOf, depthOf)
+				if os.Getenv("TRACE_RECON_FANOUTDIST") != "" {
+					// Emit the fan-out WIDTH histogram (children per node with >=2
+					// children) for this trace, then skip recon. Aggregated offline.
+					cc := make(map[uint64]int)
+					for _, s := range spans {
+						if s.Parent != 0 {
+							cc[s.Parent]++
+						}
+					}
+					hist := make(map[int]int)
+					for _, w := range cc {
+						if w >= 1 { // all non-leaf nodes (include single-child)
+							hist[w]++
+						}
+					}
+					fmt.Fprint(os.Stderr, "FOW")
+					for w, n := range hist {
+						fmt.Fprintf(os.Stderr, " %d:%d", w, n)
+					}
+					fmt.Fprintln(os.Stderr)
+					continue
+				}
 				st.spans += int64(len(spans))
 				st.spansPer = append(st.spansPer, int64(len(spans)))
 				st.nTraces++
@@ -297,7 +321,7 @@ type sbSpanInfo struct {
 
 func evalSBridge(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.Config, cpd int, rate float64, dropSeed int64, fpBits, nspans int) {
 	tr := corpus.StoredTrace{TraceID: tid, Events: events}
-	payloads, truth, spans, dees := sbEmitTrace(tr, cpd, false, fpBits, false)
+	payloads, truth, spans, dees := sbEmitTrace(tr, cpd, false, fpBits, false, cfg.PrefixLen)
 	dropped := sbDropSet(tr, rate, dropSeed, cpd)
 
 	inputs := make([]recon.SBInput, 0, len(payloads))
@@ -364,13 +388,16 @@ func evalSBridge(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.C
 
 // sbEmitTrace replays one trace through a fresh SBridgeHandler (verbatim from
 // cmd/sbridge_recon/main.go).
-func sbEmitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool) (map[uint64][]byte, recon.SBTruth, []sbSpanInfo, [][]byte) {
+func sbEmitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool, ckptBytes int) (map[uint64][]byte, recon.SBTruth, []sbSpanInfo, [][]byte) {
 	h := bridge.NewSBridgeHandler(cpd, nil)
 	h.EmitOC = true
 	h.TopoOnly = topoOnly
 	h.OmitOrdinal = noOrdinal
 	if fpBits > 0 {
 		h.FPBits = fpBits
+	}
+	if ckptBytes > 0 {
+		h.CkptBytes = ckptBytes
 	}
 	payloads := map[uint64][]byte{}
 	h.EmitSink = func(_, sid uint64, payload []byte) {
@@ -515,7 +542,11 @@ func bloomFPTarget() float64 {
 }
 
 func evalCGPRB(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.Config, cpd int, rate float64, dropSeed int64, nspans int) {
-	h := bridge.NewCGPRBBridgeHandler(cpd, bridge.DefaultPCRPrefixLen, bloomFPTarget())
+	prefixLen := cfg.PrefixLen
+	if prefixLen <= 0 {
+		prefixLen = bridge.DefaultPCRPrefixLen
+	}
+	h := bridge.NewCGPRBBridgeHandler(cpd, prefixLen, bloomFPTarget())
 	h.Capture = true
 	var spans []cgColl
 	idx := map[uint64]int{}

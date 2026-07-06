@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -370,6 +371,17 @@ func cgpGenCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
 	for _, s := range sk.byID {
 		survByDepth[s.Depth] = append(survByDepth[s.Depth], s)
 	}
+	// Determinism: sk.fanouts and sk.byID are maps, so the per-depth lists above
+	// come out in random iteration order, which would feed a randomly-permuted
+	// model to the solver (and randomly-ordered equal-depth options, whose ties
+	// the solver then breaks differently run-to-run). Sort by id so identical
+	// input yields an identical candidate set and option order.
+	for d := range haByDepth {
+		sort.Slice(haByDepth[d], func(i, j int) bool { return haByDepth[d][i] < haByDepth[d][j] })
+	}
+	for d := range survByDepth {
+		sort.Slice(survByDepth[d], func(i, j int) bool { return survByDepth[d][i].SpanID < survByDepth[d][j].SpanID })
+	}
 	wtop := func(d int) int { // window-top checkpoint depth for a span at depth d
 		if d%cfg.CPD == 0 {
 			return d - cfg.CPD
@@ -574,6 +586,14 @@ func cgpSolveAndEmit(sk *cgpSkeleton, fr *cgpForest, opts []*cgpFragOpts, cfg Co
 	for id, fo := range sk.fanouts {
 		haDepth[id] = fo.depth
 	}
+	// Deterministic fan-out order for any loop that EMITS into the model (map
+	// range order would otherwise permute the constraints run-to-run). Map-fill
+	// loops below (witnessWindow/realizedWindow) are keyed lookups and need no order.
+	fanoutIDs := make([]uint64, 0, len(sk.fanouts))
+	for id := range sk.fanouts {
+		fanoutIDs = append(fanoutIDs, id)
+	}
+	sort.Slice(fanoutIDs, func(i, j int) bool { return fanoutIDs[i] < fanoutIDs[j] })
 
 	// A fragment routes through fan-out M iff its chosen anchor sits ABOVE M
 	// (anchor.Depth < M.depth) and it confirms M. routesByWindow groups those
@@ -719,7 +739,7 @@ func cgpSolveAndEmit(sk *cgpSkeleton, fr *cgpForest, opts []*cgpFragOpts, cfg Co
 	// needs to supply the shortfall: need = 2 - exactKids. A pinned window that
 	// cannot meet the shortfall is a candidate-generation gap (counted, not hidden).
 	thinWindow := 0
-	for m := range sk.fanouts {
+	for _, m := range fanoutIDs { // deterministic constraint-emission order
 		w := realizedWindow[m]
 		if w == 0 {
 			continue

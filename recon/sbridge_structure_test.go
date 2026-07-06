@@ -207,10 +207,12 @@ func TestStructureScoring(t *testing.T) {
 func TestReconstructStructure(t *testing.T) {
 	const eps = int64(1)
 	b1 := &STNode{Real: true, Start: 30, End: 40, Ord: 1, Children: map[int]*STNode{}}
-	b := &STNode{Ord: 2, Children: map[int]*STNode{1: b1}, EndOrder: []int{1}}
+	b := &STNode{Ord: 2, Children: map[int]*STNode{1: b1}, EndOrder: []int{1}, EE: []int{1}}
 	a := &STNode{Real: true, Start: 10, End: 20, Ord: 1, Children: map[int]*STNode{}}
 	c := &STNode{Real: true, Start: 50, End: 90, Ord: 3, Children: map[int]*STNode{}}
-	p := &STNode{Ord: 1, Children: map[int]*STNode{1: a, 2: b, 3: c}, EndOrder: []int{1, 3, 2}}
+	// merged event order (starts + ends): A ended (in B.EE) before B started; C's
+	// end is a DEE leftover; B ends implicitly last -> sA,eA,sB,sC,eC,eB.
+	p := &STNode{Ord: 1, Children: map[int]*STNode{1: a, 2: b, 3: c}, EndOrder: []int{1, 3, 2}, DEE: []int{3}}
 	root := &STNode{Real: true, Start: 0, End: 100, Ord: 0, Children: map[int]*STNode{1: p}, EndOrder: []int{1}}
 
 	ReconstructStructure(root, eps)
@@ -236,5 +238,39 @@ func TestReconstructStructure(t *testing.T) {
 	}
 	if !(a.Start < b.Start && b.Start < c.Start) {
 		t.Errorf("start order broken: A=%d B=%d C=%d", a.Start, b.Start, c.Start)
+	}
+}
+
+// TestReconstructStructureInterleave pins the start-vs-end ordering that two
+// independent passes (end-among-ends, start-among-starts) could not enforce.
+// A and B are reconstructed SEQUENTIAL siblings: A's end was witnessed before B
+// started (B.EE={A}). Their encompass seeds TIE — A covers a1[10,20], B covers
+// b1[20,35], so A.End == B.Start == 20. End-among-ends never looks at B's start
+// and start-among-starts never looks at A's end, so they'd leave the tie and A/B
+// read as (falsely) touching. The single merged-order sweep sees eA immediately
+// before sB and separates them by eps, so A.End < B.Start (strictly sequential).
+func TestReconstructStructureInterleave(t *testing.T) {
+	const eps = int64(1)
+	a1 := &STNode{Real: true, Start: 10, End: 20, Ord: 1, Children: map[int]*STNode{}}
+	a := &STNode{Ord: 1, Children: map[int]*STNode{1: a1}}
+	b1 := &STNode{Real: true, Start: 20, End: 35, Ord: 1, Children: map[int]*STNode{}}
+	b := &STNode{Ord: 2, Children: map[int]*STNode{1: b1}, EE: []int{1}} // A ended before B started
+	// merged over A,B: sA, eA (from B.EE), sB, eB (implicit last) — no DEE leftover.
+	root := &STNode{Real: true, Start: 0, End: 100, Ord: 0, Children: map[int]*STNode{1: a, 2: b}}
+
+	ReconstructStructure(root, eps)
+
+	if !(a.End < b.Start) {
+		t.Errorf("sequential order broken: A.End=%d must be < B.Start=%d", a.End, b.Start)
+	}
+	if a.Start != 10 || a.End != 20 {
+		t.Errorf("A = [%d,%d], want [10,20]", a.Start, a.End)
+	}
+	// B's start is nudged one eps past the tie to sit strictly after A's end.
+	if b.Start != 21 || b.End != 35 {
+		t.Errorf("B = [%d,%d], want [21,35]", b.Start, b.End)
+	}
+	if a1.Start != 10 || a1.End != 20 || b1.Start != 20 || b1.End != 35 {
+		t.Errorf("a survivor moved: a1=[%d,%d] b1=[%d,%d]", a1.Start, a1.End, b1.Start, b1.End)
 	}
 }

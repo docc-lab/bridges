@@ -71,6 +71,7 @@ extern "C" int cpsat_solve_bool(const char* model, double tlim, int* vals,
   Model model_;
   SatParameters p;
   p.set_num_search_workers(1);
+  p.set_random_seed(1);  // fixed seed: identical model -> identical solution
   p.set_max_time_in_seconds(tlim);
   model_.Add(NewSatParameters(p));
   CpSolverResponse r = SolveCpModel(m.Build(), &model_);

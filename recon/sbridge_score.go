@@ -66,7 +66,7 @@ func ScoreStructure(res SBResult, truth SBTruth, endPos map[uint64]int64, deeQua
 
 	var build func(n *SBNode, trueID uint64, depth int) *STNode
 	build = func(n *SBNode, trueID uint64, depth int) *STNode {
-		st := &STNode{ID: trueID, Ord: n.Ord, Real: n.RealID != 0, Children: map[int]*STNode{}}
+		st := &STNode{ID: trueID, Ord: n.Ord, Real: n.RealID != 0, Children: map[int]*STNode{}, EE: append([]int(nil), n.EE...)}
 		var kids []SBChild
 		childOrds := map[int]bool{}
 		witnessed := map[int]bool{} // ends already accounted in children's EE
@@ -123,6 +123,7 @@ func ScoreStructure(res SBResult, truth SBTruth, endPos map[uint64]int64, deeQua
 	// Each parent's end-order = its children's EE blocks ++ its DEE leftovers.
 	for id, st := range stByID {
 		st.EndOrder = GatherEndOrder(childrenByID[id], deeByParent[id])
+		st.DEE = deeByParent[id]
 	}
 
 	// Order against order: each parent's recovered EndOrder vs its true end order.

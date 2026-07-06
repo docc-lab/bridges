@@ -127,6 +127,12 @@ def main() -> None:
         "Scatter outliers above the cap are clipped out of view. Default: no cap.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed for jitter randomness.")
+    parser.add_argument("--label-fs", type=float, default=None, help="Font size for axis labels (default: matplotlib default).")
+    parser.add_argument("--tick-fs", type=float, default=None, help="Font size for tick labels.")
+    parser.add_argument("--legend-fs", type=float, default=11.0, help="Font size for the legend.")
+    parser.add_argument("--ylabel", default=None, help="Override the y-axis label (default: per-field label).")
+    parser.add_argument("--figw", type=float, default=11.0, help="Figure width (inches).")
+    parser.add_argument("--figh", type=float, default=6.0, help="Figure height (inches).")
     args = parser.parse_args()
 
     out_dir = Path(args.data_dir)
@@ -135,11 +141,11 @@ def main() -> None:
 
     cpds: List[int] = list(args.cpds)
     field: str = args.field
-    ylabel = FIELD_YLABEL.get(field, field)
+    ylabel = args.ylabel if args.ylabel else FIELD_YLABEL.get(field, field)
 
     rng = np.random.default_rng(args.seed)
 
-    fig, ax = plt.subplots(figsize=(11, 6))
+    fig, ax = plt.subplots(figsize=(args.figw, args.figh))
 
     bridge_modes = list(args.bridges)
     n_series = len(bridge_modes)
@@ -200,8 +206,10 @@ def main() -> None:
             label=label,
         )
 
-    ax.set_xlabel("Checkpoint distance")
-    ax.set_ylabel(ylabel)
+    ax.set_xlabel("Checkpoint distance", fontsize=args.label_fs)
+    ax.set_ylabel(ylabel, fontsize=args.label_fs)
+    if args.tick_fs is not None:
+        ax.tick_params(axis="both", labelsize=args.tick_fs)
     if args.ylog:
         ax.set_yscale("log")
         # Log scale requires strictly positive lower bound.
@@ -213,7 +221,7 @@ def main() -> None:
         ax.set_ylim(top=max_bar_top * (1.0 + args.ymax_iqr_pct / 100.0))
     ax.set_xticks(cpds)
     ax.grid(True, alpha=0.28)
-    ax.legend(loc=args.legend_loc, fontsize=11)
+    ax.legend(loc=args.legend_loc, fontsize=args.legend_fs)
     plt.tight_layout()
     plt.savefig(args.out, dpi=300, bbox_inches="tight")
     plt.close()

@@ -10,9 +10,12 @@ import "sort"
 //
 //   For each node (post-order — children finalized first), resolve the node's
 //   whole SIBLING SET in one shot:
-//     1. reorder the children: push reconstructed starts EARLIER / ends LATER
-//        (only-widening, ε apart) so starts come out in start-ordinal order and
-//        ends in the EE/DEE-derived end order; survivors never move.
+//     1. reorder the children along the ONE recovered event order — starts and
+//        ends interleaved (start-ordinals + the EE/DEE end witnesses) — so
+//        start-vs-end sequencing/concurrency is respected, not just start-vs-start
+//        and end-vs-end. A forward pass pushes each reconstructed event past its
+//        predecessor (ε gap); a backward pass pulls it under its successor. Values
+//        seed from the encompass intervals; survivors never move.
 //     2. the node (if reconstructed) encompasses its now-positioned children.
 //
 // Because children are finalized before their parent, a child pushed past its
@@ -146,6 +149,8 @@ type STNode struct {
 	Ord      int             // start-ordinal under its parent (start order)
 	Children map[int]*STNode // keyed by child start-ordinal
 	EndOrder []int           // this node's children's ordinals, in end-event order (EE+DEE)
+	EE       []int           // ends this node witnessed before IT started (earlier-sibling ordinals)
+	DEE      []int           // this node's leftover end-ordinals as a parent (ends after its last child started)
 }
 
 // criticalPath returns the chain of last-finishing spans from the root: at each
@@ -219,42 +224,88 @@ func resolve(n *STNode, eps int64) {
 	encompass(n)
 }
 
-// reorderSiblings resolves a node's whole child set at once: ends pushed later in
-// end-event order, starts pushed earlier in ordinal order. Reconstructed spans
-// only widen; survivors are fixed anchors.
+// stEvent is one start/end event of a child, for the merged-order sweep.
+type stEvent struct {
+	ord int  // child start-ordinal
+	end bool // false = start event, true = end event
+}
+
+// mergedEvents rebuilds the ONE recovered event order over n's children: starts
+// in start-ordinal order, with each end spliced in where it was witnessed (a
+// child's EE = the earlier-sibling ends seen before it started; the parent's DEE
+// = ends after the last child started; the lone child in neither is the implicit
+// last end). This is GatherEndOrder with the starts kept in, so start-vs-end
+// adjacencies (sequencing vs concurrency) are represented, not just end-vs-end.
+func mergedEvents(n *STNode) []stEvent {
+	ords := sortedOrds(n.Children) // start-ordinal order
+	evs := make([]stEvent, 0, 2*len(ords))
+	seen := make(map[int]bool, len(ords)) // ends already placed
+	for _, o := range ords {
+		for _, e := range n.Children[o].EE { // ends witnessed before child o started
+			evs = append(evs, stEvent{e, true})
+			seen[e] = true
+		}
+		evs = append(evs, stEvent{o, false}) // child o's start
+	}
+	for _, e := range n.DEE { // ends after the last child started
+		evs = append(evs, stEvent{e, true})
+		seen[e] = true
+	}
+	for _, o := range ords { // the single implicit-last end
+		if !seen[o] {
+			evs = append(evs, stEvent{o, true})
+			break
+		}
+	}
+	return evs
+}
+
+// reorderSiblings assigns timestamps to n's reconstructed children by a single
+// sweep of the merged event order, so start-vs-end order (sequencing/concurrency)
+// is respected together with start-vs-start and end-vs-end. Two directions over
+// that one order: a forward pass pushes each reconstructed event to sit at least
+// its predecessor+eps, a backward pass pulls it to sit at most its successor-eps.
+// Values begin at the encompass seeds (containment); survivors are fixed anchors
+// that never move. Sweeping the single merged order — rather than two separate
+// end/start chains — is what stops an end and a later start from desyncing.
 func reorderSiblings(n *STNode, eps int64) {
-	// Ends: walk children in end-event order; each end >= the previous (+eps for a
-	// strict gap). Only reconstructed ends move, and only later.
-	var prev int64
-	have := false
-	for _, ord := range n.EndOrder {
-		c := n.Children[ord]
-		if c == nil {
+	evs := mergedEvents(n)
+	get := func(e stEvent) int64 {
+		c := n.Children[e.ord]
+		if e.end {
+			return c.End
+		}
+		return c.Start
+	}
+	set := func(e stEvent, v int64) {
+		c := n.Children[e.ord]
+		if c.Real { // survivors never move
+			return
+		}
+		if e.end {
+			c.End = v
+		} else {
+			c.Start = v
+		}
+	}
+	fixed := func(e stEvent) bool { return n.Children[e.ord].Real }
+	// Forward: each event >= its predecessor + eps (reconstructed pushed later).
+	for i := 1; i < len(evs); i++ {
+		if fixed(evs[i]) {
 			continue
 		}
-		if have && !c.Real {
-			if need := prev + eps; c.End < need {
-				c.End = need
-			}
+		if need := get(evs[i-1]) + eps; get(evs[i]) < need {
+			set(evs[i], need)
 		}
-		prev = c.End
-		have = true
 	}
-	// Starts: walk children in ordinal order; each start <= the next (-eps). Only
-	// reconstructed starts move, and only earlier — sweep backward so an
-	// out-of-order start is pulled under its successor.
-	ords := sortedOrds(n.Children)
-	var next int64
-	haveN := false
-	for i := len(ords) - 1; i >= 0; i-- {
-		c := n.Children[ords[i]]
-		if haveN && !c.Real {
-			if lim := next - eps; c.Start > lim {
-				c.Start = lim
-			}
+	// Backward: each event <= its successor - eps (reconstructed pulled earlier).
+	for i := len(evs) - 2; i >= 0; i-- {
+		if fixed(evs[i]) {
+			continue
 		}
-		next = c.Start
-		haveN = true
+		if lim := get(evs[i+1]) - eps; get(evs[i]) > lim {
+			set(evs[i], lim)
+		}
 	}
 }
 

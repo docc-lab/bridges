@@ -123,7 +123,7 @@ func parseFlags() config {
 	flag.Parse()
 	bloom.PrimeM = primeM // set before any handler/config sizing (emit + recon must match)
 	bloom.PrimeMByteCap = primeMByteCap
-	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" {
+	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" {
 		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, pcrs, or cgprb (got %q)\n", c.mode)
 		os.Exit(2)
 	}
@@ -228,6 +228,10 @@ type harness struct {
 
 	scores map[uint64]recon.Score
 
+	// cg2: inline cgp2 (ReconstructCGP2 + ScoreCGP2Iso) tallies, guarded by mu.
+	// Additive across the parallel workers; reported at drain.
+	cg2 cgp2acc
+
 	// CGP call-graph-topology accounting (TRACE_RECON_TOPO=1), guarded by mu.
 	topoOn        bool
 	topoTotal     int64
@@ -304,6 +308,14 @@ type finishJob struct {
 	dropped map[uint64]struct{}
 }
 
+// cgp2acc accumulates the inline cgp2 per-trace scores (mirrors cmd/cgp2_replay).
+// All fields are additive so the parallel workers merge under harness.mu.
+type cgp2acc struct {
+	nt, feas, clean, empty                                                   int
+	realNodes, edgeExact, edgeWrong, survN, survEx, named, namedEx, totWrong int
+	emptySurvSum, emptyNoDrop, emptyTiny                                     int
+}
+
 // wrongRec locates one wrong-edge bridge against the pre-drop truth.
 type wrongRec struct {
 	Trace     string `json:"trace"`
@@ -353,10 +365,11 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		ph.Capture = true
 		return ph, pcrbCfg
-	case "cgprb":
+	case "cgprb", "cgp2":
 		// Call-graph-preserving: PCRB payload + window-local hash array. Same
 		// checkpoint-root + bloom geometry as PCRB, so it shares the PCRB
-		// config; reconstruction additionally consumes the HA.
+		// config; reconstruction additionally consumes the HA. cgp2 reconstructs
+		// the SAME emitted payloads with the from-scratch ReconstructCGP2.
 		ph := bridge.NewCGPRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		ph.Capture = true
 		pcrbCfg := recon.NewPCRBConfig(c.checkpointDistance, c.prefixLen, c.bloomFP)
@@ -518,6 +531,27 @@ func (ha *harness) drain() {
 			pct(ha.topoPrec, ha.topoReconSib), ha.topoPrec, ha.topoReconSib)
 		fmt.Fprintf(os.Stderr, "STRICT singleton-branchpoint orphans tested=%d misrouted=%d\n",
 			ha.topoSingleBP, ha.topoSingleMis)
+	}
+	if ha.mode == "cgp2" {
+		a := ha.cg2
+		pct := func(x, y int) float64 {
+			if y == 0 {
+				return 0
+			}
+			return 100 * float64(x) / float64(y)
+		}
+		wt := 0.0
+		if a.feas > 0 {
+			wt = float64(a.totWrong) / float64(a.feas)
+		}
+		fmt.Fprintf(os.Stderr, "CGP2 traces=%d feasible=%d empty=%d | correct=%.2f%% (clean=%d) | correctExclEmpty=%.2f%% | correctCreditEmpty=%.2f%%\n",
+			a.nt, a.feas, a.empty, pct(a.clean, a.nt), a.clean, pct(a.clean, a.feas), pct(a.clean+a.empty, a.nt))
+		if a.empty > 0 {
+			fmt.Fprintf(os.Stderr, "CGP2 empties: n=%d avgSurv=%.1f noDrop(trivial)=%d tiny(<=2 surv)=%d\n",
+				a.empty, float64(a.emptySurvSum)/float64(a.empty), a.emptyNoDrop, a.emptyTiny)
+		}
+		fmt.Fprintf(os.Stderr, "CGP2 per-edge: exact=%.3f%% (%d/%d) wrong/trace=%.2f | survivor edges=%.3f%% | named-syn=%.2f%%\n",
+			pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt, pct(a.survEx, a.survN), pct(a.namedEx, a.named))
 	}
 }
 
@@ -685,7 +719,7 @@ func (ha *harness) process(j finishJob) {
 				sp.CkptPrefix = prefix
 				sp.BloomBits = bits
 				sp.LeafCarrier = d%ha.cpd != 0
-			} else if ha.mode == "cgprb" || ha.cfg.CGRP {
+			} else if ha.mode == "cgprb" || ha.mode == "cgp2" || ha.cfg.CGRP {
 				d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
@@ -741,7 +775,7 @@ func (ha *harness) process(j finishJob) {
 		} else {
 			res = recon.ReconstructPCRS(survivors, ha.cfg)
 		}
-		ha.recRecon(tid, len(survivors), len(truth), len(dropped), time.Since(t0))
+		ha.recRecon(tid, len(survivors), len(truth), len(dropped), true, time.Since(t0))
 		ha.scoresStore(tid, recon.ScorePCR(res, truth, dropped))
 		ha.classifyWrong(tid, res, truth, dropped)
 		if ha.topoOn {
@@ -781,7 +815,7 @@ func (ha *harness) process(j finishJob) {
 		t0 := time.Now()
 		res := recon.ReconstructCGPRB(survivors, ha.cfg)
 		d := time.Since(t0)
-		ha.recRecon(tid, len(survivors), len(truth), len(dropped), d)
+		ha.recRecon(tid, len(survivors), len(truth), len(dropped), true, d)
 		if slowReconMS > 0 && d.Milliseconds() >= slowReconMS {
 			fmt.Fprintf(os.Stderr, "SLOWRECON tid=%016x survivors=%d ms=%d\n", tid, len(survivors), d.Milliseconds())
 		}
@@ -790,6 +824,57 @@ func (ha *harness) process(j finishJob) {
 		if ha.topoOn {
 			ha.addTopo(recon.ScoreCGPTopology(res, truth, dropped, tid))
 		}
+	} else if ha.mode == "cgp2" {
+		// The from-scratch CGP reconstructor over the same CGPRB payloads, scored
+		// by per-edge isomorphism. Reconstruct+score off the lock (the expensive
+		// part); only the additive tally is mutex-guarded.
+		t0 := time.Now()
+		res := recon.ReconstructCGP2(survivors, ha.cfg)
+		d := time.Since(t0)
+		empty := len(res.ReconParent) == 0
+		ha.recRecon(tid, len(survivors), len(truth), len(dropped), !empty, d)
+		var iso recon.CGP2Iso
+		if !empty {
+			iso = recon.ScoreCGP2Iso(res, truth, dropped) // dropped is already map[uint64]struct{}
+		}
+		ha.mu.Lock()
+		ha.cg2.nt++
+		if empty {
+			ha.cg2.empty++
+			ha.cg2.emptySurvSum += len(survivors)
+			if len(dropped) == 0 {
+				ha.cg2.emptyNoDrop++
+			}
+			if len(survivors) <= 2 {
+				ha.cg2.emptyTiny++
+			}
+		} else {
+			ha.cg2.feas++
+			ha.cg2.realNodes += iso.RealNodes
+			ha.cg2.edgeExact += iso.EdgeExact
+			ha.cg2.edgeWrong += iso.EdgeWrong
+			ha.cg2.totWrong += iso.EdgeWrong
+			ha.cg2.survN += iso.SurvNodes
+			ha.cg2.survEx += iso.SurvExact
+			ha.cg2.named += iso.NamedSyn
+			ha.cg2.namedEx += iso.NamedExact
+			if iso.EdgeWrong == 0 {
+				ha.cg2.clean++
+			}
+		}
+		// Progress row every 10k traces (cgp2 bypasses scoresStore, so emit here).
+		if a := ha.cg2; a.nt%10000 == 0 {
+			ex, pe := 100.0, 100.0
+			if a.feas > 0 {
+				ex = 100 * float64(a.clean) / float64(a.feas)
+			}
+			if a.realNodes > 0 {
+				pe = 100 * float64(a.edgeExact) / float64(a.realNodes)
+			}
+			fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds feasible=%d empty=%d exclEmpty=%.2f%% per-edge-exact=%.3f%%\n",
+				a.nt, int(time.Since(ha.prog.start).Seconds()), a.feas, a.empty, ex, pe)
+		}
+		ha.mu.Unlock()
 	} else {
 		res := recon.ReconstructPB(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))
@@ -797,19 +882,22 @@ func (ha *harness) process(j finishJob) {
 }
 
 // traceTiming is one trace's reconstruction wall-time and size, for --timing.
+// feasible = the reconstruction produced output (cgp2: non-empty, i.e. the
+// exclEmpty subset); for modes without an empty/feasible notion it is true.
 type traceTiming struct {
 	tid                 uint64
 	nsurv, nspan, ndrop int
+	feasible            bool
 	ns                  int64
 }
 
 // recRecon records one trace's reconstruction time (no-op unless timing is on).
-func (ha *harness) recRecon(tid uint64, nsurv, nspan, ndrop int, d time.Duration) {
+func (ha *harness) recRecon(tid uint64, nsurv, nspan, ndrop int, feasible bool, d time.Duration) {
 	if !ha.timingOn {
 		return
 	}
 	ha.mu.Lock()
-	ha.timingRecs = append(ha.timingRecs, traceTiming{tid, nsurv, nspan, ndrop, d.Nanoseconds()})
+	ha.timingRecs = append(ha.timingRecs, traceTiming{tid, nsurv, nspan, ndrop, feasible, d.Nanoseconds()})
 	ha.mu.Unlock()
 }
 
@@ -1186,24 +1274,34 @@ func main() {
 // microseconds) and, if path != "", writes the full per-trace CSV.
 func reportTiming(ha *harness, path string) {
 	recs := ha.timingRecs
-	ns := make([]int64, len(recs))
-	var total int64
-	for i, r := range recs {
-		ns[i] = r.ns
-		total += r.ns
-	}
-	sort.Slice(ns, func(i, j int) bool { return ns[i] < ns[j] })
-	us := func(v int64) float64 { return float64(v) / 1000 }
-	pctl := func(p float64) int64 {
+	// Summarize two subsets: all recorded traces, and the feasible (exclEmpty)
+	// subset — the traces that actually reconstructed something.
+	summ := func(label string, ns []int64) {
 		if len(ns) == 0 {
-			return 0
+			fmt.Fprintf(os.Stderr, "TIMING[%s] traces=0\n", label)
+			return
 		}
-		i := int(p * float64(len(ns)-1))
-		return ns[i]
+		sort.Slice(ns, func(i, j int) bool { return ns[i] < ns[j] })
+		var total int64
+		for _, v := range ns {
+			total += v
+		}
+		ms := func(v int64) float64 { return float64(v) / 1e6 }
+		pctl := func(p float64) int64 { return ns[int(p*float64(len(ns)-1))] }
+		fmt.Fprintf(os.Stderr, "TIMING[%s] traces=%d recon_total=%s mean=%.3fms p50=%.3f p90=%.3f p99=%.3f max=%.3f (ms)\n",
+			label, len(ns), time.Duration(total).Round(time.Millisecond),
+			ms(total/int64(len(ns))), ms(pctl(0.50)), ms(pctl(0.90)), ms(pctl(0.99)), ms(ns[len(ns)-1]))
 	}
-	fmt.Fprintf(os.Stderr, "TIMING traces=%d recon_total=%s mean=%.1fus p50=%.1f p90=%.1f p99=%.1f max=%.1f (us)\n",
-		len(ns), time.Duration(total).Round(time.Millisecond),
-		us(total/int64(len(ns))), us(pctl(0.50)), us(pctl(0.90)), us(pctl(0.99)), us(ns[len(ns)-1]))
+	all := make([]int64, 0, len(recs))
+	feas := make([]int64, 0, len(recs))
+	for _, r := range recs {
+		all = append(all, r.ns)
+		if r.feasible {
+			feas = append(feas, r.ns)
+		}
+	}
+	summ("all", all)
+	summ("exclEmpty", feas)
 	if path == "" {
 		return
 	}
@@ -1215,9 +1313,13 @@ func reportTiming(ha *harness, path string) {
 	defer f.Close()
 	w := bufio.NewWriter(f)
 	defer w.Flush()
-	fmt.Fprintln(w, "tid,survivors,spans,dropped,recon_ns")
+	fmt.Fprintln(w, "tid,survivors,spans,dropped,feasible,recon_ns")
 	for _, r := range recs {
-		fmt.Fprintf(w, "%016x,%d,%d,%d,%d\n", r.tid, r.nsurv, r.nspan, r.ndrop, r.ns)
+		fb := 0
+		if r.feasible {
+			fb = 1
+		}
+		fmt.Fprintf(w, "%016x,%d,%d,%d,%d,%d\n", r.tid, r.nsurv, r.nspan, r.ndrop, fb, r.ns)
 	}
 }
 

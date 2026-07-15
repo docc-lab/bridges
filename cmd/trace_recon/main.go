@@ -123,7 +123,7 @@ func parseFlags() config {
 	flag.Parse()
 	bloom.PrimeM = primeM // set before any handler/config sizing (emit + recon must match)
 	bloom.PrimeMByteCap = primeMByteCap
-	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" {
+	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" && c.mode != "pb2" {
 		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, pcrs, or cgprb (got %q)\n", c.mode)
 		os.Exit(2)
 	}
@@ -365,7 +365,7 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		ph.Capture = true
 		return ph, pcrbCfg
-	case "cgprb", "cgp2":
+	case "cgprb", "cgp2", "pb2":
 		// Call-graph-preserving: PCRB payload + window-local hash array. Same
 		// checkpoint-root + bloom geometry as PCRB, so it shares the PCRB
 		// config; reconstruction additionally consumes the HA. cgp2 reconstructs
@@ -532,8 +532,12 @@ func (ha *harness) drain() {
 		fmt.Fprintf(os.Stderr, "STRICT singleton-branchpoint orphans tested=%d misrouted=%d\n",
 			ha.topoSingleBP, ha.topoSingleMis)
 	}
-	if ha.mode == "cgp2" {
+	if ha.mode == "cgp2" || ha.mode == "pb2" {
 		a := ha.cg2
+		label := "CGP2"
+		if ha.mode == "pb2" {
+			label = "PB2"
+		}
 		pct := func(x, y int) float64 {
 			if y == 0 {
 				return 0
@@ -544,14 +548,19 @@ func (ha *harness) drain() {
 		if a.feas > 0 {
 			wt = float64(a.totWrong) / float64(a.feas)
 		}
-		fmt.Fprintf(os.Stderr, "CGP2 traces=%d feasible=%d empty=%d | correct=%.2f%% (clean=%d) | correctExclEmpty=%.2f%% | correctCreditEmpty=%.2f%%\n",
-			a.nt, a.feas, a.empty, pct(a.clean, a.nt), a.clean, pct(a.clean, a.feas), pct(a.clean+a.empty, a.nt))
+		fmt.Fprintf(os.Stderr, "%s traces=%d feasible=%d empty=%d | correct=%.2f%% (clean=%d) | correctExclEmpty=%.2f%% | correctCreditEmpty=%.2f%%\n",
+			label, a.nt, a.feas, a.empty, pct(a.clean, a.nt), a.clean, pct(a.clean, a.feas), pct(a.clean+a.empty, a.nt))
 		if a.empty > 0 {
-			fmt.Fprintf(os.Stderr, "CGP2 empties: n=%d avgSurv=%.1f noDrop(trivial)=%d tiny(<=2 surv)=%d\n",
-				a.empty, float64(a.emptySurvSum)/float64(a.empty), a.emptyNoDrop, a.emptyTiny)
+			fmt.Fprintf(os.Stderr, "%s empties: n=%d avgSurv=%.1f noDrop(trivial)=%d tiny(<=2 surv)=%d\n",
+				label, a.empty, float64(a.emptySurvSum)/float64(a.empty), a.emptyNoDrop, a.emptyTiny)
 		}
-		fmt.Fprintf(os.Stderr, "CGP2 per-edge: exact=%.3f%% (%d/%d) wrong/trace=%.2f | survivor edges=%.3f%% | named-syn=%.2f%%\n",
-			pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt, pct(a.survEx, a.survN), pct(a.namedEx, a.named))
+		if ha.mode == "cgp2" {
+			fmt.Fprintf(os.Stderr, "CGP2 per-edge: exact=%.3f%% (%d/%d) wrong/trace=%.2f | survivor edges=%.3f%% | named-syn=%.2f%%\n",
+				pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt, pct(a.survEx, a.survN), pct(a.namedEx, a.named))
+		} else {
+			fmt.Fprintf(os.Stderr, "PB2 per-fragment: reconnect-exact=%.3f%% (%d/%d) wrong/trace=%.2f\n",
+				pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt)
+		}
 	}
 }
 
@@ -719,7 +728,7 @@ func (ha *harness) process(j finishJob) {
 				sp.CkptPrefix = prefix
 				sp.BloomBits = bits
 				sp.LeafCarrier = d%ha.cpd != 0
-			} else if ha.mode == "cgprb" || ha.mode == "cgp2" || ha.cfg.CGRP {
+			} else if ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "pb2" || ha.cfg.CGRP {
 				d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
@@ -872,6 +881,52 @@ func (ha *harness) process(j finishJob) {
 				pe = 100 * float64(a.edgeExact) / float64(a.realNodes)
 			}
 			fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds feasible=%d empty=%d exclEmpty=%.2f%% per-edge-exact=%.3f%%\n",
+				a.nt, int(time.Since(ha.prog.start).Seconds()), a.feas, a.empty, ex, pe)
+		}
+		ha.mu.Unlock()
+	} else if ha.mode == "pb2" {
+		// The from-scratch PATH-bridge reconstructor over the same CGPRB payloads
+		// (HA ignored via NoFanout), scored by ancestor/path correctness. Shares the
+		// cg2 tally + reporting: exclEmpty = traces whose every reconnection is right.
+		t0 := time.Now()
+		res := recon.ReconstructPB2(survivors, ha.cfg)
+		d := time.Since(t0)
+		empty := len(res.ReconParent) == 0
+		ha.recRecon(tid, len(survivors), len(truth), len(dropped), !empty, d)
+		var iso recon.CGP2Iso
+		if !empty {
+			iso = recon.ScorePB2Path(res, truth, dropped)
+		}
+		ha.mu.Lock()
+		ha.cg2.nt++
+		if empty {
+			ha.cg2.empty++
+			ha.cg2.emptySurvSum += len(survivors)
+			if len(dropped) == 0 {
+				ha.cg2.emptyNoDrop++
+			}
+			if len(survivors) <= 2 {
+				ha.cg2.emptyTiny++
+			}
+		} else {
+			ha.cg2.feas++
+			ha.cg2.realNodes += iso.RealNodes
+			ha.cg2.edgeExact += iso.EdgeExact
+			ha.cg2.edgeWrong += iso.EdgeWrong
+			ha.cg2.totWrong += iso.EdgeWrong
+			if iso.EdgeWrong == 0 {
+				ha.cg2.clean++
+			}
+		}
+		if a := ha.cg2; a.nt%10000 == 0 {
+			ex, pe := 100.0, 100.0
+			if a.feas > 0 {
+				ex = 100 * float64(a.clean) / float64(a.feas)
+			}
+			if a.realNodes > 0 {
+				pe = 100 * float64(a.edgeExact) / float64(a.realNodes)
+			}
+			fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds feasible=%d empty=%d exclEmpty=%.2f%% reconnect-exact=%.3f%%\n",
 				a.nt, int(time.Since(ha.prog.start).Seconds()), a.feas, a.empty, ex, pe)
 		}
 		ha.mu.Unlock()

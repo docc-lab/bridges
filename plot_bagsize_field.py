@@ -133,6 +133,12 @@ def main() -> None:
     parser.add_argument("--ylabel", default=None, help="Override the y-axis label (default: per-field label).")
     parser.add_argument("--figw", type=float, default=11.0, help="Figure width (inches).")
     parser.add_argument("--figh", type=float, default=6.0, help="Figure height (inches).")
+    parser.add_argument("--no-line", action="store_true", help="Draw median markers + error bars only, no connecting line (the midpoints are not a trend).")
+    parser.add_argument("--marker-size", type=float, default=None, help="Marker size for the median points.")
+    parser.add_argument("--short-labels", action="store_true", help="Abbreviate legend labels: Path->P, Call Graph Preserving->CG, Structural->S.")
+    parser.add_argument("--cloud-size", type=float, default=14.0, help="Scatter point size (s) for the cloud.")
+    parser.add_argument("--err-lw", type=float, default=2.2, help="Error-bar line width (and cap thickness).")
+    parser.add_argument("--capsize", type=float, default=5.0, help="Error-bar cap size.")
     args = parser.parse_args()
 
     out_dir = Path(args.data_dir)
@@ -156,6 +162,9 @@ def main() -> None:
             raise SystemExit(f"Unknown bridge mode '{mode}'. Known: {sorted(BRIDGE_META.keys())}")
 
         label, color, marker = BRIDGE_META[mode]
+        if args.short_labels:
+            label = {"pb": "P", "pcrb": "P", "cgpb": "CG", "cgprb": "CG",
+                     "structural": "S", "sbridge": "S", "sb": "S"}.get(mode, label)
 
         medians: List[float] = []
         iqr_lows: List[float] = []   # Q1
@@ -180,7 +189,7 @@ def main() -> None:
                 cloud_values = values
 
             x_jittered = (cpd + x_offset) + rng.uniform(-args.jitter, args.jitter, size=len(cloud_values))
-            ax.scatter(x_jittered, cloud_values, s=14, alpha=args.scatter_alpha, color=color, marker=marker)
+            ax.scatter(x_jittered, cloud_values, s=args.cloud_size, alpha=args.scatter_alpha, color=color, marker=marker)
 
             median = float(np.median(values))
             q1 = float(np.quantile(values, 0.25))
@@ -201,8 +210,12 @@ def main() -> None:
             yerr=[lower_err, upper_err],
             color=color,
             marker=marker,
-            linewidth=2.2,
-            capsize=5,
+            markersize=args.marker_size,
+            linestyle="none" if args.no_line else "-",
+            linewidth=args.err_lw,
+            elinewidth=args.err_lw,
+            capsize=args.capsize,
+            capthick=args.err_lw,
             label=label,
         )
 
@@ -221,7 +234,8 @@ def main() -> None:
         ax.set_ylim(top=max_bar_top * (1.0 + args.ymax_iqr_pct / 100.0))
     ax.set_xticks(cpds)
     ax.grid(True, alpha=0.28)
-    ax.legend(loc=args.legend_loc, fontsize=args.legend_fs)
+    ax.legend(loc=args.legend_loc, fontsize=args.legend_fs, handletextpad=0.4,
+              labelspacing=0.25, handlelength=1.0, borderpad=0.4, borderaxespad=0.5)
     plt.tight_layout()
     plt.savefig(args.out, dpi=300, bbox_inches="tight")
     plt.close()

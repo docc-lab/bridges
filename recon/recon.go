@@ -156,6 +156,15 @@ type Config struct {
 	// confirms it MAY route through it (soft, scored by the MAP objective).
 	CGRP bool
 
+	// NoFanout turns the from-scratch reconstructor (ReconstructCGP2) into the
+	// path-bridge reconstructor (pb2): it ignores HA evidence entirely, so no
+	// dropped fan-outs are recovered and the fan-out >=2 corroboration constraint
+	// disappears. Everything else is unchanged — multi-bloom admissibility,
+	// named-parent coalescing, orphan borrowing, and full explicit synthetic
+	// emit — matching PB's contract: reconnect each fragment to its deepest
+	// surviving ancestor, don't require fan-out/topology correctness.
+	NoFanout bool
+
 	// BottomUp processes orphans deepest-first and lets shallower orphans
 	// discover descendant carriers by walking across already-reconstructed
 	// bridges (verified by bloom containment) before falling back to the

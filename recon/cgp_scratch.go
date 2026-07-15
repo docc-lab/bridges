@@ -144,7 +144,14 @@ func cgpParse(survivors []Span, cfg Config) *cgpSkeleton {
 	// if M itself is dropped (a recovered fan-out); a surviving M is just a real
 	// node. Witness = shallowest carrier of the entry (closest to M), the
 	// concrete descendant whose existence vouches for M.
+	//
+	// pb2 (NoFanout): skip this entirely. With sk.fanouts empty, the whole fan-out
+	// machinery downstream (candidates, the >=2 constraint, fan-out naming in emit)
+	// is inert, leaving exactly the path-bridge reconstruction.
 	for i := range survivors {
+		if cfg.NoFanout {
+			break
+		}
 		s := &survivors[i]
 		for _, e := range s.HA {
 			if _, ok := sk.byID[e.ParentID]; ok {
@@ -478,6 +485,9 @@ func cgpGenCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
 		// same-depth cousin whose lineage diverges above it.
 		for d := hi - 2; d > lo; d-- {
 			for _, s := range survByDepth[d] {
+				if s.LeafCarrier {
+					continue // a provable leaf can never be an ancestor (mirrors pcrb/pcrs)
+				}
 				k := bridge.HexOf(s.SpanID)
 				if !confirmedByAll(k[:], d) {
 					continue
@@ -1498,4 +1508,53 @@ func ReconstructCGP2(survivors []Span, cfg Config) Result {
 		cgpDiagOptions(opts)
 	}
 	return cgpSolveAndEmit(sk, fr, opts, cfg)
+}
+
+// ReconstructPB2 is the from-scratch PATH-bridge reconstructor: the cgp2
+// pipeline with HA evidence switched off (Config.NoFanout). It reconnects each
+// fragment to its deepest bloom-admissible surviving ancestor via the same
+// CP-SAT solve and emits the same full explicit synthetic tree; it simply never
+// recovers fan-outs and never imposes the >=2 corroboration constraint. Score
+// it with ScorePB2Path (path/ancestor correctness), not the topology scorers.
+func ReconstructPB2(survivors []Span, cfg Config) Result {
+	cfg.NoFanout = true
+	return ReconstructCGP2(survivors, cfg)
+}
+
+// ScorePB2Path grades a reconstruction by PATH correctness only: each emitted
+// bridge (fragment root -> chosen surviving anchor) is correct iff the anchor is
+// the fragment root's TRUE nearest surviving ancestor. Fan-out arity and the
+// synthetic chain between them are NOT graded — that is exactly what pb2 gives
+// up relative to cgp2. Returned in CGP2Iso shape so the harness tally/reporting
+// is shared: RealNodes = bridges scored, EdgeExact = correct reconnections,
+// EdgeWrong = wrong. A trace is "clean" (exclEmpty-correct) iff EdgeWrong == 0.
+func ScorePB2Path(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
+	var iso CGP2Iso
+	if len(res.Bridges) == 0 {
+		return iso
+	}
+	tparent := make(map[uint64]uint64, len(truth))
+	for _, t := range truth {
+		tparent[t.SpanID] = t.ParentID
+	}
+	isDropped := func(id uint64) bool { _, d := dropped[id]; return d }
+	// True nearest surviving ancestor of a span: walk up the truth tree past
+	// dropped ancestors to the first survivor (0 if none survives up to the root).
+	trueAnchor := func(id uint64) uint64 {
+		for p := tparent[id]; p != 0; p = tparent[p] {
+			if !isDropped(p) {
+				return p
+			}
+		}
+		return 0
+	}
+	for _, b := range res.Bridges {
+		iso.RealNodes++
+		if b.AnchorID == trueAnchor(b.OrphanID) {
+			iso.EdgeExact++
+		} else {
+			iso.EdgeWrong++
+		}
+	}
+	return iso
 }

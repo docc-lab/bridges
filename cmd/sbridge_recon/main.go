@@ -50,7 +50,7 @@ func main() {
 	var nTraces, nUnsolvable, nSevAmbig, nWrong, nCorrect int
 	var sumEmit, sumSurv, sumIdent, sumSevPlaced, sumSevNoPlace, sumReal int
 	var nStruct, nAccepted, nEventOK, nCPOK, nDeeAmbig int // Phase-2 (event structure) tally
-	var topoNanos, structNanos []int64                    // per-trace recon times (with --timing)
+	var topoNanos, structNanos, structAll []int64         // per-trace recon times (--timing); structAll aligned to topoNanos (0 when structure phase skipped)
 	var sumParents, sumEndOK int                          // per-parent end-order recovery (accepted traces only)
 	t0 := time.Now()
 	process := func(i int, tr corpus.StoredTrace) {
@@ -79,9 +79,8 @@ func main() {
 
 		tRec := time.Now()
 		res := recon.ReconstructSBridge(inputs, survivors, recon.Config{CPD: *cpd, FPBits: *fpBits, NoOrdinal: *noOrdinal, PrefixLen: *prefixLen})
-		if *timing != "" {
-			topoNanos = append(topoNanos, time.Since(tRec).Nanoseconds())
-		}
+		topoNs := time.Since(tRec).Nanoseconds()
+		var structNs int64 // structure (ordering) phase recon time; stays 0 if the phase is skipped for this trace
 		v := recon.ScoreSBridgeUnderDrop(res, truth)
 		nTraces++
 		sumIdent += res.Identified
@@ -110,8 +109,9 @@ func main() {
 			}
 			tStruct := time.Now()
 			sr := recon.ScoreStructure(res, truth, endPos, dees)
+			structNs = time.Since(tStruct).Nanoseconds()
 			if *timing != "" {
-				structNanos = append(structNanos, time.Since(tStruct).Nanoseconds())
+				structNanos = append(structNanos, structNs)
 			}
 			nStruct++
 			if sr.DEEAmbiguous {
@@ -127,6 +127,11 @@ func main() {
 					nCPOK++
 				}
 			}
+		}
+
+		if *timing != "" { // one aligned per-trace record: topology + structure phase
+			topoNanos = append(topoNanos, topoNs)
+			structAll = append(structAll, structNs)
 		}
 
 		if *progress > 0 && (i+1)%*progress == 0 {
@@ -200,7 +205,12 @@ func main() {
 	if *timing != "" {
 		timingSummary("topology", topoNanos)
 		timingSummary("structure", structNanos)
-		if err := writeTimingCSV(*timing, topoNanos); err != nil {
+		total := make([]int64, len(topoNanos))
+		for i := range topoNanos {
+			total[i] = topoNanos[i] + structAll[i]
+		}
+		timingSummary("total", total)
+		if err := writeTimingCSV(*timing, topoNanos, structAll); err != nil {
 			fmt.Fprintf(os.Stderr, "timing csv: %v\n", err)
 		}
 	}
@@ -226,16 +236,20 @@ func timingSummary(label string, ns []int64) {
 }
 
 // writeTimingCSV writes one recon_ns per line (for offline distribution compare).
-func writeTimingCSV(path string, ns []int64) error {
+func writeTimingCSV(path string, topo, str []int64) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	w := bufio.NewWriter(f)
-	fmt.Fprintln(w, "recon_ns")
-	for _, v := range ns {
-		fmt.Fprintln(w, v)
+	fmt.Fprintln(w, "topo_ns,struct_ns")
+	for i := range topo {
+		var s int64
+		if i < len(str) {
+			s = str[i]
+		}
+		fmt.Fprintf(w, "%d,%d\n", topo[i], s)
 	}
 	return w.Flush()
 }

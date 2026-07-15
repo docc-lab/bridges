@@ -51,6 +51,7 @@ type config struct {
 	timingPath         string // non-empty: write per-trace reconstruction timing CSV here
 	checkpointDistance int
 	dropRate           float64
+	dropRates          string // comma list: one decode, all these rates reconstructed per pass (cgp2/pb2)
 	seed               int64
 	traceCount         int
 	requireClean       bool
@@ -94,6 +95,7 @@ func parseFlags() config {
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides)")
 	flag.Float64Var(&c.dropRate, "drop-rate", 1.0, "Probability of dropping each non-checkpoint span (1.0 = drop all)")
+	flag.StringVar(&c.dropRates, "drop-rates", "", "Comma-separated drop rates run on ONE decoded trace per pass (amortizes the corpus stream/emit across rates). cgp2/pb2 only; drops are per-trace-seeded (bit-identical to separate --drop-rate runs). --timing must contain {dc} (replaced per rate, e.g. d05).")
 	order := ""
 	flag.StringVar(&order, "order", "bottom-up", "Orphan processing order: bottom-up (deepest-first, default) or independent")
 	consistency := ""
@@ -258,6 +260,16 @@ type harness struct {
 	timingPath string
 	timingRecs []traceTiming
 
+	// Multi-drop: decode each trace ONCE, then reconstruct+score it under every
+	// one of these drop rates in the same pass (cgp2/pb2 only). Empty => the
+	// legacy single --drop-rate path. Per-rate accumulators + timing, guarded by
+	// mu. Drops are per-trace-seeded so each rate is bit-identical to a separate
+	// --drop-rate run.
+	mdRates  []float64
+	mdDC     []string        // drop code per rate ("d05", "d10", ...), for CSV names + labels
+	mdAcc    []cgp2acc       // per-rate correctness accumulator
+	mdTiming [][]traceTiming // per-rate per-trace timing (if timingOn)
+
 	// Per-trace reconstruction is embarrassingly parallel (no cross-trace
 	// state in pb/pcr/pcrb/pcrs). Drop decisions are made SERIALLY at
 	// dispatch (preserving the global RNG sequence, hence bit-identical
@@ -303,9 +315,10 @@ type harness struct {
 }
 
 type finishJob struct {
-	tid     uint64
-	spans   []collSpan
-	dropped map[uint64]struct{}
+	tid          uint64
+	spans        []collSpan
+	dropped      map[uint64]struct{}   // single-drop path
+	droppedMulti []map[uint64]struct{} // multi-drop path: one set per ha.mdRates
 }
 
 // cgp2acc accumulates the inline cgp2 per-trace scores (mirrors cmd/cgp2_replay).
@@ -421,6 +434,27 @@ func newHarness(c config) *harness {
 	ha.fullsatEngine = c.fullsatEngine
 	ha.timingPath = c.timingPath
 	ha.timingOn = c.timingPath != "" || os.Getenv("TRACE_RECON_TIMING") == "1"
+	if c.dropRates != "" {
+		if c.mode != "cgp2" && c.mode != "pb2" {
+			fmt.Fprintln(os.Stderr, "--drop-rates supports only --mode cgp2 or pb2")
+			os.Exit(2)
+		}
+		for _, tok := range strings.Split(c.dropRates, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			r, err := strconv.ParseFloat(tok, 64)
+			if err != nil || r <= 0 || r > 1 {
+				fmt.Fprintf(os.Stderr, "--drop-rates: bad rate %q\n", tok)
+				os.Exit(2)
+			}
+			ha.mdRates = append(ha.mdRates, r)
+			ha.mdDC = append(ha.mdDC, dropCode(r))
+		}
+		ha.mdAcc = make([]cgp2acc, len(ha.mdRates))
+		ha.mdTiming = make([][]traceTiming, len(ha.mdRates))
+	}
 	ha.prog.start = time.Now()
 	if c.scoreAudit {
 		ha.audit = newAuditStats()
@@ -533,7 +567,6 @@ func (ha *harness) drain() {
 			ha.topoSingleBP, ha.topoSingleMis)
 	}
 	if ha.mode == "cgp2" || ha.mode == "pb2" {
-		a := ha.cg2
 		label := "CGP2"
 		if ha.mode == "pb2" {
 			label = "PB2"
@@ -544,22 +577,31 @@ func (ha *harness) drain() {
 			}
 			return 100 * float64(x) / float64(y)
 		}
-		wt := 0.0
-		if a.feas > 0 {
-			wt = float64(a.totWrong) / float64(a.feas)
+		emit := func(tag string, a cgp2acc) {
+			wt := 0.0
+			if a.feas > 0 {
+				wt = float64(a.totWrong) / float64(a.feas)
+			}
+			fmt.Fprintf(os.Stderr, "%s%s traces=%d feasible=%d empty=%d | correct=%.2f%% (clean=%d) | correctExclEmpty=%.2f%% | correctCreditEmpty=%.2f%%\n",
+				label, tag, a.nt, a.feas, a.empty, pct(a.clean, a.nt), a.clean, pct(a.clean, a.feas), pct(a.clean+a.empty, a.nt))
+			if a.empty > 0 {
+				fmt.Fprintf(os.Stderr, "%s%s empties: n=%d avgSurv=%.1f noDrop(trivial)=%d tiny(<=2 surv)=%d\n",
+					label, tag, a.empty, float64(a.emptySurvSum)/float64(a.empty), a.emptyNoDrop, a.emptyTiny)
+			}
+			if ha.mode == "cgp2" {
+				fmt.Fprintf(os.Stderr, "%s%s per-edge: exact=%.3f%% (%d/%d) wrong/trace=%.2f | survivor edges=%.3f%% | named-syn=%.2f%%\n",
+					label, tag, pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt, pct(a.survEx, a.survN), pct(a.namedEx, a.named))
+			} else {
+				fmt.Fprintf(os.Stderr, "%s%s per-fragment: reconnect-exact=%.3f%% (%d/%d) wrong/trace=%.2f\n",
+					label, tag, pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt)
+			}
 		}
-		fmt.Fprintf(os.Stderr, "%s traces=%d feasible=%d empty=%d | correct=%.2f%% (clean=%d) | correctExclEmpty=%.2f%% | correctCreditEmpty=%.2f%%\n",
-			label, a.nt, a.feas, a.empty, pct(a.clean, a.nt), a.clean, pct(a.clean, a.feas), pct(a.clean+a.empty, a.nt))
-		if a.empty > 0 {
-			fmt.Fprintf(os.Stderr, "%s empties: n=%d avgSurv=%.1f noDrop(trivial)=%d tiny(<=2 surv)=%d\n",
-				label, a.empty, float64(a.emptySurvSum)/float64(a.empty), a.emptyNoDrop, a.emptyTiny)
-		}
-		if ha.mode == "cgp2" {
-			fmt.Fprintf(os.Stderr, "CGP2 per-edge: exact=%.3f%% (%d/%d) wrong/trace=%.2f | survivor edges=%.3f%% | named-syn=%.2f%%\n",
-				pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt, pct(a.survEx, a.survN), pct(a.namedEx, a.named))
+		if len(ha.mdRates) > 0 {
+			for r := range ha.mdRates {
+				emit("["+ha.mdDC[r]+"]", ha.mdAcc[r])
+			}
 		} else {
-			fmt.Fprintf(os.Stderr, "PB2 per-fragment: reconnect-exact=%.3f%% (%d/%d) wrong/trace=%.2f\n",
-				pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt)
+			emit("", ha.cg2)
 		}
 	}
 }
@@ -658,6 +700,54 @@ func (ha *harness) computeDropped(tid uint64, spans []collSpan) map[uint64]struc
 	return dropped
 }
 
+// computeDroppedMulti returns one drop set per ha.mdRates, from a SINGLE
+// per-span uniform draw thresholded at each rate. This is bit-identical to
+// running each rate as a separate --per-trace-drop-seed --drop-rate job (same
+// seed, same spanID order, same draws), and the sets are nested. Rate 1.0
+// thresholds every candidate (Float64 in [0,1) < 1.0 always), matching dropAll.
+func (ha *harness) computeDroppedMulti(tid uint64, spans []collSpan) []map[uint64]struct{} {
+	out := make([]map[uint64]struct{}, len(ha.mdRates))
+	for i := range out {
+		out[i] = make(map[uint64]struct{})
+	}
+	cands := make([]uint64, 0, len(spans))
+	for _, s := range spans {
+		if s.br == nil {
+			cands = append(cands, s.spanID)
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
+	rng := rand.New(rand.NewSource(mixSeed(tid, ha.seed)))
+	for _, id := range cands {
+		u := rng.Float64()
+		for r, rate := range ha.mdRates {
+			if u < rate {
+				out[r][id] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+// dropCode maps a drop rate to the sweep's file/label code (d005, d05, d10 ...).
+func dropCode(r float64) string {
+	switch r {
+	case 0.05:
+		return "d005"
+	case 0.25:
+		return "d025"
+	case 0.5:
+		return "d05"
+	case 0.75:
+		return "d075"
+	case 0.95:
+		return "d095"
+	case 1.0:
+		return "d10"
+	}
+	return "d" + strings.ReplaceAll(strconv.FormatFloat(r, 'f', -1, 64), ".", "")
+}
+
 // finishTrace frees the trace's collection state, makes the drop decisions, and
 // hands reconstruction+scoring to the worker pool. Drops are bit-identical
 // regardless of worker count; with --per-trace-drop-seed they are also identical
@@ -672,6 +762,14 @@ func (ha *harness) finishTrace(tid uint64) {
 
 	// Drop policy: only non-checkpoint spans (no _br) are candidates;
 	// _br carriers ride the high-priority queue and are never dropped.
+	if len(ha.mdRates) > 0 {
+		dm := ha.computeDroppedMulti(tid, spans)
+		if ha.only != nil && !ha.only[tid] {
+			return
+		}
+		ha.jobs <- finishJob{tid: tid, spans: spans, droppedMulti: dm}
+		return
+	}
 	dropped := ha.computeDropped(tid, spans)
 	// --only-traces: the drop loop above still ran (RNG advanced identically),
 	// so survivors match a full run; we just skip the expensive reconstruct for
@@ -702,54 +800,17 @@ func (ha *harness) process(j finishJob) {
 		truth[i] = recon.TruthSpan{SpanID: s.spanID, ParentID: s.parentID, Depth: s.depth}
 	}
 
+	if len(ha.mdRates) > 0 {
+		ha.processMulti(j, truth) // decode once, reconstruct under every rate
+		return
+	}
+
 	survivors := make([]recon.Span, 0, len(spans)-len(dropped))
 	for _, s := range spans {
 		if _, gone := dropped[s.spanID]; gone {
 			continue
 		}
-		sp := recon.Span{SpanID: s.spanID, ParentID: s.parentID, Depth: s.depth}
-		if s.br != nil {
-			if ha.mode == "pcr" {
-				d, prefix, err := recon.DecodePCRPayload(s.br, ha.cfg)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
-					os.Exit(1)
-				}
-				sp.Depth = d
-				sp.CkptPrefix = prefix
-				sp.LeafCarrier = d%ha.cpd != 0
-			} else if (ha.mode == "pcrb" || ha.mode == "pcrs") && !ha.cfg.CGRP {
-				d, prefix, bits, err := recon.DecodePCRBPayload(s.br, ha.cfg)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
-					os.Exit(1)
-				}
-				sp.Depth = d
-				sp.CkptPrefix = prefix
-				sp.BloomBits = bits
-				sp.LeafCarrier = d%ha.cpd != 0
-			} else if ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "pb2" || ha.cfg.CGRP {
-				d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
-					os.Exit(1)
-				}
-				sp.Depth = d
-				sp.CkptPrefix = prefix
-				sp.BloomBits = bits
-				sp.LeafCarrier = d%ha.cpd != 0
-				sp.HA = haEntries
-			} else {
-				d, bits, err := recon.DecodePBPayload(s.br, ha.cfg)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
-					os.Exit(1)
-				}
-				sp.Depth = d
-				sp.BloomBits = bits
-			}
-		}
-		survivors = append(survivors, sp)
+		survivors = append(survivors, ha.decodeSpan(tid, s))
 	}
 
 	if ha.dumpW != nil {
@@ -934,6 +995,145 @@ func (ha *harness) process(j finishJob) {
 		res := recon.ReconstructPB(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))
 	}
+}
+
+// decodeSpan turns one collected span into a recon.Span, decoding its carried
+// payload per mode. Drop-independent, so multi-drop decodes each span once and
+// reuses it across every rate.
+func (ha *harness) decodeSpan(tid uint64, s collSpan) recon.Span {
+	sp := recon.Span{SpanID: s.spanID, ParentID: s.parentID, Depth: s.depth}
+	if s.br == nil {
+		return sp
+	}
+	die := func(err error) {
+		fmt.Fprintf(os.Stderr, "trace %016x span %016x: %v\n", tid, s.spanID, err)
+		os.Exit(1)
+	}
+	switch {
+	case ha.mode == "pcr":
+		d, prefix, err := recon.DecodePCRPayload(s.br, ha.cfg)
+		if err != nil {
+			die(err)
+		}
+		sp.Depth = d
+		sp.CkptPrefix = prefix
+		sp.LeafCarrier = d%ha.cpd != 0
+	case (ha.mode == "pcrb" || ha.mode == "pcrs") && !ha.cfg.CGRP:
+		d, prefix, bits, err := recon.DecodePCRBPayload(s.br, ha.cfg)
+		if err != nil {
+			die(err)
+		}
+		sp.Depth = d
+		sp.CkptPrefix = prefix
+		sp.BloomBits = bits
+		sp.LeafCarrier = d%ha.cpd != 0
+	case ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "pb2" || ha.cfg.CGRP:
+		d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
+		if err != nil {
+			die(err)
+		}
+		sp.Depth = d
+		sp.CkptPrefix = prefix
+		sp.BloomBits = bits
+		sp.LeafCarrier = d%ha.cpd != 0
+		sp.HA = haEntries
+	default:
+		d, bits, err := recon.DecodePBPayload(s.br, ha.cfg)
+		if err != nil {
+			die(err)
+		}
+		sp.Depth = d
+		sp.BloomBits = bits
+	}
+	return sp
+}
+
+// processMulti reconstructs one already-decoded trace under every ha.mdRates
+// drop rate (cgp2 or pb2 per ha.mode), accumulating into the per-rate cells.
+// Reconstruction runs off-lock; only the additive tally is mutex-guarded.
+func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
+	tid, spans := j.tid, j.spans
+	decoded := make([]recon.Span, len(spans))
+	for i, s := range spans {
+		decoded[i] = ha.decodeSpan(tid, s)
+	}
+	type cell struct {
+		empty         bool
+		iso           recon.CGP2Iso
+		nsurv, ndrop  int
+		ns            int64
+	}
+	cells := make([]cell, len(ha.mdRates))
+	for r := range ha.mdRates {
+		dropped := j.droppedMulti[r]
+		survivors := make([]recon.Span, 0, len(spans))
+		for i, s := range spans {
+			if _, gone := dropped[s.spanID]; gone {
+				continue
+			}
+			survivors = append(survivors, decoded[i])
+		}
+		t0 := time.Now()
+		var res recon.Result
+		if ha.mode == "pb2" {
+			res = recon.ReconstructPB2(survivors, ha.cfg)
+		} else {
+			res = recon.ReconstructCGP2(survivors, ha.cfg)
+		}
+		ns := time.Since(t0).Nanoseconds()
+		empty := len(res.ReconParent) == 0
+		var iso recon.CGP2Iso
+		if !empty {
+			if ha.mode == "pb2" {
+				iso = recon.ScorePB2Path(res, truth, dropped)
+			} else {
+				iso = recon.ScoreCGP2Iso(res, truth, dropped)
+			}
+		}
+		cells[r] = cell{empty, iso, len(survivors), len(dropped), ns}
+	}
+	ha.mu.Lock()
+	for r := range cells {
+		c := cells[r]
+		a := &ha.mdAcc[r]
+		a.nt++
+		if c.empty {
+			a.empty++
+			a.emptySurvSum += c.nsurv
+			if c.ndrop == 0 {
+				a.emptyNoDrop++
+			}
+			if c.nsurv <= 2 {
+				a.emptyTiny++
+			}
+		} else {
+			a.feas++
+			a.realNodes += c.iso.RealNodes
+			a.edgeExact += c.iso.EdgeExact
+			a.edgeWrong += c.iso.EdgeWrong
+			a.totWrong += c.iso.EdgeWrong
+			if c.iso.EdgeWrong == 0 {
+				a.clean++
+			}
+		}
+		if ha.timingOn {
+			ha.mdTiming[r] = append(ha.mdTiming[r], traceTiming{tid, c.nsurv, len(truth), c.ndrop, !c.empty, c.ns})
+		}
+	}
+	if ha.mdAcc[0].nt%10000 == 0 {
+		var b strings.Builder
+		fmt.Fprintf(&b, "PROGRESS traces=%d elapsed=%ds |", ha.mdAcc[0].nt, int(time.Since(ha.prog.start).Seconds()))
+		for r := range ha.mdRates {
+			a := ha.mdAcc[r]
+			ex := 100.0
+			if a.feas > 0 {
+				ex = 100 * float64(a.clean) / float64(a.feas)
+			}
+			fmt.Fprintf(&b, " %s:excl=%.2f%%", ha.mdDC[r], ex)
+		}
+		fmt.Fprintln(os.Stderr, b.String())
+	}
+	ha.mu.Unlock()
 }
 
 // traceTiming is one trace's reconstruction wall-time and size, for --timing.
@@ -1319,7 +1519,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "orphans_placed=%d orphan_open_ends_pending=%d\n",
 			agg.OrphansPlaced, agg.OrphanOpenEnds)
 	}
-	if ha.timingOn && len(ha.timingRecs) > 0 {
+	if len(ha.mdRates) > 0 {
+		if ha.timingOn {
+			reportTimingMulti(ha, c.timingPath)
+		}
+	} else if ha.timingOn && len(ha.timingRecs) > 0 {
 		reportTiming(ha, c.timingPath)
 	}
 	fmt.Fprintf(os.Stderr, "Wrote %d traces to %s\n", len(traceOrder), c.outputPath)
@@ -1328,12 +1532,17 @@ func main() {
 // reportTiming prints a per-trace reconstruction-time summary (percentiles in
 // microseconds) and, if path != "", writes the full per-trace CSV.
 func reportTiming(ha *harness, path string) {
-	recs := ha.timingRecs
+	reportTimingRecs(ha.timingRecs, "", path)
+}
+
+// reportTimingRecs prints a per-trace reconstruction-time summary (percentiles
+// in ms, tag-prefixed) and, if path != "", writes the full per-trace CSV.
+func reportTimingRecs(recs []traceTiming, tag, path string) {
 	// Summarize two subsets: all recorded traces, and the feasible (exclEmpty)
 	// subset — the traces that actually reconstructed something.
 	summ := func(label string, ns []int64) {
 		if len(ns) == 0 {
-			fmt.Fprintf(os.Stderr, "TIMING[%s] traces=0\n", label)
+			fmt.Fprintf(os.Stderr, "TIMING[%s%s] traces=0\n", tag, label)
 			return
 		}
 		sort.Slice(ns, func(i, j int) bool { return ns[i] < ns[j] })
@@ -1343,8 +1552,8 @@ func reportTiming(ha *harness, path string) {
 		}
 		ms := func(v int64) float64 { return float64(v) / 1e6 }
 		pctl := func(p float64) int64 { return ns[int(p*float64(len(ns)-1))] }
-		fmt.Fprintf(os.Stderr, "TIMING[%s] traces=%d recon_total=%s mean=%.3fms p50=%.3f p90=%.3f p99=%.3f max=%.3f (ms)\n",
-			label, len(ns), time.Duration(total).Round(time.Millisecond),
+		fmt.Fprintf(os.Stderr, "TIMING[%s%s] traces=%d recon_total=%s mean=%.3fms p50=%.3f p90=%.3f p99=%.3f max=%.3f (ms)\n",
+			tag, label, len(ns), time.Duration(total).Round(time.Millisecond),
 			ms(total/int64(len(ns))), ms(pctl(0.50)), ms(pctl(0.90)), ms(pctl(0.99)), ms(ns[len(ns)-1]))
 	}
 	all := make([]int64, 0, len(recs))
@@ -1375,6 +1584,24 @@ func reportTiming(ha *harness, path string) {
 			fb = 1
 		}
 		fmt.Fprintf(w, "%016x,%d,%d,%d,%d,%d\n", r.tid, r.nsurv, r.nspan, r.ndrop, fb, r.ns)
+	}
+}
+
+// reportTimingMulti writes one summary + per-trace CSV per drop rate. The path
+// template should contain {dc}; it is replaced by each rate's drop code (else
+// the code is appended).
+func reportTimingMulti(ha *harness, tmpl string) {
+	for r := range ha.mdRates {
+		dc := ha.mdDC[r]
+		p := ""
+		if tmpl != "" {
+			if strings.Contains(tmpl, "{dc}") {
+				p = strings.ReplaceAll(tmpl, "{dc}", dc)
+			} else {
+				p = tmpl + "_" + dc
+			}
+		}
+		reportTimingRecs(ha.mdTiming[r], dc+" ", p)
 	}
 }
 
@@ -1650,6 +1877,14 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 	buf := make(map[int]prepped)
 	next := 0
 	dispatch := func(p prepped) {
+		if len(ha.mdRates) > 0 {
+			dm := ha.computeDroppedMulti(p.tid, p.spans)
+			if ha.only != nil && !ha.only[p.tid] {
+				return
+			}
+			ha.jobs <- finishJob{tid: p.tid, spans: p.spans, droppedMulti: dm}
+			return
+		}
 		dropped := ha.computeDropped(p.tid, p.spans)
 		// --only-traces: RNG already advanced above; skip the (expensive)
 		// reconstruction for non-target traces, mirroring finishTrace.

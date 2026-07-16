@@ -9,7 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-SC = "/tmp/claude-36637/-users-tomislav/9c554978-de8c-42cf-bd6a-bbbe3b07797f/scratchpad"
+SC = os.environ.get("ERR_SC", "/tmp/claude-36637/-users-tomislav/9c554978-de8c-42cf-bd6a-bbbe3b07797f/scratchpad")
 RATES = ["0.05", "0.25", "0.5", "0.75", "0.95", "1.0"]
 CPDS = [3, 4, 5, 6, 7, 8]
 SUFFIX = {"0.05": "_d005", "0.25": "_d025", "0.5": "_d05", "0.75": "_d075", "0.95": "_d095", "1.0": "_d10"}
@@ -25,6 +25,8 @@ ap = argparse.ArgumentParser(description="cgp2 reconstruction-error (FP-rate) ba
 ap.add_argument("--xlabel", default=None, help="x-axis label text (omit for no label)")
 ap.add_argument("--ylabel", default=None, help="y-axis label text (omit for no label)")
 args = ap.parse_args()
+OUTPRE = os.environ.get("ERR_OUTPRE", "/users/tomislav/cgp2")  # output path prefix
+OUTSUF = os.environ.get("ERR_OUTSUF", "")                      # suffix before extension
 
 def _drop_ok(mode, drop):
     for day in ("day1", "day2"):
@@ -92,6 +94,6 @@ def plot_bydrop(mode, outfile, ymax):
 
 for ext in ("pdf", "png"):
     ymax = _ymax()
-    plot_bydrop("up", f"/users/tomislav/cgp2_err_primeup_bydrop.{ext}", ymax)
-    plot_bydrop("down", f"/users/tomislav/cgp2_err_primedown_bydrop.{ext}", ymax)
-    plot_bydrop("none", f"/users/tomislav/cgp2_err_noprime_bydrop.{ext}", ymax)
+    plot_bydrop("up", f"{OUTPRE}_err_primeup_bydrop{OUTSUF}.{ext}", ymax)
+    plot_bydrop("down", f"{OUTPRE}_err_primedown_bydrop{OUTSUF}.{ext}", ymax)
+    plot_bydrop("none", f"{OUTPRE}_err_noprime_bydrop{OUTSUF}.{ext}", ymax)

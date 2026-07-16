@@ -10,7 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
-TD = "/mydata/uber/bignode_state/cgp2_timing"
+TD = os.environ.get("VIOLIN_TD", "/mydata/uber/bignode_state/cgp2_timing")
 DROPS = [("0.05", "d005"), ("0.25", "d025"), ("0.5", "d05"), ("0.75", "d075"), ("0.95", "d095"), ("1.0", "d10")]
 CPDS = [3, 4, 5, 6, 7, 8]
 # cpd is ORDINAL (3..8), so a perceptually-uniform sequential map (viridis) is

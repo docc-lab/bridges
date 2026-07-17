@@ -125,7 +125,7 @@ func parseFlags() config {
 	flag.Parse()
 	bloom.PrimeM = primeM // set before any handler/config sizing (emit + recon must match)
 	bloom.PrimeMByteCap = primeMByteCap
-	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" && c.mode != "pb2" {
+	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" && c.mode != "pb2" && c.mode != "cgp1" && c.mode != "pb1" {
 		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, pcrs, or cgprb (got %q)\n", c.mode)
 		os.Exit(2)
 	}
@@ -378,7 +378,7 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		ph.Capture = true
 		return ph, pcrbCfg
-	case "cgprb", "cgp2", "pb2":
+	case "cgprb", "cgp2", "pb2", "cgp1", "pb1":
 		// Call-graph-preserving: PCRB payload + window-local hash array. Same
 		// checkpoint-root + bloom geometry as PCRB, so it shares the PCRB
 		// config; reconstruction additionally consumes the HA. cgp2 reconstructs
@@ -435,8 +435,8 @@ func newHarness(c config) *harness {
 	ha.timingPath = c.timingPath
 	ha.timingOn = c.timingPath != "" || os.Getenv("TRACE_RECON_TIMING") == "1"
 	if c.dropRates != "" {
-		if c.mode != "cgp2" && c.mode != "pb2" {
-			fmt.Fprintln(os.Stderr, "--drop-rates supports only --mode cgp2 or pb2")
+		if !cg2Family(c.mode) {
+			fmt.Fprintln(os.Stderr, "--drop-rates supports only --mode cgp2/pb2/cgp1/pb1")
 			os.Exit(2)
 		}
 		for _, tok := range strings.Split(c.dropRates, ",") {
@@ -566,11 +566,9 @@ func (ha *harness) drain() {
 		fmt.Fprintf(os.Stderr, "STRICT singleton-branchpoint orphans tested=%d misrouted=%d\n",
 			ha.topoSingleBP, ha.topoSingleMis)
 	}
-	if ha.mode == "cgp2" || ha.mode == "pb2" {
-		label := "CGP2"
-		if ha.mode == "pb2" {
-			label = "PB2"
-		}
+	if cg2Family(ha.mode) {
+		label := strings.ToUpper(ha.mode) // CGP2 / PB2 / CGP1 / PB1
+		cgpFamily := ha.mode == "cgp1" || ha.mode == "cgp2"
 		pct := func(x, y int) float64 {
 			if y == 0 {
 				return 0
@@ -588,7 +586,7 @@ func (ha *harness) drain() {
 				fmt.Fprintf(os.Stderr, "%s%s empties: n=%d avgSurv=%.1f noDrop(trivial)=%d tiny(<=2 surv)=%d\n",
 					label, tag, a.empty, float64(a.emptySurvSum)/float64(a.empty), a.emptyNoDrop, a.emptyTiny)
 			}
-			if ha.mode == "cgp2" {
+			if cgpFamily {
 				fmt.Fprintf(os.Stderr, "%s%s per-edge: exact=%.3f%% (%d/%d) wrong/trace=%.2f | survivor edges=%.3f%% | named-syn=%.2f%%\n",
 					label, tag, pct(a.edgeExact, a.realNodes), a.edgeExact, a.realNodes, wt, pct(a.survEx, a.survN), pct(a.namedEx, a.named))
 			} else {
@@ -894,18 +892,18 @@ func (ha *harness) process(j finishJob) {
 		if ha.topoOn {
 			ha.addTopo(recon.ScoreCGPTopology(res, truth, dropped, tid))
 		}
-	} else if ha.mode == "cgp2" {
-		// The from-scratch CGP reconstructor over the same CGPRB payloads, scored
-		// by per-edge isomorphism. Reconstruct+score off the lock (the expensive
-		// part); only the additive tally is mutex-guarded.
+	} else if cg2Family(ha.mode) {
+		// From-scratch reconstructors over the same CGPRB payloads: cgp2/pb2
+		// (solver-based) and cgp1/pb1 (greedy baselines), all scored into the
+		// shared cg2 tally. Reconstruct+score off-lock; only the tally is guarded.
 		t0 := time.Now()
-		res := recon.ReconstructCGP2(survivors, ha.cfg)
+		res := ha.cg2Reconstruct(survivors)
 		d := time.Since(t0)
-		empty := len(res.ReconParent) == 0
+		empty := res.Reconnected == 0 // "did work" = >=1 fragment reconnected (consistent across cgp2/pb2/cgp1/pb1)
 		ha.recRecon(tid, len(survivors), len(truth), len(dropped), !empty, d)
 		var iso recon.CGP2Iso
 		if !empty {
-			iso = recon.ScoreCGP2Iso(res, truth, dropped) // dropped is already map[uint64]struct{}
+			iso = ha.cg2ScoreOf(res, truth, dropped)
 		}
 		ha.mu.Lock()
 		ha.cg2.nt++
@@ -945,56 +943,39 @@ func (ha *harness) process(j finishJob) {
 				a.nt, int(time.Since(ha.prog.start).Seconds()), a.feas, a.empty, ex, pe)
 		}
 		ha.mu.Unlock()
-	} else if ha.mode == "pb2" {
-		// The from-scratch PATH-bridge reconstructor over the same CGPRB payloads
-		// (HA ignored via NoFanout), scored by ancestor/path correctness. Shares the
-		// cg2 tally + reporting: exclEmpty = traces whose every reconnection is right.
-		t0 := time.Now()
-		res := recon.ReconstructPB2(survivors, ha.cfg)
-		d := time.Since(t0)
-		empty := len(res.ReconParent) == 0
-		ha.recRecon(tid, len(survivors), len(truth), len(dropped), !empty, d)
-		var iso recon.CGP2Iso
-		if !empty {
-			iso = recon.ScorePB2Path(res, truth, dropped)
-		}
-		ha.mu.Lock()
-		ha.cg2.nt++
-		if empty {
-			ha.cg2.empty++
-			ha.cg2.emptySurvSum += len(survivors)
-			if len(dropped) == 0 {
-				ha.cg2.emptyNoDrop++
-			}
-			if len(survivors) <= 2 {
-				ha.cg2.emptyTiny++
-			}
-		} else {
-			ha.cg2.feas++
-			ha.cg2.realNodes += iso.RealNodes
-			ha.cg2.edgeExact += iso.EdgeExact
-			ha.cg2.edgeWrong += iso.EdgeWrong
-			ha.cg2.totWrong += iso.EdgeWrong
-			if iso.EdgeWrong == 0 {
-				ha.cg2.clean++
-			}
-		}
-		if a := ha.cg2; a.nt%10000 == 0 {
-			ex, pe := 100.0, 100.0
-			if a.feas > 0 {
-				ex = 100 * float64(a.clean) / float64(a.feas)
-			}
-			if a.realNodes > 0 {
-				pe = 100 * float64(a.edgeExact) / float64(a.realNodes)
-			}
-			fmt.Fprintf(os.Stderr, "PROGRESS traces=%d elapsed=%ds feasible=%d empty=%d exclEmpty=%.2f%% reconnect-exact=%.3f%%\n",
-				a.nt, int(time.Since(ha.prog.start).Seconds()), a.feas, a.empty, ex, pe)
-		}
-		ha.mu.Unlock()
 	} else {
 		res := recon.ReconstructPB(survivors, ha.cfg)
 		ha.scoresStore(tid, recon.ScorePB(res, truth, dropped))
 	}
+}
+
+// cg2Family reports whether the mode uses the shared cgp2-style tally/scoring:
+// the from-scratch reconstructors (cgp2/pb2 solver-based, cgp1/pb1 greedy).
+func cg2Family(mode string) bool {
+	return mode == "cgp2" || mode == "pb2" || mode == "cgp1" || mode == "pb1"
+}
+
+// cg2Reconstruct dispatches to the right from-scratch reconstructor by mode.
+func (ha *harness) cg2Reconstruct(survivors []recon.Span) recon.Result {
+	switch ha.mode {
+	case "pb2":
+		return recon.ReconstructPB2(survivors, ha.cfg)
+	case "cgp1":
+		return recon.ReconstructCGP1(survivors, ha.cfg)
+	case "pb1":
+		return recon.ReconstructPB1(survivors, ha.cfg)
+	default: // cgp2
+		return recon.ReconstructCGP2(survivors, ha.cfg)
+	}
+}
+
+// cg2ScoreOf scores a from-scratch result: ancestor/path (pb-family) or per-edge
+// topology (cgp-family), matching how the solver-based versions are scored.
+func (ha *harness) cg2ScoreOf(res recon.Result, truth []recon.TruthSpan, dropped map[uint64]struct{}) recon.CGP2Iso {
+	if ha.mode == "pb1" || ha.mode == "pb2" {
+		return recon.ScorePB2Path(res, truth, dropped)
+	}
+	return recon.ScoreCGP2Strict(res, truth, dropped) // cgp: connectivity AND topology
 }
 
 // decodeSpan turns one collected span into a recon.Span, decoding its carried
@@ -1027,7 +1008,7 @@ func (ha *harness) decodeSpan(tid uint64, s collSpan) recon.Span {
 		sp.CkptPrefix = prefix
 		sp.BloomBits = bits
 		sp.LeafCarrier = d%ha.cpd != 0
-	case ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "pb2" || ha.cfg.CGRP:
+	case ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "pb2" || ha.mode == "cgp1" || ha.mode == "pb1" || ha.cfg.CGRP:
 		d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
 		if err != nil {
 			die(err)
@@ -1074,21 +1055,12 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			survivors = append(survivors, decoded[i])
 		}
 		t0 := time.Now()
-		var res recon.Result
-		if ha.mode == "pb2" {
-			res = recon.ReconstructPB2(survivors, ha.cfg)
-		} else {
-			res = recon.ReconstructCGP2(survivors, ha.cfg)
-		}
+		res := ha.cg2Reconstruct(survivors)
 		ns := time.Since(t0).Nanoseconds()
-		empty := len(res.ReconParent) == 0
+		empty := res.Reconnected == 0 // "did work" = >=1 fragment reconnected (consistent across cgp2/pb2/cgp1/pb1)
 		var iso recon.CGP2Iso
 		if !empty {
-			if ha.mode == "pb2" {
-				iso = recon.ScorePB2Path(res, truth, dropped)
-			} else {
-				iso = recon.ScoreCGP2Iso(res, truth, dropped)
-			}
+			iso = ha.cg2ScoreOf(res, truth, dropped)
 		}
 		cells[r] = cell{empty, iso, len(survivors), len(dropped), ns}
 	}

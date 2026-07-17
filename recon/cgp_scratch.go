@@ -406,6 +406,23 @@ func cgpGenCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
 	var efprHits, efprProbes, thN int
 	var thFprSum float64
 	seenEfpr := make(map[uint64]bool)
+	// Join-sibling pooling: fragments naming the same dropped parent (a free,
+	// carried structural fact) share in-window bloom evidence for the candidates
+	// above that parent. Built only when enabled (solver-based cgp2/pb2).
+	var siblingsByParent map[uint64][]*cgpFragment
+	if cfg.PoolJoinBlooms {
+		siblingsByParent = make(map[uint64][]*cgpFragment)
+		for _, fr := range sk.frags {
+			p := fr.root.ParentID
+			if p == 0 {
+				continue
+			}
+			if _, surv := sk.byID[p]; surv {
+				continue // parent survived -> not a named dropped join point
+			}
+			siblingsByParent[p] = append(siblingsByParent[p], fr)
+		}
+	}
 	for _, f := range sk.frags {
 		if f.bf == nil || f.anchorCkpt == nil {
 			continue
@@ -424,9 +441,25 @@ func cgpGenCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
 			bf    *bloom.Filter
 		}
 		var blooms []winBloom
-		for _, s := range f.spans {
-			if s.BloomBits != nil && wtop(s.Depth) == lo {
-				blooms = append(blooms, winBloom{s.Depth, bloom.Deserialize(s.BloomBits, cfg.BloomM, cfg.BloomK)})
+		gather := func(frag *cgpFragment) {
+			for _, s := range frag.spans {
+				if s.BloomBits != nil && wtop(s.Depth) == lo {
+					blooms = append(blooms, winBloom{s.Depth, bloom.Deserialize(s.BloomBits, cfg.BloomM, cfg.BloomK)})
+				}
+			}
+		}
+		gather(f)
+		// Pool join-siblings' in-window blooms (candidates all sit above the
+		// shared named parent, so they are true ancestors of every sibling).
+		if cfg.PoolJoinBlooms {
+			if p := f.root.ParentID; p != 0 {
+				if _, surv := sk.byID[p]; !surv {
+					for _, g := range siblingsByParent[p] {
+						if g != f {
+							gather(g)
+						}
+					}
+				}
 			}
 		}
 		if len(blooms) == 0 {
@@ -1494,6 +1527,7 @@ func cgpDiagEvidence(sk *cgpSkeleton, cfg Config) {
 // rather than a wrong edge — soundness first), and emits diagnostics under
 // TRACE_RECON_CGP2DIAG.
 func ReconstructCGP2(survivors []Span, cfg Config) Result {
+	cfg.PoolJoinBlooms = true // exploit free named-parent joins (solver-based path)
 	sk := cgpParse(survivors, cfg)
 	fr := cgpBuildForest(sk)
 	cgpResolveEvidence(sk, cfg)
@@ -1557,4 +1591,165 @@ func ScorePB2Path(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CG
 		}
 	}
 	return iso
+}
+
+// ScoreCGP2Strict grades a CGP reconstruction STRICTLY, and strictly harder than
+// the path scorer: a trace is correct only if BOTH
+//   (1) connectivity is right -- every fragment reconnects to its TRUE nearest
+//       surviving ancestor (exactly the check pb is graded on, via ScorePB2Path),
+//       so a wrong reconnection counts as wrong even when its synthetic chain is
+//       anonymous (it can't hide behind AnonOK), AND
+//   (2) topology is right -- the per-edge call-graph shape (ScoreCGP2Iso).
+// EdgeWrong sums both, so a clean trace (EdgeWrong==0) requires connectivity-clean
+// AND topology-clean; hence cgp-clean implies pb-clean, never the reverse. The
+// per-edge exact stats reported are the topology ones.
+func ScoreCGP2Strict(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
+	topo := ScoreCGP2Iso(res, truth, dropped)
+	conn := ScorePB2Path(res, truth, dropped) // connectivity: fragment -> true nearest surviving ancestor
+	topo.EdgeWrong += conn.EdgeWrong
+	return topo
+}
+
+// greedyPathEmit is the shared GREEDY (non-solver) emit for the 1-baselines.
+// Each fragment attaches to its DEEPEST bloom-admissible surviving ancestor
+// (cand.survAnc is depth-descending, so element 0), else its window checkpoint.
+// No CP-SAT, no named-parent joining/pooling (structure-free) -- gap-fillers are
+// anonymous. For cgp1 (sk.fanouts populated), a fragment that confirms a
+// witnessed fan-out routes through the shared NAMED node at that depth, so
+// fragments confirming the same fan-out merge under it (HA path-merge); no >=2
+// enforcement, no window pinning. Orphans are handled upstream by borrowing a
+// descendant carrier's window bloom (cgpResolveEvidence), so they arrive here
+// as ordinary fragments.
+func greedyPathEmit(sk *cgpSkeleton, cand *cgpCandidates, cfg Config) Result {
+	chosen := make(map[uint64]*Span, len(sk.frags))
+	for _, f := range sk.frags {
+		if f.bf == nil || f.anchorCkpt == nil {
+			continue
+		}
+		if sa := cand.survAnc[f.root.SpanID]; len(sa) > 0 {
+			chosen[f.root.SpanID] = sa[0] // deepest bloom-matching survivor
+		} else {
+			chosen[f.root.SpanID] = f.anchorCkpt // fall back to the window checkpoint
+		}
+	}
+	// per-fragment confirmed fan-outs by depth (HA-merge naming; empty for pb1)
+	haDepth := make(map[uint64]int, len(sk.fanouts))
+	for id, fo := range sk.fanouts {
+		haDepth[id] = fo.depth
+	}
+	fanAt := make(map[uint64]map[int]uint64, len(sk.frags))
+	for _, f := range sk.frags {
+		m := make(map[int]uint64)
+		for _, id := range cand.fragJoins[f.root.SpanID] {
+			m[haDepth[id]] = id
+		}
+		fanAt[f.root.SpanID] = m
+	}
+	parent := make(map[uint64]uint64)
+	for _, s := range sk.byID { // intra-fragment real edges (certain)
+		if s.ParentID != 0 {
+			if _, surv := sk.byID[s.ParentID]; surv {
+				parent[s.SpanID] = s.ParentID
+			}
+		}
+	}
+	used := make(map[uint64]bool, len(sk.byID))
+	for id := range sk.byID {
+		used[id] = true
+	}
+	for _, f := range sk.frags {
+		if f.root.ParentID != 0 {
+			used[f.root.ParentID] = true
+		}
+	}
+	for id := range sk.fanouts {
+		used[id] = true
+	}
+	anon := make(map[uint64]bool)
+	next := uint64(1)
+	allocAnon := func() uint64 {
+		for used[next] || anon[next] {
+			next++
+		}
+		id := next
+		next++
+		anon[id] = true
+		return id
+	}
+	var res Result
+	// deterministic fragment order (map-free): sort by root id
+	order := make([]*cgpFragment, 0, len(sk.frags))
+	for _, f := range sk.frags {
+		order = append(order, f)
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i].root.SpanID < order[j].root.SpanID })
+	for _, f := range order {
+		a := chosen[f.root.SpanID]
+		if a == nil || f.root.ParentID == 0 {
+			continue
+		}
+		cur := f.root.SpanID
+		done := false
+		for d := f.root.Depth - 1; d > a.Depth; d-- {
+			if _, exists := parent[cur]; exists {
+				done = true // already threaded upward (shared via a merged fan-out node)
+				break
+			}
+			var node uint64
+			if m := fanAt[f.root.SpanID][d]; m != 0 {
+				node = m // confirmed fan-out -> shared named node (HA-merge)
+			} else {
+				node = allocAnon()
+			}
+			parent[cur] = node
+			cur = node
+		}
+		if !done {
+			if _, exists := parent[cur]; !exists {
+				parent[cur] = a.SpanID
+			}
+		}
+		res.Bridges = append(res.Bridges, Bridge{
+			OrphanID: f.root.SpanID, AnchorID: a.SpanID,
+			Synthetic: f.root.Depth - a.Depth - 1, ViaCarrier: f.viaCarrier,
+			ReconFanout: f.root.ParentID,
+		})
+		res.Reconnected++
+	}
+	res.ReconParent = parent
+	res.ReconAnon = anon
+	ha := make(map[uint64]bool, len(sk.fanouts))
+	for id := range sk.fanouts {
+		ha[id] = true
+	}
+	res.ReconHAFanouts = ha
+	return res
+}
+
+// ReconstructPB1 is the original greedy path-bridge baseline: no solver, no free
+// structure. Each fragment connects to the deepest bloom-matching surviving span
+// in its window (multi-bloom, own evidence); orphans borrow a descendant
+// carrier's window bloom. Score with ScorePB2Path.
+func ReconstructPB1(survivors []Span, cfg Config) Result {
+	cfg.NoFanout = true
+	cfg.PoolJoinBlooms = false
+	sk := cgpParse(survivors, cfg)
+	cgpResolveEvidence(sk, cfg)
+	cgpResolveAnchors(sk, cfg)
+	cand := cgpGenCandidates(sk, cfg)
+	return greedyPathEmit(sk, cand, cfg)
+}
+
+// ReconstructCGP1 is the original greedy call-graph-preserving baseline: pb1
+// plus HA path-merge (fragments whose blooms confirm a witnessed dropped fan-out
+// route through a shared named node). No solver, no >=2 enforcement, no free
+// named-parent structure. Score with ScoreCGP2Iso (topology).
+func ReconstructCGP1(survivors []Span, cfg Config) Result {
+	cfg.NoFanout = false
+	cfg.PoolJoinBlooms = false
+	sk := cgpParse(survivors, cfg)
+	cgpResolveEvidence(sk, cfg)
+	cgpResolveAnchors(sk, cfg)
+	cand := cgpGenCandidates(sk, cfg)
+	return greedyPathEmit(sk, cand, cfg)
 }

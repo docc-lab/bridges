@@ -165,6 +165,17 @@ type Config struct {
 	// surviving ancestor, don't require fan-out/topology correctness.
 	NoFanout bool
 
+	// PoolJoinBlooms: when generating a fragment's admissible-ancestor
+	// candidates, also test them against the in-window blooms of its
+	// join-siblings (fragments that name the same dropped parent). Every
+	// surviving-ancestor candidate sits above the shared named parent, so it
+	// is a true ancestor of every sibling and present in every sibling's bloom
+	// (no false negatives) -- pooling never rejects a true ancestor and
+	// strictly suppresses false positives (a spurious ancestor must now fool
+	// all joined siblings). ON for the solver-based cgp2/pb2; OFF for the
+	// greedy 1-baselines.
+	PoolJoinBlooms bool
+
 	// BottomUp processes orphans deepest-first and lets shallower orphans
 	// discover descendant carriers by walking across already-reconstructed
 	// bridges (verified by bloom containment) before falling back to the

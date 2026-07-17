@@ -125,7 +125,7 @@ func parseFlags() config {
 	flag.Parse()
 	bloom.PrimeM = primeM // set before any handler/config sizing (emit + recon must match)
 	bloom.PrimeMByteCap = primeMByteCap
-	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" && c.mode != "pb2" && c.mode != "cgp1" && c.mode != "pb1" {
+	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" && c.mode != "pb2" && c.mode != "cgp1" && c.mode != "pb1" && c.mode != "cgp0" && c.mode != "pb0" {
 		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, pcrs, or cgprb (got %q)\n", c.mode)
 		os.Exit(2)
 	}
@@ -378,7 +378,7 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		ph.Capture = true
 		return ph, pcrbCfg
-	case "cgprb", "cgp2", "pb2", "cgp1", "pb1":
+	case "cgprb", "cgp2", "pb2", "cgp1", "pb1", "cgp0", "pb0":
 		// Call-graph-preserving: PCRB payload + window-local hash array. Same
 		// checkpoint-root + bloom geometry as PCRB, so it shares the PCRB
 		// config; reconstruction additionally consumes the HA. cgp2 reconstructs
@@ -568,7 +568,7 @@ func (ha *harness) drain() {
 	}
 	if cg2Family(ha.mode) {
 		label := strings.ToUpper(ha.mode) // CGP2 / PB2 / CGP1 / PB1
-		cgpFamily := ha.mode == "cgp1" || ha.mode == "cgp2"
+		cgpFamily := ha.mode == "cgp0" || ha.mode == "cgp1" || ha.mode == "cgp2"
 		pct := func(x, y int) float64 {
 			if y == 0 {
 				return 0
@@ -952,7 +952,11 @@ func (ha *harness) process(j finishJob) {
 // cg2Family reports whether the mode uses the shared cgp2-style tally/scoring:
 // the from-scratch reconstructors (cgp2/pb2 solver-based, cgp1/pb1 greedy).
 func cg2Family(mode string) bool {
-	return mode == "cgp2" || mode == "pb2" || mode == "cgp1" || mode == "pb1"
+	switch mode {
+	case "cgp2", "pb2", "cgp1", "pb1", "cgp0", "pb0":
+		return true
+	}
+	return false
 }
 
 // cg2Reconstruct dispatches to the right from-scratch reconstructor by mode.
@@ -964,15 +968,20 @@ func (ha *harness) cg2Reconstruct(survivors []recon.Span) recon.Result {
 		return recon.ReconstructCGP1(survivors, ha.cfg)
 	case "pb1":
 		return recon.ReconstructPB1(survivors, ha.cfg)
+	case "cgp0":
+		return recon.ReconstructCGP0(survivors, ha.cfg)
+	case "pb0":
+		return recon.ReconstructPB0(survivors, ha.cfg)
 	default: // cgp2
 		return recon.ReconstructCGP2(survivors, ha.cfg)
 	}
 }
 
-// cg2ScoreOf scores a from-scratch result: ancestor/path (pb-family) or per-edge
-// topology (cgp-family), matching how the solver-based versions are scored.
+// cg2ScoreOf scores a from-scratch result: ancestor/path (pb-family) or strict
+// connectivity+topology (cgp-family), matching how the solver versions score.
 func (ha *harness) cg2ScoreOf(res recon.Result, truth []recon.TruthSpan, dropped map[uint64]struct{}) recon.CGP2Iso {
-	if ha.mode == "pb1" || ha.mode == "pb2" {
+	switch ha.mode {
+	case "pb0", "pb1", "pb2":
 		return recon.ScorePB2Path(res, truth, dropped)
 	}
 	return recon.ScoreCGP2Strict(res, truth, dropped) // cgp: connectivity AND topology
@@ -1008,7 +1017,7 @@ func (ha *harness) decodeSpan(tid uint64, s collSpan) recon.Span {
 		sp.CkptPrefix = prefix
 		sp.BloomBits = bits
 		sp.LeafCarrier = d%ha.cpd != 0
-	case ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "pb2" || ha.mode == "cgp1" || ha.mode == "pb1" || ha.cfg.CGRP:
+	case ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "pb2" || ha.mode == "cgp1" || ha.mode == "pb1" || ha.mode == "cgp0" || ha.mode == "pb0" || ha.cfg.CGRP:
 		d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
 		if err != nil {
 			die(err)

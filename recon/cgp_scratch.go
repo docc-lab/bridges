@@ -1610,6 +1610,105 @@ func ScoreCGP2Strict(res Result, truth []TruthSpan, dropped map[uint64]struct{})
 	return topo
 }
 
+// cgpGreedyCandidates is the LEAN candidate step for the greedy baselines. For
+// each fragment it finds ONLY the deepest bloom-admissible surviving ancestor --
+// scanning deepest-first and stopping at the first match -- instead of the full
+// admissible-ancestor set the solver enumerates (given a chain A->B->C that all
+// matches, the solver keeps {A,B,C} as options; greedy keeps just C). For cgp1
+// it also collects the confirmed dropped fan-outs on the reconstructed chain
+// between that anchor and the fragment (for HA-merge). Own in-window blooms
+// only (structure-free; no join pooling). Returns the same anchor the solver's
+// depth objective would pick, so accuracy is unchanged -- this is purely faster.
+func cgpGreedyCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
+	survByDepth := make(map[int][]*Span)
+	for _, s := range sk.byID {
+		survByDepth[s.Depth] = append(survByDepth[s.Depth], s)
+	}
+	for d := range survByDepth {
+		sort.Slice(survByDepth[d], func(i, j int) bool { return survByDepth[d][i].SpanID < survByDepth[d][j].SpanID })
+	}
+	haByDepth := make(map[int][]uint64)
+	for id, fo := range sk.fanouts {
+		haByDepth[fo.depth] = append(haByDepth[fo.depth], id)
+	}
+	for d := range haByDepth {
+		sort.Slice(haByDepth[d], func(i, j int) bool { return haByDepth[d][i] < haByDepth[d][j] })
+	}
+	wtop := func(d int) int {
+		if d%cfg.CPD == 0 {
+			return d - cfg.CPD
+		}
+		return (d / cfg.CPD) * cfg.CPD
+	}
+	c := &cgpCandidates{
+		members:   make(map[uint64][]*cgpFragment),
+		fragJoins: make(map[uint64][]uint64),
+		survAnc:   make(map[uint64][]*Span),
+	}
+	for _, f := range sk.frags {
+		if f.bf == nil || f.anchorCkpt == nil {
+			continue
+		}
+		lo, hi := f.anchorCkpt.Depth, f.root.Depth
+		var blooms []*bloom.Filter
+		var bdepth []int
+		for _, s := range f.spans {
+			if s.BloomBits != nil && wtop(s.Depth) == lo {
+				blooms = append(blooms, bloom.Deserialize(s.BloomBits, cfg.BloomM, cfg.BloomK))
+				bdepth = append(bdepth, s.Depth)
+			}
+		}
+		if len(blooms) == 0 {
+			blooms = append(blooms, f.bf)
+			bdepth = append(bdepth, f.carrier.Depth)
+		}
+		confirmedByAll := func(key []byte, d int) bool {
+			for i, bf := range blooms {
+				if bdepth[i] > d && !bf.Test(key) {
+					return false
+				}
+			}
+			return true
+		}
+		var anchor *Span
+	scan:
+		for d := hi - 2; d > lo; d-- { // deepest-first
+			for _, s := range survByDepth[d] {
+				if s.LeafCarrier {
+					continue // a provable leaf can never be an ancestor
+				}
+				k := bridge.HexOf(s.SpanID)
+				if !confirmedByAll(k[:], d) {
+					continue
+				}
+				if s.ParentID != f.anchorCkpt.SpanID {
+					pk := bridge.HexOf(s.ParentID)
+					if !confirmedByAll(pk[:], d-1) {
+						continue // parent-check prunes a same-depth cousin
+					}
+				}
+				anchor = s
+				break scan // deepest match -> stop
+			}
+		}
+		if anchor == nil {
+			anchor = f.anchorCkpt // no deeper match: fall back to the window checkpoint
+		}
+		c.survAnc[f.root.SpanID] = []*Span{anchor}
+		if len(sk.fanouts) > 0 { // cgp1: confirmed fan-outs on the chain (anchor, root)
+			for d := hi - 2; d > anchor.Depth; d-- {
+				for _, m := range haByDepth[d] {
+					mk := bridge.HexOf(m)
+					if confirmedByAll(mk[:], d) {
+						c.fragJoins[f.root.SpanID] = append(c.fragJoins[f.root.SpanID], m)
+					}
+				}
+			}
+		}
+	}
+	return c
+}
+
 // greedyPathEmit is the shared GREEDY (non-solver) emit for the 1-baselines.
 // Each fragment attaches to its DEEPEST bloom-admissible surviving ancestor
 // (cand.survAnc is depth-descending, so element 0), else its window checkpoint.
@@ -1750,6 +1849,31 @@ func ReconstructCGP1(survivors []Span, cfg Config) Result {
 	sk := cgpParse(survivors, cfg)
 	cgpResolveEvidence(sk, cfg)
 	cgpResolveAnchors(sk, cfg)
-	cand := cgpGenCandidates(sk, cfg)
+	cand := cgpGenCandidates(sk, cfg) // full candidate forest (in-between: same setup as the solver)
+	return greedyPathEmit(sk, cand, cfg)
+}
+
+// ReconstructPB0 / ReconstructCGP0 are the LEAN greedy baselines: identical to
+// pb1/cgp1 but with cgpGreedyCandidates (deepest match only, no candidate
+// forest). Same output as pb1/cgp1, just faster -- the faithful cost of the
+// original greedy algorithm. (cgp1/pb1 are kept as the in-between rung that
+// reuses the solver's full candidate generation.)
+func ReconstructPB0(survivors []Span, cfg Config) Result {
+	cfg.NoFanout = true
+	cfg.PoolJoinBlooms = false
+	sk := cgpParse(survivors, cfg)
+	cgpResolveEvidence(sk, cfg)
+	cgpResolveAnchors(sk, cfg)
+	cand := cgpGreedyCandidates(sk, cfg)
+	return greedyPathEmit(sk, cand, cfg)
+}
+
+func ReconstructCGP0(survivors []Span, cfg Config) Result {
+	cfg.NoFanout = false
+	cfg.PoolJoinBlooms = false
+	sk := cgpParse(survivors, cfg)
+	cgpResolveEvidence(sk, cfg)
+	cgpResolveAnchors(sk, cfg)
+	cand := cgpGreedyCandidates(sk, cfg)
 	return greedyPathEmit(sk, cand, cfg)
 }

@@ -4,8 +4,15 @@
 # --drop-rates path), so the corpus is read/emitted once per pass instead of
 # once per rate. Uses the per-trace store (parallel, no serial event streaming).
 #
+# Reconstructors (RECONS), a ladder per bridge type:
+#   pb0/cgp0 -- lean greedy   (deepest bloom-match, early-stop, no candidate forest)
+#   pb1/cgp1 -- greedy over the solver's FULL candidate set (in-between rung)
+#   pb2/cgp2 -- CP-SAT solver (pooled join-blooms)
+# pb* scored on path (connectivity to true ancestor); cgp* scored strictly
+# (connectivity AND topology). All feed the same exclEmpty framework.
+#
 # Outputs under $OUT_DIR:
-#   <recon>_<day>_<prime>_c<cpd>.log            -- accuracy (CGP2[dc]/PB2[dc]
+#   <recon>_<day>_<prime>_c<cpd>.log            -- accuracy (e.g. CGP0[dc]/PB2[dc]
 #                                                  correctExclEmpty per rate) + PROGRESS
 #   <recon>_timing/timing_<day>_<prime>_c<cpd>_<dc>.csv  -- per-trace recon_ns per rate
 #   sweep_status.txt                            -- WAVE/CFG START/DONE markers
@@ -20,8 +27,9 @@
 #
 # Env overrides (defaults in parens):
 #   BIN(./trace_recon) DATA_DIR(data) META_DIR(meta) OUT_DIR(out) WORKERS(28)
-#   RATES(0.05,0.25,0.5,0.75,0.95,1.0) RECONS("cgp2 pb2") DAYS("day1 day2")
-#   PRIMES("up down none") CPDS("3 4 5 6 7 8")
+#   RATES(0.05,0.25,0.5,0.75,0.95,1.0) DAYS("day1 day2")
+#   RECONS("cgp0 cgp1 cgp2 pb0 pb1 pb2") PRIMES("up down none") CPDS("3 4 5 6 7 8")
+#   SAMPLE(unset -> full corpus; set N for a quick clean-timing subset) SAMPLE_SEED(1)
 # DATA_DIR holds <day>.store; META_DIR holds <day>_unfilt_corpus/meta.bin.
 set -u
 BIN=${BIN:-./trace_recon}
@@ -30,10 +38,15 @@ META_DIR=${META_DIR:-meta}
 OUT_DIR=${OUT_DIR:-out}
 WORKERS=${WORKERS:-28}
 RATES=${RATES:-0.05,0.25,0.5,0.75,0.95,1.0}
-RECONS=${RECONS:-"cgp2 pb2"}
+RECONS=${RECONS:-"cgp0 cgp1 cgp2 pb0 pb1 pb2"}
 DAYS=${DAYS:-"day1 day2"}
 PRIMES=${PRIMES:-"up down none"}
 CPDS=${CPDS:-"3 4 5 6 7 8"}
+# SAMPLE (optional): if set, process only a uniform random subset of this many
+# traces (seeded by SAMPLE_SEED, default 1). Use for a quick clean-timing pass;
+# leave unset for full-corpus accuracy.
+SAMPLE_OPT=""
+[ -n "${SAMPLE:-}" ] && SAMPLE_OPT="--sample $SAMPLE --sample-seed ${SAMPLE_SEED:-1}"
 declare -A PF=( [up]="--prime-m" [down]="--prime-m --prime-m-bytecap" [none]="" )
 STATUS=$OUT_DIR/sweep_status.txt
 mkdir -p "$OUT_DIR"; : > "$STATUS"
@@ -45,7 +58,7 @@ for recon in $RECONS; do
       for cpd in $CPDS; do
         ( $BIN --trace-store "$DATA_DIR/${day}.store" --corpus "$META_DIR/${day}_unfilt_corpus" \
             --mode "$recon" --checkpoint-distance "$cpd" --prefix-len 8 --per-trace-drop-seed \
-            --drop-rates "$RATES" ${PF[$prime]} --workers "$WORKERS" \
+            --drop-rates "$RATES" ${PF[$prime]} --workers "$WORKERS" $SAMPLE_OPT \
             --timing "$TDIR/timing_${day}_${prime}_c${cpd}_{dc}.csv" -o /dev/null \
             > "$OUT_DIR/${recon}_${day}_${prime}_c${cpd}.log" 2>&1
           echo "CFG $recon $day $prime c$cpd DONE $(date +%H:%M:%S)" >> "$STATUS" ) &

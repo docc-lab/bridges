@@ -17,7 +17,7 @@ Then render, e.g.:
 import re, os, sys, glob
 
 D = sys.argv[1] if len(sys.argv) > 1 else "."
-RECONS = sys.argv[2:] or ["cgp2", "pb2"]
+RECONS = sys.argv[2:] or ["cgp0", "cgp1", "cgp2", "pb0", "pb1", "pb2"]
 for recon in RECONS:
     outdir = os.path.join(D, f"{recon}_bars")
     os.makedirs(outdir, exist_ok=True)

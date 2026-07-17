@@ -1,9 +1,19 @@
 # Running the corrected recon sweep on a big box (e.g. c6a.metal, 192 cores)
 
-The multi-drop sweep (`multidrop_sweep.sh`) reconstructs cgp2 + pb2 over both
-Uber days, all 3 prime modes, cpd 3-8, and all 6 drop rates. With
-`--drop-rates`, each corpus pass decodes a trace once and reconstructs it under
-every rate, so 72 passes cover what used to be 432 single-drop configs.
+The multi-drop sweep (`multidrop_sweep.sh`) reconstructs **six modes** over both
+Uber days, all 3 prime modes, cpd 3-8, and all 6 drop rates. The modes form a
+ladder per bridge type:
+
+| mode | what | scored on |
+|---|---|---|
+| pb0 / cgp0 | lean greedy (deepest bloom-match, early-stop) | path / strict |
+| pb1 / cgp1 | greedy over the solver's full candidate set | path / strict |
+| pb2 / cgp2 | CP-SAT solver (pooled join-blooms) | path / strict |
+
+(pb* = path scoring: connectivity to the true ancestor. cgp* = strict: connectivity
+AND topology.) With `--drop-rates`, each pass decodes a trace once and
+reconstructs it under every rate, so 6 modes x 2 days x 3 primes x 6 cpd = 216
+passes cover what would otherwise be 1296 single-drop configs.
 
 ## 1. Data to copy (store path — no `events.bin` needed)
 
@@ -41,25 +51,39 @@ cd bridges && go build -tags cpsat -o ../trace_recon ./cmd/trace_recon && cd ..
 
 ```bash
 export LD_LIBRARY_PATH=$PWD/or-tools_x86_64_Ubuntu-22.04_cpp_v9.15.6755/lib:$LD_LIBRARY_PATH
-WORKERS=28 bash bridges/scripts/repro/multidrop_sweep.sh
+WORKERS=28 bash bridges/scripts/repro/multidrop_sweep.sh          # full accuracy + timing
 ```
 
 `WORKERS` x 6 concurrent cpds = total recon threads. Keep it **<= cores - a few**
 (e.g. 28x6=168 on 192) so every in-flight reconstruction owns a core and
-`recon_ns` is uncontended — clean timing, no separate low-contention pass needed.
-Watch progress with `tail -f out/sweep_status.txt` and the `PROGRESS` lines in
-`out/*.log` (every 10k traces, all 6 rates' exclEmpty per line).
+`recon_ns` is uncontended — **that's what makes the timing clean**; no separate
+low-contention pass needed. Watch progress with `tail -f out/sweep_status.txt`
+and the `PROGRESS` lines in `out/*.log` (every 10k traces, all 6 rates' exclEmpty).
 
 Drops are per-trace-seeded, so results are bit-identical to separate
 `--per-trace-drop-seed --drop-rate` runs (the drop sets are even nested).
 
+**Quick clean-timing pass** (don't need full-corpus accuracy, just the recon-time
+distributions fast): set `SAMPLE` to a uniform random subset — same seed => same
+subset across modes, so cross-mode timing stays comparable:
+
+```bash
+SAMPLE=200000 WORKERS=28 bash bridges/scripts/repro/multidrop_sweep.sh
+```
+
+The greedy modes (pb0/cgp0, pb1/cgp1) run much faster than the solver (pb2/cgp2),
+so this finishes quickly; keep threads <= cores for the timing to stay honest.
+
 ## 4. Outputs to bring back
 
 - **Accuracy** (FP-rate bars): `out/<recon>_<day>_<prime>_c<cpd>.log` — each has 6
-  `CGP2[dc]/PB2[dc] ... correctExclEmpty=..%` lines. Tiny; copy all.
+  `<MODE>[dc] ... correctExclEmpty=..%` lines (MODE = CGP0/CGP1/CGP2/PB0/PB1/PB2).
+  Tiny; copy all.
 - **Timing** (recon-time violins): `out/<recon>_timing/timing_<day>_<prime>_c<cpd>_<dc>.csv`
-  (per-trace `recon_ns`). Large (~10-15 GB); `tar czf timing.tgz out/*_timing` and
-  copy that, or build the violin `.npz` cache on the box and copy just that.
+  (per-trace `recon_ns`). Larger; `tar czf timing.tgz out/*_timing` and copy that,
+  or build the violin `.npz` cache on the box and copy just that.
 
-The `scripts/repro/plot_recon_*` and `plot_sbridge_time_violin.py` plotters read
-these directly (point their timing dir / dump glob at `out/`).
+Back home: `explode_multidrop_logs.py <out_dir>` turns the logs into the per-drop
+files the bar plotter reads (defaults to all six modes); the `plot_recon_*` /
+`plot_sbridge_time_violin.py` plotters then read the timing CSVs directly (point
+`VIOLIN_TD` / `ERR_SC` at the copied `out/`).

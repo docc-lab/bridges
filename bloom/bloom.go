@@ -215,6 +215,12 @@ type Filter struct {
 	m    uint32
 	k    uint32
 	bits []byte
+
+	// prehashed selects the PB/CGPB on-wire hash scheme: split the raw key
+	// bytes into two base words (splitHashes) and double-hash with the simple
+	// bit_i = (h1 + i*h2) mod m, no MurmurHash whitening. Set by
+	// DeserializePrehashed; false => the default MurmurHash path.
+	prehashed bool
 }
 
 // New constructs an empty filter. m and k must be positive.
@@ -266,8 +272,50 @@ func (f *Filter) Add(data []byte) {
 	}
 }
 
+// splitHashes derives the two base-hash words for a PREHASHED key — bytes that
+// are already uniform (e.g. an 8-byte OTel SpanID), so no whitening is needed.
+// h1 is the big-endian pack of the first half of the bytes, h2 of the second
+// half. For an 8-byte SpanID: h1 = BE(bytes[0:4]), h2 = BE(bytes[4:8]).
+func splitHashes(data []byte) (h1, h2 uint64) {
+	mid := (len(data) + 1) / 2
+	for i := 0; i < len(data); i++ {
+		if i < mid {
+			h1 = h1<<8 | uint64(data[i])
+		} else {
+			h2 = h2<<8 | uint64(data[i])
+		}
+	}
+	return h1, h2
+}
+
+// TestPrehashed tests a raw prehashed key via splitHashes + the simple double
+// hash bit_i = (h1 + i*h2) mod m — the exact scheme PB/CGPB emit with (no
+// MurmurHash). Bit addressing (LSB-first within each byte) matches Add/Test.
+func (f *Filter) TestPrehashed(raw []byte) bool {
+	h1, h2 := splitHashes(raw)
+	mu := uint64(f.m)
+	for i := uint64(0); i < uint64(f.k); i++ {
+		pos := (h1 + i*h2) % mu
+		if f.bits[pos/8]&(1<<(pos%8)) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Test returns true if data may have been added (no false negatives).
 func (f *Filter) Test(data []byte) bool {
+	if f.prehashed {
+		// Recon callers key blooms by bridge.HexOf(id) (16 hex chars of the
+		// 8-byte span id); decode back to the raw bytes the wire hashed.
+		if len(data) == 16 {
+			var raw [8]byte
+			if _, err := hex.Decode(raw[:], data); err == nil {
+				return f.TestPrehashed(raw[:])
+			}
+		}
+		return f.TestPrehashed(data)
+	}
 	h1, h2, h3, h4 := BaseHashes(data)
 	h := [4]uint64{h1, h2, h3, h4}
 	mu := uint64(f.m)
@@ -308,6 +356,17 @@ func Deserialize(data []byte, m, k uint32) *Filter {
 		return f
 	}
 	copy(f.bits, data)
+	return f
+}
+
+// DeserializePrehashed is Deserialize for a filter whose bits were produced by
+// the PB/CGPB prehashed scheme (raw span ids via splitHashes). Membership tests
+// on the returned filter use TestPrehashed automatically.
+func DeserializePrehashed(data []byte, m, k uint32) *Filter {
+	f := Deserialize(data, m, k)
+	if f != nil {
+		f.prehashed = true
+	}
 	return f
 }
 

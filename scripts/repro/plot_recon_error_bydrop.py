@@ -18,8 +18,8 @@ LABEL_FS, TICK_FS, LEG_FS = 9, 8, 7  # typical paper text sizes for a 2.2x1.2in 
 # Colorblind-safe (Okabe-Ito) + distinct hatch per cpd = redundant encoding, so
 # bars are distinguishable by pattern even in grayscale / for CVD readers.
 OKABE = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9"]
-HATCHES = ["/", "\\", "x", ".", "+", "o"]  # single-pass = bigger cells (same patterns)
-matplotlib.rcParams["hatch.linewidth"] = 0.4  # thin hatches for the small canvas
+HATCHES = ["////", "\\\\\\\\", "xxxx", "....", "++++", "oooo"]  # repeated glyphs = finer cells for the small canvas
+matplotlib.rcParams["hatch.linewidth"] = 0.3  # thin hatches for the small canvas
 
 ap = argparse.ArgumentParser(description="cgp2 reconstruction-error (FP-rate) bars (2.2x1.2in paper figure)")
 ap.add_argument("--xlabel", default=None, help="x-axis label text (omit for no label)")

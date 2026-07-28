@@ -108,12 +108,20 @@ if args.xlabel:
     ax.set_xlabel(args.xlabel, fontsize=LABEL_FS)
 if args.ylabel:
     ax.set_ylabel(args.ylabel, fontsize=LABEL_FS)
-yt = [0, 1, 2, 3, 4, 5]  # log10 ms
-ax.set_yticks(yt)
-ax.set_yticklabels([f"$10^{{{k}}}$" for k in yt])
 ymin = min(float(g.min()) for g in grids)  # fit the full violin bottoms (KDE tails dip below 10^0)
 gmax = max(float(g.max()) for g in grids)
-ax.set_ylim(ymin - 0.05, gmax + 1.15)  # top headroom so the top-left legend clears the tails
+# VIOLIN_YLO/YHI (log10 ms) override the data-driven range so a set of figures
+# (e.g. the 0- and 2-mode of one variant) can share an identical y-scale.
+ylo = float(os.environ.get("VIOLIN_YLO", ymin - 0.05))
+yhi = float(os.environ.get("VIOLIN_YHI", gmax + 1.15))  # top headroom so the top-left legend clears the tails
+ax.set_ylim(ylo, yhi)
+# Decade ticks span ceil(ylo)..floor(data max) -- not the legend headroom -- and
+# are thinned to <=6 labels so a wide (shared) range stays readable.
+yt = list(range(int(np.ceil(ylo)), int(np.floor(gmax)) + 1))
+if len(yt) > 6:
+    yt = yt[::2]
+ax.set_yticks(yt)
+ax.set_yticklabels([f"$10^{{{k}}}$" for k in yt])
 ax.tick_params(axis="both", labelsize=TICK_FS, width=0.5, length=2.5, pad=1.5)
 for sp in ax.spines.values():
     sp.set_linewidth(0.5)

@@ -183,6 +183,12 @@ type Config struct {
 	// independently.
 	BottomUp bool
 
+	// Prehashed selects the PB/CGPB on-wire bloom hash (raw span ids via
+	// splitHashes, no MurmurHash) for every window bloom the reconstructor
+	// deserializes. Set when reconstructing real bridge payloads emitted by
+	// the production PB handler; false for the simulator's MurmurHash blooms.
+	Prehashed bool
+
 	// ChainCheck requires anchor candidates to pass ancestry-chain
 	// consistency: walking up from the candidate, every ancestor ID we can
 	// name must also test positive in the orphan's bloom. Through surviving

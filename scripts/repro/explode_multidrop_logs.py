@@ -29,7 +29,7 @@ for recon in RECONS:
             continue
         day, prime, cpd = m.groups()
         for line in open(log):
-            mm = re.match(r"(?:CGP2|PB2)\[(d\w+)\] traces=", line)  # summary line only
+            mm = re.match(r"(?:CGP[012]|PB[012])\[(d\w+)\] traces=", line)  # summary line only
             if mm:
                 with open(os.path.join(outdir, f"tim_{day}_{prime}_c{cpd}_{mm.group(1)}.txt"), "w") as fh:
                     fh.write(line)

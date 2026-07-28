@@ -66,6 +66,16 @@ type cgpFragment struct {
 // carrier — evidentially it is a checkpoint.)
 func (f *cgpFragment) isOrphan() bool { return f.carrier == nil }
 
+// cgpBloom deserializes a window bloom in the hash mode the payloads were
+// emitted with: the PB/CGPB prehashed scheme (raw span ids) when cfg.Prehashed,
+// else the simulator's MurmurHash scheme.
+func cgpBloom(bits []byte, cfg Config) *bloom.Filter {
+	if cfg.Prehashed {
+		return bloom.DeserializePrehashed(bits, cfg.BloomM, cfg.BloomK)
+	}
+	return bloom.Deserialize(bits, cfg.BloomM, cfg.BloomK)
+}
+
 // cgpFanout is an HA-witnessed dropped fan-out: a NAMED branch point (its id is
 // known exactly from the HA entry) that MUST have >=2 children wired through it.
 // Membership — which paths are its children — is what the solve determines.
@@ -253,7 +263,7 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 			continue
 		}
 		if f.carrier.BloomBits != nil {
-			f.bf = bloom.Deserialize(f.carrier.BloomBits, cfg.BloomM, cfg.BloomK)
+			f.bf = cgpBloom(f.carrier.BloomBits, cfg)
 		}
 		f.prefix = f.carrier.CkptPrefix
 		f.viaCarrier = 0
@@ -283,7 +293,7 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 		wbot := (r.Depth/cfg.CPD + 1) * cfg.CPD // window-bottom checkpoint depth
 		for d := r.Depth + 1; d <= wbot && f.carrier == nil; d++ {
 			for _, c := range carriersByDepth[d] {
-				bf := bloom.Deserialize(c.BloomBits, cfg.BloomM, cfg.BloomK)
+				bf := cgpBloom(c.BloomBits, cfg)
 				if !bf.Test(rk[:]) {
 					continue
 				}
@@ -444,7 +454,7 @@ func cgpGenCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
 		gather := func(frag *cgpFragment) {
 			for _, s := range frag.spans {
 				if s.BloomBits != nil && wtop(s.Depth) == lo {
-					blooms = append(blooms, winBloom{s.Depth, bloom.Deserialize(s.BloomBits, cfg.BloomM, cfg.BloomK)})
+					blooms = append(blooms, winBloom{s.Depth, cgpBloom(s.BloomBits, cfg)})
 				}
 			}
 		}
@@ -1654,7 +1664,7 @@ func cgpGreedyCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
 		var bdepth []int
 		for _, s := range f.spans {
 			if s.BloomBits != nil && wtop(s.Depth) == lo {
-				blooms = append(blooms, bloom.Deserialize(s.BloomBits, cfg.BloomM, cfg.BloomK))
+				blooms = append(blooms, cgpBloom(s.BloomBits, cfg))
 				bdepth = append(bdepth, s.Depth)
 			}
 		}

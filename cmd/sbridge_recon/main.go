@@ -39,6 +39,7 @@ func main() {
 	fpBits := flag.Int("fp-bits", 16, "non-checkpoint fingerprint width in bits (emit + recon must match)")
 	prefixLen := flag.Int("prefix-len", 4, "checkpoint-root window-anchor width in bytes (1-8; emit + recon must match). 8 = full-width.")
 	noOrdinal := flag.Bool("no-ordinal", false, "drop the interior ordinal: emit _o=depth only, place severed survivors by (depth, own-fp, parent-fp)")
+	lehmerEE := flag.Bool("lehmer-ee", false, "Lehmer-code EE/DEE ordinal groups (emit + reconstruction)")
 	progress := flag.Int("progress", 0, "print a progress line every N traces (0 = silent)")
 	timing := flag.String("timing", "", "write per-trace topology recon_ns to this CSV and print a TIMING summary (topology + structure phases, µs)")
 	flag.Parse()
@@ -50,11 +51,11 @@ func main() {
 	var nTraces, nUnsolvable, nSevAmbig, nWrong, nCorrect int
 	var sumEmit, sumSurv, sumIdent, sumSevPlaced, sumSevNoPlace, sumReal int
 	var nStruct, nAccepted, nEventOK, nCPOK, nDeeAmbig int // Phase-2 (event structure) tally
-	var topoNanos, structNanos, structAll []int64         // per-trace recon times (--timing); structAll aligned to topoNanos (0 when structure phase skipped)
-	var sumParents, sumEndOK int                          // per-parent end-order recovery (accepted traces only)
+	var topoNanos, structNanos, structAll []int64          // per-trace recon times (--timing); structAll aligned to topoNanos (0 when structure phase skipped)
+	var sumParents, sumEndOK int                           // per-parent end-order recovery (accepted traces only)
 	t0 := time.Now()
 	process := func(i int, tr corpus.StoredTrace) {
-		payloads, truth, spans, dees := emitTrace(tr, *cpd, *topoOnly, *fpBits, *noOrdinal, *prefixLen)
+		payloads, truth, spans, dees := emitTrace(tr, *cpd, *topoOnly, *fpBits, *noOrdinal, *prefixLen, *lehmerEE)
 		dropped := dropSet(tr, *dropRate, *dropSeed, *cpd)
 
 		inputs := make([]recon.SBInput, 0, len(payloads))
@@ -78,7 +79,7 @@ func main() {
 		sumSurv += len(survivors)
 
 		tRec := time.Now()
-		res := recon.ReconstructSBridge(inputs, survivors, recon.Config{CPD: *cpd, FPBits: *fpBits, NoOrdinal: *noOrdinal, PrefixLen: *prefixLen})
+		res := recon.ReconstructSBridge(inputs, survivors, recon.Config{CPD: *cpd, FPBits: *fpBits, NoOrdinal: *noOrdinal, PrefixLen: *prefixLen, SBridgeLehmer: *lehmerEE})
 		topoNs := time.Since(tRec).Nanoseconds()
 		var structNs int64 // structure (ordering) phase recon time; stays 0 if the phase is skipped for this trace
 		v := recon.ScoreSBridgeUnderDrop(res, truth)
@@ -266,7 +267,7 @@ type spanInfo struct {
 // order, capturing each emitting span's serialized _br payload, the ground-truth
 // tree (children indexed by 1-based start ordinal — the same ordinal the handler
 // assigns), and per-span (parent, ordinal, depth) for orphan matching.
-func emitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool, ckptBytes int) (map[uint64][]byte, recon.SBTruth, []spanInfo, [][]byte) {
+func emitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool, ckptBytes int, lehmerEE bool) (map[uint64][]byte, recon.SBTruth, []spanInfo, [][]byte) {
 	h := bridge.NewSBridgeHandler(cpd, nil)
 	// Interior spans export _o = varint(ordinal)||varint(depth); charge it so the
 	// cost accounting matches a real sbridge deployment. (Reconstruction itself
@@ -274,6 +275,7 @@ func emitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdi
 	h.EmitOC = true
 	h.TopoOnly = topoOnly // drop EE/DEE; topology emission is unchanged
 	h.OmitOrdinal = noOrdinal
+	h.LehmerEE = lehmerEE
 	if fpBits > 0 {
 		h.FPBits = fpBits
 	}

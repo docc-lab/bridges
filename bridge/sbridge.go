@@ -108,6 +108,12 @@ type SBridgeHandler struct {
 	// exchange for a smaller _br payload and zero DEE baggage.
 	TopoOnly bool
 
+	// LehmerEE replaces each EE/DEE group's raw ordinal varints with a
+	// fixed-width Lehmer (factoradic) rank. Group boundaries are retained, so
+	// start/end interleaving reconstructs exactly as before. This changes the
+	// wire format and must match the decoder's SBridgeLehmer setting.
+	LehmerEE bool
+
 	// EmitSink, when non-nil, receives the actual serialized _br payload at each
 	// emit point (checkpoint OnStart, leaf OnEnd) — the faithful bytes a span
 	// would persist. Opt-in: the bag-size study leaves it nil and pays no
@@ -275,11 +281,11 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	if isCheckpoint {
 		// Only the payload SIZE matters for the bag-size study, so compute it
 		// without serializing (no per-span allocation).
-		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSize(depth, chain, deeBytes, h.FPBits, h.CkptBytes)
+		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + sbridgeBRSizeWithCoding(depth, chain, deeBytes, h.FPBits, h.CkptBytes, h.LehmerEE)
 		if h.EmitSink != nil {
 			// Pack BEFORE the reset: a checkpoint's own payload describes its
 			// position within its PARENT window (pre-reset anchor + chain).
-			h.EmitSink(tid, sid, PackSBridgeBR(depth, ckpt, h.CkptBytes, chain, deeBytes, h.FPBits))
+			h.EmitSink(tid, sid, packSBridgeBR(depth, ckpt, h.CkptBytes, chain, deeBytes, h.FPBits, h.LehmerEE))
 		}
 
 		// Reset state for the post-checkpoint snapshot: this span becomes the
@@ -295,7 +301,7 @@ func (h *SBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		h.parentEEAcc[stateKey{tid, sid}] = nil
 	}
 
-	packedLen := sbridgeBRSize(depth, chain, deeBytes, h.FPBits, h.CkptBytes)
+	packedLen := sbridgeBRSizeWithCoding(depth, chain, deeBytes, h.FPBits, h.CkptBytes, h.LehmerEE)
 
 	var baggageBytes int
 	if baggageFound {
@@ -344,7 +350,8 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 		if len(rem) > 0 {
 			kept := rem[:len(rem)-1]
 			if len(kept) > 0 {
-				quad := EncodeDEEQuad(TraceID16(tid), ps.depth, sid>>uint(64-h.FPBits), h.FPBits, kept)
+				childCount := h.parentEventCount[key]
+				quad := encodeDEEQuad(TraceID16(tid), ps.depth, sid>>uint(64-h.FPBits), h.FPBits, childCount, kept, h.LehmerEE)
 				h.enqueueDEE(ev.ServiceID, quad, tid)
 				if h.DEESink != nil {
 					h.DEESink(tid, quad)
@@ -362,7 +369,7 @@ func (h *SBridgeHandler) OnEnd(ev *Event) EndResult {
 		emitBytes = BRPropertyNameOverheadBytes + SBridgeTypeID + ps.packedLen
 		ps.emitted = true
 		if h.EmitSink != nil {
-			h.EmitSink(tid, sid, PackSBridgeBR(ps.depth, ps.ckpt, h.CkptBytes, ps.chain, ps.deeBytes, h.FPBits))
+			h.EmitSink(tid, sid, packSBridgeBR(ps.depth, ps.ckpt, h.CkptBytes, ps.chain, ps.deeBytes, h.FPBits, h.LehmerEE))
 		}
 	} else if !ps.emitted && h.EmitOC {
 		// Interior span (not a checkpoint, not a leaf): exports

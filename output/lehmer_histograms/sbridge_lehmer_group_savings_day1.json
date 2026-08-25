@@ -1,0 +1,128 @@
+{
+  "schema": "bridges.sbridge_group_savings.v1",
+  "inputs": [
+    "/mydata/uber/bignode_state/day1_unfilt_corpus"
+  ],
+  "traces": 521305,
+  "spans": 475488643,
+  "ee": {
+    "count": 4818892,
+    "legacy_bytes": 63788298,
+    "lehmer_bytes": 45355291,
+    "positive_count": 2773284,
+    "zero_count": 1990560,
+    "negative_count": 55048,
+    "average_saving_bytes": 3.8251546206057325,
+    "total_saving_pct": 28.89716073001352,
+    "max_saving": {
+      "trace_id": 6953827895265349379,
+      "parent_id": 4701597231914346938,
+      "universe": 1691,
+      "length": 765,
+      "legacy_bytes": 1526,
+      "lehmer_bytes": 991,
+      "saving_bytes": 535,
+      "saving_pct": 35.05897771952818
+    },
+    "max_saving_pct": {
+      "trace_id": 14328753570751903241,
+      "parent_id": 3216881970723892410,
+      "universe": 5,
+      "length": 5,
+      "legacy_bytes": 6,
+      "lehmer_bytes": 2,
+      "saving_bytes": 4,
+      "saving_pct": 66.66666666666667
+    },
+    "max_inflation": {
+      "trace_id": 16815074437198413528,
+      "parent_id": 2378670813195306044,
+      "universe": 493,
+      "length": 49,
+      "legacy_bytes": 50,
+      "lehmer_bytes": 56,
+      "saving_bytes": -6,
+      "saving_pct": -12
+    }
+  },
+  "dee": {
+    "count": 29671136,
+    "legacy_bytes": 184454354,
+    "lehmer_bytes": 141432371,
+    "positive_count": 11622313,
+    "zero_count": 5324268,
+    "negative_count": 12724555,
+    "average_saving_bytes": 1.4499607632144587,
+    "total_saving_pct": 23.32391839338203,
+    "max_saving": {
+      "trace_id": 11787208038001093214,
+      "parent_id": 8843375354007457390,
+      "universe": 5443,
+      "length": 5442,
+      "legacy_bytes": 10759,
+      "lehmer_bytes": 7467,
+      "saving_bytes": 3292,
+      "saving_pct": 30.597639185797938
+    },
+    "max_saving_pct": {
+      "trace_id": 8625596897018565081,
+      "parent_id": 11552219148009798957,
+      "universe": 253,
+      "length": 120,
+      "legacy_bytes": 241,
+      "lehmer_bytes": 117,
+      "saving_bytes": 124,
+      "saving_pct": 51.45228215767635
+    },
+    "max_inflation": {
+      "trace_id": 10840136550679226266,
+      "parent_id": 17548012021898395452,
+      "universe": 2,
+      "length": 1,
+      "legacy_bytes": 2,
+      "lehmer_bytes": 3,
+      "saving_bytes": -1,
+      "saving_pct": -50
+    }
+  },
+  "all": {
+    "count": 34490028,
+    "legacy_bytes": 248242652,
+    "lehmer_bytes": 186787662,
+    "positive_count": 14395597,
+    "zero_count": 7314828,
+    "negative_count": 12779603,
+    "average_saving_bytes": 1.7818190811558634,
+    "total_saving_pct": 24.756015738987514,
+    "max_saving": {
+      "trace_id": 11787208038001093214,
+      "parent_id": 8843375354007457390,
+      "universe": 5443,
+      "length": 5442,
+      "legacy_bytes": 10759,
+      "lehmer_bytes": 7467,
+      "saving_bytes": 3292,
+      "saving_pct": 30.597639185797938
+    },
+    "max_saving_pct": {
+      "trace_id": 14328753570751903241,
+      "parent_id": 3216881970723892410,
+      "universe": 5,
+      "length": 5,
+      "legacy_bytes": 6,
+      "lehmer_bytes": 2,
+      "saving_bytes": 4,
+      "saving_pct": 66.66666666666667
+    },
+    "max_inflation": {
+      "trace_id": 16815074437198413528,
+      "parent_id": 2378670813195306044,
+      "universe": 493,
+      "length": 49,
+      "legacy_bytes": 50,
+      "lehmer_bytes": 56,
+      "saving_bytes": -6,
+      "saving_pct": -12
+    }
+  }
+}

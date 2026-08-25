@@ -54,12 +54,13 @@ type SBResult struct {
 	Reason     string
 	FPBits     int  // non-checkpoint fp width used (for severed matching)
 	NoOrdinal  bool // severed placement ignores the ordinal (own-fp distinguishes siblings)
+	LehmerEE   bool // EE/DEE payload groups use optional Lehmer coding
 
 	// Attachment accounting.
-	Identified      int // survivors attached by their real parent edge (connected)
-	SeveredPlaced   int // severed survivors (parent dropped) uniquely matched by 4-tuple
+	Identified       int // survivors attached by their real parent edge (connected)
+	SeveredPlaced    int // severed survivors (parent dropped) uniquely matched by 4-tuple
 	SeveredAmbiguous int // severed survivor matched >1 slot (truncated-key collision) -> fail
-	SeveredNoPlace  int // severed survivor matched 0 slots (shouldn't happen: leaves never drop)
+	SeveredNoPlace   int // severed survivor matched 0 slots (shouldn't happen: leaves never drop)
 }
 
 // SBSurvivor is one surviving span's real topology: id, real parent, 1-based
@@ -97,7 +98,13 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 	}
 	ds := make([]decoded, 0, len(inputs))
 	for _, in := range inputs {
-		br, err := bridge.DecodeSBridgeBR(in.Payload, cfg.CPD, fpBits, ckptBytes)
+		var br bridge.SBridgeBR
+		var err error
+		if cfg.SBridgeLehmer {
+			br, err = bridge.DecodeSBridgeBRLehmer(in.Payload, cfg.CPD, fpBits, ckptBytes)
+		} else {
+			br, err = bridge.DecodeSBridgeBR(in.Payload, cfg.CPD, fpBits, ckptBytes)
+		}
 		if err != nil {
 			return unsolvable("decode span %016x: %v", in.SpanID, err)
 		}
@@ -192,7 +199,7 @@ func ReconstructSBridge(inputs []SBInput, survivors []SBSurvivor, cfg Config) SB
 	if root == nil {
 		return unsolvable("no depth-0 root checkpoint among %d emitting spans", len(inputs))
 	}
-	res := SBResult{Root: root, FPBits: fpBits, NoOrdinal: cfg.NoOrdinal}
+	res := SBResult{Root: root, FPBits: fpBits, NoOrdinal: cfg.NoOrdinal, LehmerEE: cfg.SBridgeLehmer}
 	labeled := map[uint64]bool{}
 	collectRealIDs(root, labeled) // checkpoints + leaves placed by their own chains (incl. severed)
 	res.identifyByEdges(survivors, labeled)

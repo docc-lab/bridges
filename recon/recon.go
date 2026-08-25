@@ -125,6 +125,10 @@ type Config struct {
 	// (the legacy 2-byte fp). Must match the width the payloads were emitted with.
 	FPBits int
 
+	// SBridgeLehmer selects the optional Lehmer-coded EE/DEE wire format.
+	// It must match SBridgeHandler.LehmerEE on the emitting side.
+	SBridgeLehmer bool
+
 	// NoOrdinal: place severed survivors by (depth, own-fp, parent-fp) only,
 	// dropping the ordinal discriminator (own-fp distinguishes siblings). Pairs
 	// with the handler's OmitOrdinal emission.
@@ -634,11 +638,11 @@ type Score struct {
 	// is curable by bloom corroboration (non-ancestor) or lives in PCRS's
 	// lattice (ancestor).
 	MisattachAncestor int
-	Unanchored     int
-	Synthetic      int // total synthetic spans created
-	Borrowed       int // bridges built via the membership-based bloom fallback
-	Ambiguous      int // bridges where >1 candidate tested positive at the anchor depth
-	AmbiguousBad   int // ... of which the anchor was wrong
+	Unanchored        int
+	Synthetic         int // total synthetic spans created
+	Borrowed          int // bridges built via the membership-based bloom fallback
+	Ambiguous         int // bridges where >1 candidate tested positive at the anchor depth
+	AmbiguousBad      int // ... of which the anchor was wrong
 
 	// PCR fragment accounting (ScorePCR only; zero under ScorePB). A
 	// carrier-less fragment — an unanchored orphan plus every survivor

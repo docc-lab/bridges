@@ -39,14 +39,16 @@ type config struct {
 	topoOnly           bool
 	fpBits             int
 	noOrdinal          bool
+	lehmerEE           bool
 	prefixLen          int
 	bloomFP            float64
-	sampleCount        int   // corpus mode: if >0, simulate a RANDOM sample of this many traces (seeded)
-	sampleSeed         int64 // seed for the random sample
-	first              int   // corpus mode: if >0, simulate only the FIRST N traces (contiguous), stop early
-	progressN          int   // corpus mode: print a PROGRESS line every N completed traces (0 = off)
-	workers            int   // corpus mode: parallel worker count (trace sharding; non-sbridge modes only)
+	sampleCount        int    // corpus mode: if >0, simulate a RANDOM sample of this many traces (seeded)
+	sampleSeed         int64  // seed for the random sample
+	first              int    // corpus mode: if >0, simulate only the FIRST N traces (contiguous), stop early
+	progressN          int    // corpus mode: print a PROGRESS line every N completed traces (0 = off)
+	workers            int    // corpus mode: parallel worker count (trace sharding; non-sbridge modes only)
 	streamMetrics      string // corpus mode: stream per-trace metrics CSV here instead of holding all in RAM
+	sizeHistograms     string // exact corpus-wide baggage-call and emitted-payload size histograms
 }
 
 func parseFlags() config {
@@ -64,12 +66,14 @@ func parseFlags() config {
 	flag.IntVar(&c.progressN, "progress", 0, "Corpus mode: print a PROGRESS line to stderr every N completed traces (0 = silent)")
 	flag.IntVar(&c.workers, "workers", 1, "Corpus mode: parallel workers, sharding traces by tid%workers (1 = single-threaded). Only for modes with no cross-trace state (pb/cgpb/pcr/pcrb/cgprb/vanilla); sbridge is forced to 1 (its DEE queue is cross-trace).")
 	flag.StringVar(&c.streamMetrics, "stream-metrics", "", "Corpus mode: stream per-trace metrics as CSV to this file (one row per trace, written + freed on finalize) instead of holding them all in RAM. Bounds memory to the in-flight trace set; post-process into the bagsize JSON with `trace_sim csv2json <csv> <out.json>`. Replaces -o (no JSON written directly).")
+	flag.StringVar(&c.sizeHistograms, "size-histograms", "", "Write exact overall baggage-call and emitted bridge-payload byte histograms as JSON. Can be used alone without -o/--stream-metrics.")
 	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
 	flag.BoolVar(&c.emitDepth, "emit-depth", true, "Emit absolute depth: varint(depth) replaces varint(depthMod) in _br payloads, and interior non-checkpoint spans carry a _d attribute (see docs/depth_emission.md). Default on: reconstruction relies on per-span depth, so its cost must be charged. Pass --emit-depth=false for the legacy depthMod accounting.")
 	flag.BoolVar(&c.emitOC, "emit-oc", true, "S-bridge: emit an _oc attribute (window-relative ordinal chain) on interior non-checkpoint spans so a surviving non-checkpoint can self-place. Default on: sbridge reconstruction needs per-span ordinal position, so charge it. (No effect on non-sbridge modes.)")
 	flag.BoolVar(&c.topoOnly, "topo-only", false, "S-bridge: emit topology only — drop the per-level EE sublists and DEE batches (Phase-2 ordering). Smaller _br payload, no DEE baggage; reconstructs call-graph shape but not event order.")
 	flag.IntVar(&c.fpBits, "fp-bits", 16, "S-bridge: non-checkpoint fingerprint width in bits (bit-packed in the _br fp section). Default 16 (legacy 2-byte). Narrower = smaller payload, higher reject rate.")
 	flag.BoolVar(&c.noOrdinal, "no-ordinal", false, "S-bridge: drop the ordinal from interior _o (emit depth only); severed survivors self-place by (depth, own-fp, parent-fp).")
+	flag.BoolVar(&c.lehmerEE, "lehmer-ee", false, "S-bridge: Lehmer-code each EE/DEE ordinal group (optional wire-format add-on; preserves group boundaries and event interleaving).")
 	flag.BoolVar(&c.logDee, "log-dee", false, "S-bridge: log DEE pickup/queue events to stderr")
 	flag.IntVar(&c.deeLogBytes, "dee-log-bytes", 10000, "Threshold for --log-dee")
 	flag.IntVar(&c.prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "truncated checkpoint-root span ID length in bytes (1-8); PCR/PCRB/CGPRB prefix and the S-bridge window anchor. 8 = full-width.")
@@ -92,8 +96,8 @@ func parseFlags() config {
 		fmt.Fprintln(os.Stderr, "error: --stream-metrics requires corpus mode (--corpus)")
 		os.Exit(2)
 	}
-	if c.outputPath == "" && c.streamMetrics == "" {
-		fmt.Fprintln(os.Stderr, "error: -o/--output required (or use --stream-metrics)")
+	if c.outputPath == "" && c.streamMetrics == "" && c.sizeHistograms == "" {
+		fmt.Fprintln(os.Stderr, "error: -o/--output required (or use --stream-metrics/--size-histograms)")
 		os.Exit(2)
 	}
 	if !c.bagsize {
@@ -138,6 +142,7 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 		h.EmitOC = c.emitOC
 		h.TopoOnly = c.topoOnly
 		h.OmitOrdinal = c.noOrdinal
+		h.LehmerEE = c.lehmerEE
 		if c.fpBits > 0 {
 			h.FPBits = c.fpBits
 		}
@@ -156,30 +161,44 @@ func main() {
 		runCSV2JSON(os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "histmerge" {
+		runHistogramMerge(os.Args[2:])
+		return
+	}
 	c := parseFlags()
+	var hist *sizeHistograms
+	if c.sizeHistograms != "" {
+		hist = newSizeHistograms()
+	}
 
 	var metrics []TraceMetrics
 	if c.corpusDir != "" {
-		metrics = runFromCorpus(c)
+		metrics = runFromCorpus(c, hist)
 	} else {
-		metrics = runFromJSON(c)
+		metrics = runFromJSON(c, hist)
 	}
 
 	if c.streamMetrics != "" {
 		// Per-trace records were streamed to the CSV; nothing to dump here.
 		// Post-process with cmd/bagsize_csv2json to get the bagsize JSON.
 		fmt.Fprintf(os.Stderr, "Streamed per-trace metrics to %s\n", c.streamMetrics)
-		return
+	} else if c.outputPath != "" {
+		if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth, c.emitOC); err != nil {
+			fmt.Fprintf(os.Stderr, "write output: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Wrote %d traces to %s\n", len(metrics), c.outputPath)
 	}
-
-	if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth, c.emitOC); err != nil {
-		fmt.Fprintf(os.Stderr, "write output: %v\n", err)
-		os.Exit(1)
+	if hist != nil {
+		if err := writeSizeHistograms(c.sizeHistograms, c, hist); err != nil {
+			fmt.Fprintf(os.Stderr, "write size histograms: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Wrote size histograms to %s\n", c.sizeHistograms)
 	}
-	fmt.Fprintf(os.Stderr, "Wrote %d traces to %s\n", len(metrics), c.outputPath)
 }
 
-func runFromJSON(c config) []TraceMetrics {
+func runFromJSON(c config, hist *sizeHistograms) []TraceMetrics {
 	t0 := time.Now()
 	traces, services, err := loadTracesFromDir(c.inputDir, c.traceCount, c.requireClean)
 	if err != nil {
@@ -214,12 +233,13 @@ func runFromJSON(c config) []TraceMetrics {
 	h := makeHandler(c,
 		func(id uint16) string { return services.Name(id) },
 		func(tid uint64) string { return traceSource[tid] })
-	metrics := runInterleavedJSON(traces, h)
+	releaseMetrics := c.outputPath == "" && c.streamMetrics == ""
+	metrics := runInterleavedJSON(traces, h, hist, releaseMetrics)
 	fmt.Fprintf(os.Stderr, "Simulated in %s\n", time.Since(t1).Round(time.Millisecond))
 	return metrics
 }
 
-func runFromCorpus(c config) []TraceMetrics {
+func runFromCorpus(c config, hist *sizeHistograms) []TraceMetrics {
 	t0 := time.Now()
 	eventsPath, metaPath := corpus.Paths(c.corpusDir)
 	meta, err := corpus.ReadMeta(metaPath)
@@ -269,9 +289,9 @@ func runFromCorpus(c config) []TraceMetrics {
 	var metrics []TraceMetrics
 	if W > 1 {
 		fmt.Fprintf(os.Stderr, "sharded: %d workers (parallel across traces)\n", W)
-		metrics = runShardedFromCorpus(er, meta, func() bridge.Handler { return makeHandler(c, svcFn, srcFn) }, c, W, stream)
+		metrics = runShardedFromCorpus(er, meta, func() bridge.Handler { return makeHandler(c, svcFn, srcFn) }, c, W, stream, hist)
 	} else {
-		metrics = runInterleavedFromCorpus(er, meta, makeHandler(c, svcFn, srcFn), c, stream)
+		metrics = runInterleavedFromCorpus(er, meta, makeHandler(c, svcFn, srcFn), c, stream, hist)
 	}
 	if stream != nil {
 		if err := stream.close(); err != nil {

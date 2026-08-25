@@ -20,9 +20,9 @@ const (
 	// payload accounting in Python (PB_BRIDGE_TYPE_ID = 1, CGP_BRIDGE_TYPE_ID
 	// = 2, SB_BRIDGE_TYPE_ID = 3). They double as numeric identifiers and
 	// as fixed byte counts; we mirror that arithmetic exactly.
-	PBBridgeTypeID    = 1
-	CGPBridgeTypeID   = 2
-	SBridgeTypeID     = 3
+	PBBridgeTypeID  = 1
+	CGPBridgeTypeID = 2
+	SBridgeTypeID   = 3
 
 	// Default bloom false-positive rate used by PB and CGPB.
 	DefaultBloomFPRate = 0.0001
@@ -209,16 +209,24 @@ func countFPs(chain []bcEntry) int {
 // fpBits is the bit width of each non-checkpoint parent fingerprint; ckptBytes
 // is the truncated checkpoint-root anchor width (1-8 bytes).
 func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte, fpBits, ckptBytes int) int {
+	return sbridgeBRSizeWithCoding(depth, chain, deeBytes, fpBits, ckptBytes, false)
+}
+
+func sbridgeBRSizeWithCoding(depth int, chain []bcEntry, deeBytes []byte, fpBits, ckptBytes int, lehmer bool) int {
 	size := VarintLen(depth) + VarintLen(len(chain))
 	for i := range chain { // ordinals section
 		size += VarintLen(maxInt(chain[i].ord, 0))
 	}
-	size += ckptBytes                           // ckpt anchor leads the fp section
-	size += (countFPs(chain)*fpBits + 7) / 8    // bit-packed non-checkpoint fps
-	for i := range chain {                      // end-events section
+	size += ckptBytes                        // ckpt anchor leads the fp section
+	size += (countFPs(chain)*fpBits + 7) / 8 // bit-packed non-checkpoint fps
+	for i := range chain {                   // end-events section
 		size += VarintLen(len(chain[i].ee))
-		for _, s := range chain[i].ee {
-			size += VarintLen(s)
+		if lehmer {
+			size += partialPermutationBytes(maxInt(chain[i].ord-1, 0), len(chain[i].ee))
+		} else {
+			for _, s := range chain[i].ee {
+				size += VarintLen(s)
+			}
 		}
 	}
 	size += len(deeBytes)
@@ -235,6 +243,10 @@ func sbridgeBRSize(depth int, chain []bcEntry, deeBytes []byte, fpBits, ckptByte
 //	  END-EVENTS:  L × ( varint(n) ‖ n × varint(seq) )
 //	  dee_bytes
 //
+// With SBridgeHandler.LehmerEE, each END-EVENTS body changes from raw ordinal
+// varints to the fixed-width rank documented in docs/sbridge_lehmer.md. The
+// leading count and the per-level group boundaries do not change.
+//
 // Per-level depth and the legacy count field are dropped — depth is derivable
 // from (depth, L, position) and fp presence from depth%cpd, so the decoder
 // recomputes both. fpBits is the width of each non-checkpoint parent fingerprint
@@ -247,7 +259,17 @@ func PackSBridgeBR(
 	deeBytes []byte,
 	fpBits int,
 ) []byte {
-	out := make([]byte, 0, sbridgeBRSize(depth, chain, deeBytes, fpBits, ckptBytes))
+	return packSBridgeBR(depth, ckpt, ckptBytes, chain, deeBytes, fpBits, false)
+}
+
+// PackSBridgeBRLehmer is PackSBridgeBR with Lehmer coding enabled for EE
+// groups. Any trailing DEE bytes must have been produced by EncodeDEEQuadLehmer.
+func PackSBridgeBRLehmer(depth int, ckpt [8]byte, ckptBytes int, chain []bcEntry, deeBytes []byte, fpBits int) []byte {
+	return packSBridgeBR(depth, ckpt, ckptBytes, chain, deeBytes, fpBits, true)
+}
+
+func packSBridgeBR(depth int, ckpt [8]byte, ckptBytes int, chain []bcEntry, deeBytes []byte, fpBits int, lehmer bool) []byte {
+	out := make([]byte, 0, sbridgeBRSizeWithCoding(depth, chain, deeBytes, fpBits, ckptBytes, lehmer))
 	out = binary.AppendUvarint(out, uint64(maxInt(depth, 0)))
 	out = binary.AppendUvarint(out, uint64(len(chain)))
 	for i := range chain { // ORDINALS
@@ -263,8 +285,16 @@ func PackSBridgeBR(
 	out = appendPackedBits(out, fps, fpBits)
 	for i := range chain { // END-EVENTS
 		out = binary.AppendUvarint(out, uint64(len(chain[i].ee)))
-		for _, s := range chain[i].ee {
-			out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))
+		if lehmer {
+			rank, err := encodePartialPermutation(maxInt(chain[i].ord-1, 0), chain[i].ee)
+			if err != nil {
+				panic("invalid S-Bridge EE group: " + err.Error())
+			}
+			out = append(out, rank...)
+		} else {
+			for _, s := range chain[i].ee {
+				out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))
+			}
 		}
 	}
 	out = append(out, deeBytes...)
@@ -320,13 +350,29 @@ func unpackBits(b []byte, count, w int) []uint64 {
 // there's no surrounding path to narrow candidates the way a chain fp can. The
 // wider the owner fp, the more decisively it pins the owner on its own.
 func EncodeDEEQuad(traceID16 [16]byte, depth int, ownerFP uint64, fpBits int, seqs []int) []byte {
+	return encodeDEEQuad(traceID16, depth, ownerFP, fpBits, 0, seqs, false)
+}
+
+// EncodeDEEQuadLehmer encodes a DEE group as a Lehmer-ranked ordered partial
+// permutation. childCount is included on the wire, making the rank's universe
+// independent of owner attribution (and therefore still useful for pruning
+// fingerprint collisions during reconstruction).
+func EncodeDEEQuadLehmer(traceID16 [16]byte, depth int, ownerFP uint64, fpBits, childCount int, seqs []int) []byte {
+	return encodeDEEQuad(traceID16, depth, ownerFP, fpBits, childCount, seqs, true)
+}
+
+func encodeDEEQuad(traceID16 [16]byte, depth int, ownerFP uint64, fpBits, childCount int, seqs []int, lehmer bool) []byte {
 	ownerBytes := (fpBits + 7) / 8
 	if ownerBytes < 1 {
 		ownerBytes = 1
 	}
 	size := 16 + VarintLen(depth) + ownerBytes + VarintLen(len(seqs))
-	for _, s := range seqs {
-		size += VarintLen(s)
+	if lehmer {
+		size += VarintLen(childCount) + partialPermutationBytes(childCount, len(seqs))
+	} else {
+		for _, s := range seqs {
+			size += VarintLen(s)
+		}
 	}
 	out := make([]byte, 0, size)
 	out = append(out, traceID16[:]...)
@@ -334,9 +380,20 @@ func EncodeDEEQuad(traceID16 [16]byte, depth int, ownerFP uint64, fpBits int, se
 	for i := ownerBytes - 1; i >= 0; i-- { // big-endian, low ownerBytes of the right-aligned fp
 		out = append(out, byte(ownerFP>>uint(8*i)))
 	}
+	if lehmer {
+		out = binary.AppendUvarint(out, uint64(maxInt(childCount, 0)))
+	}
 	out = binary.AppendUvarint(out, uint64(len(seqs)))
-	for _, s := range seqs {
-		out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))
+	if lehmer {
+		rank, err := encodePartialPermutation(childCount, seqs)
+		if err != nil {
+			panic("invalid S-Bridge DEE group: " + err.Error())
+		}
+		out = append(out, rank...)
+	} else {
+		for _, s := range seqs {
+			out = binary.AppendUvarint(out, uint64(maxInt(s, 0)))
+		}
 	}
 	return out
 }

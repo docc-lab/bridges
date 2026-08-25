@@ -97,7 +97,13 @@ func ScoreStructure(res SBResult, truth SBTruth, endPos map[uint64]int64, deeQua
 	deeByParent := map[uint64][]int{}
 	ambiguous := false
 	for _, q := range deeQuads {
-		quads, err := bridge.DecodeDEEQuads(q, res.FPBits)
+		var quads []bridge.DEEQuad
+		var err error
+		if res.LehmerEE {
+			quads, err = bridge.DecodeDEEQuadsLehmer(q, res.FPBits)
+		} else {
+			quads, err = bridge.DecodeDEEQuads(q, res.FPBits)
+		}
 		if err != nil {
 			continue
 		}

@@ -19,7 +19,7 @@ type tspan struct {
 // as the simulator would (events in global sorted order, parentSeqNum = the
 // child's 1-based start rank under its parent), capturing the actual serialized
 // _br payload of every emitting span. Returns the reconstructor inputs.
-func runSBridge(t *testing.T, traceID uint64, spans []tspan, cpd int) []SBInput {
+func runSBridge(t *testing.T, traceID uint64, spans []tspan, cpd int, lehmerEE ...bool) []SBInput {
 	t.Helper()
 	depth := map[uint64]int{}
 	for _, s := range spans {
@@ -75,6 +75,9 @@ func runSBridge(t *testing.T, traceID uint64, spans []tspan, cpd int) []SBInput 
 	})
 
 	h := bridge.NewSBridgeHandler(cpd, nil)
+	if len(lehmerEE) > 0 {
+		h.LehmerEE = lehmerEE[0]
+	}
 	payloads := map[uint64][]byte{}
 	h.EmitSink = func(_ /*tid*/, sid uint64, payload []byte) {
 		payloads[sid] = append([]byte(nil), payload...)
@@ -134,12 +137,12 @@ func TestSBridgeReconstructNoDropSingleWindow(t *testing.T) {
 	const traceID = 0xabcdef0123456789
 	// ids chosen with distinct top-4/top-2 bytes so fp checks are meaningful.
 	spans := []tspan{
-		{id: 0x1111_0000_0000_0001, parent: 0, start: 0, end: 100},               // root (depth 0 checkpoint)
-		{id: 0x2222_0000_0000_0002, parent: 0x1111_0000_0000_0001, start: 10, end: 40},  // A
-		{id: 0x3333_0000_0000_0003, parent: 0x1111_0000_0000_0001, start: 50, end: 90},  // B
-		{id: 0x4444_0000_0000_0004, parent: 0x2222_0000_0000_0002, start: 12, end: 20},  // A1 leaf
-		{id: 0x5555_0000_0000_0005, parent: 0x2222_0000_0000_0002, start: 22, end: 38},  // A2 leaf
-		{id: 0x6666_0000_0000_0006, parent: 0x3333_0000_0000_0003, start: 60, end: 80},  // B1 leaf
+		{id: 0x1111_0000_0000_0001, parent: 0, start: 0, end: 100},                     // root (depth 0 checkpoint)
+		{id: 0x2222_0000_0000_0002, parent: 0x1111_0000_0000_0001, start: 10, end: 40}, // A
+		{id: 0x3333_0000_0000_0003, parent: 0x1111_0000_0000_0001, start: 50, end: 90}, // B
+		{id: 0x4444_0000_0000_0004, parent: 0x2222_0000_0000_0002, start: 12, end: 20}, // A1 leaf
+		{id: 0x5555_0000_0000_0005, parent: 0x2222_0000_0000_0002, start: 22, end: 38}, // A2 leaf
+		{id: 0x6666_0000_0000_0006, parent: 0x3333_0000_0000_0003, start: 60, end: 80}, // B1 leaf
 	}
 	const cpd = 100
 
@@ -153,6 +156,22 @@ func TestSBridgeReconstructNoDropSingleWindow(t *testing.T) {
 	v := ScoreSBridge(res, truthFromSpans(spans))
 	if !v.Correct {
 		t.Fatalf("reconstruction not correct: unsolvable=%v reason=%q", v.Unsolvable, v.Reason)
+	}
+}
+
+func TestSBridgeReconstructNoDropLehmer(t *testing.T) {
+	const traceID = 0xabcdef0123456789
+	spans := []tspan{
+		{id: 0x1111_0000_0000_0001, parent: 0, start: 0, end: 100},
+		{id: 0x2222_0000_0000_0002, parent: 0x1111_0000_0000_0001, start: 10, end: 40},
+		{id: 0x3333_0000_0000_0003, parent: 0x1111_0000_0000_0001, start: 20, end: 90},
+		{id: 0x4444_0000_0000_0004, parent: 0x1111_0000_0000_0001, start: 50, end: 80},
+	}
+	const cpd = 100
+	inputs := runSBridge(t, traceID, spans, cpd, true)
+	res := ReconstructSBridge(inputs, nil, Config{CPD: cpd, SBridgeLehmer: true})
+	if v := ScoreSBridge(res, truthFromSpans(spans)); !v.Correct {
+		t.Fatalf("Lehmer reconstruction not correct: unsolvable=%v reason=%q", v.Unsolvable, v.Reason)
 	}
 }
 

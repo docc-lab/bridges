@@ -81,6 +81,15 @@ func (c *cursor) done() bool { return c.err == nil && c.i >= len(c.b) }
 // with — all needed because per-level depth and fp presence are derived (not
 // stored), the fps are bit-packed at fpBits, and the anchor occupies ckptBytes.
 func DecodeSBridgeBR(b []byte, cpd, fpBits, ckptBytes int) (SBridgeBR, error) {
+	return decodeSBridgeBR(b, cpd, fpBits, ckptBytes, false)
+}
+
+// DecodeSBridgeBRLehmer decodes payloads emitted with SBridgeHandler.LehmerEE.
+func DecodeSBridgeBRLehmer(b []byte, cpd, fpBits, ckptBytes int) (SBridgeBR, error) {
+	return decodeSBridgeBR(b, cpd, fpBits, ckptBytes, true)
+}
+
+func decodeSBridgeBR(b []byte, cpd, fpBits, ckptBytes int, lehmer bool) (SBridgeBR, error) {
 	if cpd < 1 {
 		return SBridgeBR{}, errors.New("cpd must be >= 1")
 	}
@@ -124,9 +133,19 @@ func DecodeSBridgeBR(b []byte, cpd, fpBits, ckptBytes int) (SBridgeBR, error) {
 	for i := 0; i < L; i++ {
 		m := c.uvarint()
 		if m > 0 {
-			br.Chain[i].EE = make([]int, 0, m)
-			for j := 0; j < m; j++ {
-				br.Chain[i].EE = append(br.Chain[i].EE, c.uvarint())
+			if lehmer {
+				n := maxInt(br.Chain[i].Ord-1, 0)
+				raw := c.take(partialPermutationBytes(n, m))
+				var err error
+				br.Chain[i].EE, err = decodePartialPermutation(n, m, raw)
+				if err != nil {
+					return br, fmt.Errorf("EE level %d: %w", i, err)
+				}
+			} else {
+				br.Chain[i].EE = make([]int, 0, m)
+				for j := 0; j < m; j++ {
+					br.Chain[i].EE = append(br.Chain[i].EE, c.uvarint())
+				}
 			}
 		}
 		if c.err != nil {
@@ -137,7 +156,7 @@ func DecodeSBridgeBR(b []byte, cpd, fpBits, ckptBytes int) (SBridgeBR, error) {
 	// Each carries the owner fp in ceil(fpBits/8) bytes (matching the emit width).
 	ownerBytes := (fpBits + 7) / 8
 	for !c.done() {
-		q, err := decodeDEEQuadAt(c, ownerBytes)
+		q, err := decodeDEEQuadAt(c, ownerBytes, lehmer)
 		if err != nil {
 			return br, err
 		}
@@ -149,6 +168,15 @@ func DecodeSBridgeBR(b []byte, cpd, fpBits, ckptBytes int) (SBridgeBR, error) {
 // DecodeDEEQuads parses a concatenation of DEE quadruples (e.g. a drained queue).
 // fpBits is the fingerprint width the quads were emitted with (sets owner width).
 func DecodeDEEQuads(b []byte, fpBits int) ([]DEEQuad, error) {
+	return decodeDEEQuads(b, fpBits, false)
+}
+
+// DecodeDEEQuadsLehmer decodes DEE groups emitted by EncodeDEEQuadLehmer.
+func DecodeDEEQuadsLehmer(b []byte, fpBits int) ([]DEEQuad, error) {
+	return decodeDEEQuads(b, fpBits, true)
+}
+
+func decodeDEEQuads(b []byte, fpBits int, lehmer bool) ([]DEEQuad, error) {
 	ownerBytes := (fpBits + 7) / 8
 	if ownerBytes < 1 {
 		ownerBytes = 1
@@ -156,7 +184,7 @@ func DecodeDEEQuads(b []byte, fpBits int) ([]DEEQuad, error) {
 	c := &cursor{b: b}
 	var out []DEEQuad
 	for !c.done() {
-		q, err := decodeDEEQuadAt(c, ownerBytes)
+		q, err := decodeDEEQuadAt(c, ownerBytes, lehmer)
 		if err != nil {
 			return out, err
 		}
@@ -165,7 +193,7 @@ func DecodeDEEQuads(b []byte, fpBits int) ([]DEEQuad, error) {
 	return out, c.err
 }
 
-func decodeDEEQuadAt(c *cursor, ownerBytes int) (DEEQuad, error) {
+func decodeDEEQuadAt(c *cursor, ownerBytes int, lehmer bool) (DEEQuad, error) {
 	var q DEEQuad
 	copy(q.TraceID16[:], c.take(16))
 	q.Depth = c.uvarint()
@@ -177,11 +205,24 @@ func decodeDEEQuadAt(c *cursor, ownerBytes int) (DEEQuad, error) {
 		}
 		q.OwnerFP = v
 	}
+	universe := 0
+	if lehmer {
+		universe = c.uvarint()
+	}
 	n := c.uvarint()
 	if n > 0 {
-		q.Seqs = make([]int, 0, n)
-		for j := 0; j < n; j++ {
-			q.Seqs = append(q.Seqs, c.uvarint())
+		if lehmer {
+			raw := c.take(partialPermutationBytes(universe, n))
+			var err error
+			q.Seqs, err = decodePartialPermutation(universe, n, raw)
+			if err != nil {
+				return q, fmt.Errorf("DEE: %w", err)
+			}
+		} else {
+			q.Seqs = make([]int, 0, n)
+			for j := 0; j < n; j++ {
+				q.Seqs = append(q.Seqs, c.uvarint())
+			}
 		}
 	}
 	return q, c.err

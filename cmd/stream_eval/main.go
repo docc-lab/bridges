@@ -41,6 +41,7 @@ func main() {
 	var n int
 	var baseSeed int64
 	var workers, cpd, fpBits int
+	var lehmerEE bool
 	var dropRate float64
 	var sbDropSeed, cgDropSeed int64
 	flag.StringVar(&c.Shape, "shape", "slab", "tree shape (see trace_gen): chain|star|kary|skewed|branch|spine|deepwide|slab")
@@ -61,6 +62,7 @@ func main() {
 	flag.IntVar(&cpd, "cpd", 8, "checkpoint distance (both schemes)")
 	flag.Float64Var(&dropRate, "drop-rate", 0.5, "per-span drop probability (per-trace seeded)")
 	flag.IntVar(&fpBits, "fp-bits", 16, "S-Bridge non-checkpoint fingerprint width in bits")
+	flag.BoolVar(&lehmerEE, "lehmer-ee", false, "Lehmer-code S-Bridge EE/DEE ordinal groups")
 	var prefixLen int
 	flag.IntVar(&prefixLen, "prefix-len", bridge.DefaultPCRPrefixLen, "checkpoint-root width in bytes (1-8): CGPRB prefix and S-Bridge window anchor. 8 = full-width.")
 	flag.IntVar(&n, "n", 1000, "number of traces to generate+evaluate")
@@ -82,7 +84,7 @@ func main() {
 	// cgprb recon config: same constructor/defaults as trace_recon --mode cgprb.
 	// Bloom FP target overridable via env (must match the emit side) for sweeping.
 	cgCfg := recon.NewPCRBConfig(cpd, prefixLen, bloomFPTarget())
-	sbCfg := recon.Config{CPD: cpd, FPBits: fpBits, PrefixLen: prefixLen}
+	sbCfg := recon.Config{CPD: cpd, FPBits: fpBits, PrefixLen: prefixLen, SBridgeLehmer: lehmerEE}
 
 	t0 := time.Now()
 	results := make([]stats, workers)
@@ -321,7 +323,7 @@ type sbSpanInfo struct {
 
 func evalSBridge(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.Config, cpd int, rate float64, dropSeed int64, fpBits, nspans int) {
 	tr := corpus.StoredTrace{TraceID: tid, Events: events}
-	payloads, truth, spans, dees := sbEmitTrace(tr, cpd, false, fpBits, false, cfg.PrefixLen)
+	payloads, truth, spans, dees := sbEmitTrace(tr, cpd, false, fpBits, false, cfg.PrefixLen, cfg.SBridgeLehmer)
 	dropped := sbDropSet(tr, rate, dropSeed, cpd)
 
 	inputs := make([]recon.SBInput, 0, len(payloads))
@@ -388,11 +390,12 @@ func evalSBridge(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.C
 
 // sbEmitTrace replays one trace through a fresh SBridgeHandler (verbatim from
 // cmd/sbridge_recon/main.go).
-func sbEmitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool, ckptBytes int) (map[uint64][]byte, recon.SBTruth, []sbSpanInfo, [][]byte) {
+func sbEmitTrace(tr corpus.StoredTrace, cpd int, topoOnly bool, fpBits int, noOrdinal bool, ckptBytes int, lehmerEE bool) (map[uint64][]byte, recon.SBTruth, []sbSpanInfo, [][]byte) {
 	h := bridge.NewSBridgeHandler(cpd, nil)
 	h.EmitOC = true
 	h.TopoOnly = topoOnly
 	h.OmitOrdinal = noOrdinal
+	h.LehmerEE = lehmerEE
 	if fpBits > 0 {
 		h.FPBits = fpBits
 	}

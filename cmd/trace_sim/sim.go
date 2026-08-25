@@ -134,10 +134,10 @@ type TraceMetrics struct {
 	NumBaggageCalls    int
 	BaggageSum         int
 	BaggageMax         int
-	NumDepthSpans      int // spans carrying a _d attribute (--emit-depth only)
-	DepthSum           int // total _d attribute bytes (--emit-depth only)
-	NumOcSpans         int // spans carrying an _oc ordinal chain (--emit-oc only)
-	OcSum              int // total _oc attribute bytes (--emit-oc only)
+	NumDepthSpans      int                 // spans carrying a _d attribute (--emit-depth only)
+	DepthSum           int                 // total _d attribute bytes (--emit-depth only)
+	NumOcSpans         int                 // spans carrying an _oc ordinal chain (--emit-oc only)
+	OcSum              int                 // total _oc attribute bytes (--emit-oc only)
 	emitted            map[uint64]struct{} // (span_id) — dedupe Start vs End emit
 }
 
@@ -176,18 +176,21 @@ type simState struct {
 	// set. spanCountByTID supplies each trace's span count for that lazy alloc.
 	stream         *streamWriter
 	spanCountByTID map[uint64]int
+	releaseMetrics bool
+	hist           *sizeHistograms
 }
 
-
-func newSimState(traceOrder []uint64, spanCounts []int, stream *streamWriter) *simState {
+func newSimState(traceOrder []uint64, spanCounts []int, stream *streamWriter, releaseMetrics bool, hist *sizeHistograms) *simState {
 	s := &simState{
-		metricsByTID: make(map[uint64]*TraceMetrics, len(traceOrder)),
-		traceOrder:   traceOrder,
-		openByTID:    make(map[uint64]int, len(traceOrder)),
-		nextSeq:      make(map[uint64]map[uint64]int),
-		stream:       stream,
+		metricsByTID:   make(map[uint64]*TraceMetrics, len(traceOrder)),
+		traceOrder:     traceOrder,
+		openByTID:      make(map[uint64]int, len(traceOrder)),
+		nextSeq:        make(map[uint64]map[uint64]int),
+		stream:         stream,
+		releaseMetrics: releaseMetrics,
+		hist:           hist,
 	}
-	if stream != nil {
+	if releaseMetrics {
 		// Lazy: keep only a tid->span-count index up front; per-trace metrics and
 		// openByTID entries are created on first event and freed on finalize.
 		s.spanCountByTID = make(map[uint64]int, len(traceOrder))
@@ -215,7 +218,7 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 		ServiceID: e.serviceID,
 	}
 	m := s.metricsByTID[e.traceID]
-	if m == nil && s.stream != nil { // streaming: allocate on first event seen
+	if m == nil && s.releaseMetrics { // streaming/hist-only: allocate on first event seen
 		sc := s.spanCountByTID[e.traceID]
 		m = newTraceMetrics(sc)
 		s.metricsByTID[e.traceID] = m
@@ -243,6 +246,7 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 				e.spanID, seqNum, btoi(r.BaggageFound), r.BaggageBytes, ne)
 		}
 		if r.BaggageFound && m != nil {
+			s.hist.recordBaggage(r.BaggageBytes)
 			m.NumBaggageCalls++
 			m.BaggageSum += r.BaggageBytes
 			if r.BaggageBytes > m.BaggageMax {
@@ -251,6 +255,7 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 		}
 		if r.EmitBytes > 0 && m != nil {
 			if _, seen := m.emitted[e.spanID]; !seen {
+				s.hist.recordPayload(r.EmitBytes)
 				m.emitted[e.spanID] = struct{}{}
 				m.NumCheckpointSpans++
 				m.CheckpointSum += r.EmitBytes
@@ -270,6 +275,7 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 		}
 		if r.EmitBytes > 0 && m != nil {
 			if _, seen := m.emitted[e.spanID]; !seen {
+				s.hist.recordPayload(r.EmitBytes)
 				m.emitted[e.spanID] = struct{}{}
 				m.NumCheckpointSpans++
 				m.CheckpointSum += r.EmitBytes
@@ -293,8 +299,10 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 		h.EvictTrace(e.traceID)
 		delete(s.openByTID, e.traceID)
 		delete(s.nextSeq, e.traceID) // free this trace's child-ordinal counters
-		if s.stream != nil { // streaming: emit this trace's record and free it
-			s.stream.writeRec(e.traceID, m)
+		if s.releaseMetrics {        // streaming/hist-only: write if requested, then free
+			if s.stream != nil {
+				s.stream.writeRec(e.traceID, m)
+			}
 			delete(s.metricsByTID, e.traceID)
 		}
 		if s.gCompleted != nil { // sharded: count into the shared atomic
@@ -314,6 +322,9 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 }
 
 func (s *simState) finalize() []TraceMetrics {
+	if s.releaseMetrics {
+		return nil
+	}
 	out := make([]TraceMetrics, len(s.traceOrder))
 	for i, tid := range s.traceOrder {
 		out[i] = *s.metricsByTID[tid]
@@ -322,7 +333,7 @@ func (s *simState) finalize() []TraceMetrics {
 }
 
 // runInterleavedJSON drives an in-memory traces slice through the handler.
-func runInterleavedJSON(traces []loader.Trace, h bridge.Handler) []TraceMetrics {
+func runInterleavedJSON(traces []loader.Trace, h bridge.Handler, hist *sizeHistograms, releaseMetrics bool) []TraceMetrics {
 	events := buildAndSortEvents(traces)
 
 	traceOrder := make([]uint64, len(traces))
@@ -331,7 +342,7 @@ func runInterleavedJSON(traces []loader.Trace, h bridge.Handler) []TraceMetrics 
 		traceOrder[i] = t.TraceID
 		spanCounts[i] = len(t.Spans)
 	}
-	s := newSimState(traceOrder, spanCounts, nil)
+	s := newSimState(traceOrder, spanCounts, nil, releaseMetrics, hist)
 
 	for _, e := range events {
 		s.onEvent(h, e)
@@ -388,9 +399,10 @@ func selectTraces(meta *corpus.Meta, cfg config) (traceOrder []uint64, spanCount
 	return
 }
 
-func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h bridge.Handler, cfg config, stream *streamWriter) []TraceMetrics {
+func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h bridge.Handler, cfg config, stream *streamWriter, hist *sizeHistograms) []TraceMetrics {
 	traceOrder, spanCounts, selected := selectTraces(meta, cfg)
-	s := newSimState(traceOrder, spanCounts, stream)
+	releaseMetrics := stream != nil || (cfg.outputPath == "" && cfg.streamMetrics == "")
+	s := newSimState(traceOrder, spanCounts, stream, releaseMetrics, hist)
 	s.progressN, s.t0 = cfg.progressN, time.Now()
 
 	for {
@@ -436,7 +448,7 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 // shards, summing to the same total memory as the single-threaded path. A single
 // reader routes each event to its owner's channel (bounded → backpressure).
 // makeH must return a FRESH, independent handler on each call.
-func runShardedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, makeH func() bridge.Handler, cfg config, workers int, stream *streamWriter) []TraceMetrics {
+func runShardedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, makeH func() bridge.Handler, cfg config, workers int, stream *streamWriter, hist *sizeHistograms) []TraceMetrics {
 	traceOrder, spanCounts, selected := selectTraces(meta, cfg)
 	W := workers
 	if W < 1 {
@@ -460,7 +472,8 @@ func runShardedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, makeH func
 	chans := make([]chan streamEvent, W)
 	var wg sync.WaitGroup
 	for w := 0; w < W; w++ {
-		s := newSimState(subOrder[w], subCounts[w], stream)
+		releaseMetrics := stream != nil || (cfg.outputPath == "" && cfg.streamMetrics == "")
+		s := newSimState(subOrder[w], subCounts[w], stream, releaseMetrics, hist)
 		s.gCompleted, s.gProgressN, s.t0 = &gCompleted, cfg.progressN, t0
 		states[w] = s
 		handlers[w] = makeH()

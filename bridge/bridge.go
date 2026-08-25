@@ -19,6 +19,10 @@ type Event struct {
 	SpanID    uint64
 	ParentID  uint64 // 0 = root (no parent)
 	ServiceID uint16
+	// DEEQueueID identifies a simulated service instance. S-Bridge uses it
+	// only when UseDEEQueueID is enabled; otherwise its DEE queues retain the
+	// legacy per-ServiceID behavior.
+	DEEQueueID uint32
 }
 
 // Kind discriminates a Start vs End event in the simulator's stream.
@@ -72,8 +76,8 @@ type EndResult struct {
 //
 // EvictTrace is called by the simulator when a trace closes (every span has
 // ended); the handler should free any per-(trace, span) state for that trace.
-// Cross-trace state (e.g. S-Bridge per-service DEE queues) must NOT be
-// touched by EvictTrace.
+// Cross-trace state (e.g. S-Bridge per-service-instance DEE queues) must NOT
+// be touched by EvictTrace.
 type Handler interface {
 	OnStart(ev *Event, parentSeqNum int) StartResult
 	OnEnd(ev *Event) EndResult
@@ -114,7 +118,7 @@ func TraceID16(id uint64) [16]byte {
 // VanillaHandler is the no-op handler — matches Python VanillaHandler.
 type VanillaHandler struct{}
 
-func NewVanillaHandler() *VanillaHandler                                { return &VanillaHandler{} }
-func (h *VanillaHandler) OnStart(_ *Event, _ int) StartResult           { return StartResult{} }
-func (h *VanillaHandler) OnEnd(_ *Event) EndResult                      { return EndResult{} }
-func (h *VanillaHandler) EvictTrace(_ uint64)                           {}
+func NewVanillaHandler() *VanillaHandler                      { return &VanillaHandler{} }
+func (h *VanillaHandler) OnStart(_ *Event, _ int) StartResult { return StartResult{} }
+func (h *VanillaHandler) OnEnd(_ *Event) EndResult            { return EndResult{} }
+func (h *VanillaHandler) EvictTrace(_ uint64)                 {}

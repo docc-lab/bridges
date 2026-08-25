@@ -65,13 +65,14 @@ func btoi(b bool) int {
 // streamEvent is one start or end event in the simulator's sorted order.
 // Same shape as corpus.Event but in-memory; conversions are trivial.
 type streamEvent struct {
-	ts        int64
-	kind      bridge.Kind
-	depth     int // sort tie-break, not consumed by handlers
-	traceID   uint64
-	spanID    uint64
-	parentID  uint64
-	serviceID uint16
+	ts         int64
+	kind       bridge.Kind
+	depth      int // sort tie-break, not consumed by handlers
+	traceID    uint64
+	spanID     uint64
+	parentID   uint64
+	serviceID  uint16
+	deeQueueID uint32
 }
 
 // buildAndSortEvents takes traces in load order and returns the globally
@@ -212,10 +213,11 @@ var dumpPerSpans = os.Getenv("TRACE_SIM_DUMP_PERSPANS") == "1"
 // metric accumulators. Same logic for JSON-direct and corpus modes.
 func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 	ev := &bridge.Event{
-		TraceID:   e.traceID,
-		SpanID:    e.spanID,
-		ParentID:  e.parentID,
-		ServiceID: e.serviceID,
+		TraceID:    e.traceID,
+		SpanID:     e.spanID,
+		ParentID:   e.parentID,
+		ServiceID:  e.serviceID,
+		DEEQueueID: e.deeQueueID,
 	}
 	m := s.metricsByTID[e.traceID]
 	if m == nil && s.releaseMetrics { // streaming/hist-only: allocate on first event seen
@@ -399,7 +401,7 @@ func selectTraces(meta *corpus.Meta, cfg config) (traceOrder []uint64, spanCount
 	return
 }
 
-func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h bridge.Handler, cfg config, stream *streamWriter, hist *sizeHistograms) []TraceMetrics {
+func runInterleavedFromCorpus(er *corpus.EventsReader, qr *corpus.DEEQueueReader, meta *corpus.Meta, h bridge.Handler, cfg config, stream *streamWriter, hist *sizeHistograms) []TraceMetrics {
 	traceOrder, spanCounts, selected := selectTraces(meta, cfg)
 	releaseMetrics := stream != nil || (cfg.outputPath == "" && cfg.streamMetrics == "")
 	s := newSimState(traceOrder, spanCounts, stream, releaseMetrics, hist)
@@ -414,23 +416,38 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, h brid
 			fmt.Fprintf(os.Stderr, "corpus read error: %v\n", err)
 			os.Exit(1)
 		}
+		var queueID uint32
+		if qr != nil {
+			queueID, err = qr.Next()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "DEE queue-ID read error: %v\n", err)
+				os.Exit(1)
+			}
+		}
 		if selected != nil {
 			if _, ok := selected[ce.TraceID]; !ok {
 				continue
 			}
 		}
 		s.onEvent(h, streamEvent{
-			ts:        ce.TS,
-			kind:      bridge.Kind(ce.Kind),
-			depth:     int(ce.Depth),
-			traceID:   ce.TraceID,
-			spanID:    ce.SpanID,
-			parentID:  ce.ParentID,
-			serviceID: ce.ServiceID,
+			ts:         ce.TS,
+			kind:       bridge.Kind(ce.Kind),
+			depth:      int(ce.Depth),
+			traceID:    ce.TraceID,
+			spanID:     ce.SpanID,
+			parentID:   ce.ParentID,
+			serviceID:  ce.ServiceID,
+			deeQueueID: queueID,
 		})
 		// --first: stop as soon as all selected traces have finalized.
 		if cfg.first > 0 && s.completed >= len(traceOrder) {
 			break
+		}
+	}
+	if qr != nil && !(cfg.first > 0 && s.completed >= len(traceOrder)) {
+		if err := qr.ValidateEOF(); err != nil {
+			fmt.Fprintf(os.Stderr, "DEE queue-ID validation error: %v\n", err)
+			os.Exit(1)
 		}
 	}
 	if stream != nil {

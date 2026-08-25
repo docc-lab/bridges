@@ -80,6 +80,7 @@ type sizeHistogramFile struct {
 	Mode               string          `json:"mode"`
 	CheckpointDistance int             `json:"checkpoint_distance"`
 	LehmerEE           bool            `json:"lehmer_ee"`
+	DEEInstanceQueues  bool            `json:"dee_instance_queues"`
 	BaggageCallBytes   histogramOutput `json:"baggage_call_bytes"`
 	BridgePayloadBytes histogramOutput `json:"bridge_payload_bytes"`
 }
@@ -91,6 +92,7 @@ func writeSizeHistograms(path string, c config, h *sizeHistograms) error {
 		Mode:               c.mode,
 		CheckpointDistance: c.checkpointDistance,
 		LehmerEE:           c.lehmerEE,
+		DEEInstanceQueues:  c.deeQueueIDs != "",
 		BaggageCallBytes:   snapshotHistogram(h.baggage),
 		BridgePayloadBytes: snapshotHistogram(h.payload),
 	}
@@ -131,8 +133,9 @@ func runHistogramMerge(args []string) {
 		if i == 0 {
 			base = in
 		} else if in.Schema != base.Schema || in.Mode != base.Mode ||
-			in.CheckpointDistance != base.CheckpointDistance || in.LehmerEE != base.LehmerEE {
-			fmt.Fprintf(os.Stderr, "incompatible histogram %s (schema/mode/cpd/lehmer mismatch)\n", path)
+			in.CheckpointDistance != base.CheckpointDistance || in.LehmerEE != base.LehmerEE ||
+			in.DEEInstanceQueues != base.DEEInstanceQueues {
+			fmt.Fprintf(os.Stderr, "incompatible histogram %s (schema/mode/cpd/lehmer/DEE-instance mismatch)\n", path)
 			os.Exit(1)
 		}
 		for _, b := range in.BaggageCallBytes.Bins {
@@ -143,6 +146,9 @@ func runHistogramMerge(args []string) {
 		}
 	}
 	c := config{mode: base.Mode, checkpointDistance: base.CheckpointDistance, lehmerEE: base.LehmerEE}
+	if base.DEEInstanceQueues {
+		c.deeQueueIDs = "merged"
+	}
 	if err := writeSizeHistograms(outPath, c, h); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", outPath, err)
 		os.Exit(1)

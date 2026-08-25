@@ -26,7 +26,7 @@ func TestSizeHistogramSnapshotAndWrite(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "hist.json")
-	c := config{mode: "sbridge", checkpointDistance: 4, lehmerEE: true}
+	c := config{mode: "sbridge", checkpointDistance: 4, lehmerEE: true, deeQueueIDs: "instances.bin"}
 	if err := writeSizeHistograms(path, c, h); err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestSizeHistogramSnapshotAndWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Schema != "bridges.size_histograms.v1" || got.Mode != "sbridge" ||
-		got.CheckpointDistance != 4 || !got.LehmerEE || got.BridgePayloadBytes.Count != 3 {
+		got.CheckpointDistance != 4 || !got.LehmerEE || !got.DEEInstanceQueues || got.BridgePayloadBytes.Count != 3 {
 		t.Fatalf("file = %+v", got)
 	}
 }

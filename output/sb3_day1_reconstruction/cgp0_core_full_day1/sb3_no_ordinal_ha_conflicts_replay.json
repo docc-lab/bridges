@@ -1,0 +1,42 @@
+{
+  "mode": "sb3",
+  "checkpoint_distance": 4,
+  "drop_rate": 0.5,
+  "bloom_fp": 0.0001,
+  "prefix_len": 8,
+  "fp_bits": 64,
+  "lehmer_ee": true,
+  "sb3_ignore_ordinals": true,
+  "per_trace_drop_seed": true,
+  "order": "bottom-up",
+  "consistency": "chain",
+  "seed": 42,
+  "num_traces": 6,
+  "topology_summary": {
+    "traces": 6,
+    "feasible": 6,
+    "empty": 0,
+    "clean": 0,
+    "real_nodes": 157213,
+    "edge_exact": 152513,
+    "edge_wrong": 1786,
+    "survivor_edges": 128346,
+    "survivor_exact": 128346,
+    "named_synthetic": 28867,
+    "named_exact": 24167
+  },
+  "sb3_summary": {
+    "greedy_mode": "sb3-greedy",
+    "checked": 6,
+    "compatible": 0,
+    "candidate_evaluations": 28511,
+    "ordinal_overrides": 0,
+    "hard_overrides": 25,
+    "ordinal_placed": 59674,
+    "fanouts": 10227,
+    "conflicts": 6320,
+    "hard_conflicts": 12,
+    "parent_conflicts": 0,
+    "ha_conflicts": 12
+  }
+}

@@ -11,6 +11,9 @@ type StructureResult struct {
 	EventOrderOK bool // reconstructed event total-order == corpus total-order
 	CriticalPath bool // reconstructed bottleneck chain == true bottleneck chain
 	DEEAmbiguous bool // a DEE matched >1 parent after content-pruning -> wrong
+	DEEUnplaced  bool // a DEE matched no structurally valid parent -> reject
+	Incomplete   bool // EE/DEE did not yield one complete order per parent
+	Reason       string
 
 	// Per-parent end-order recovery (the thing EE+DEE actually buys): over
 	// multi-child parents, how many had their children's END order recovered
@@ -56,81 +59,55 @@ func sameOrder(a, b []int) bool {
 // so order among tied/concurrent siblings is well-defined, not invented. endPos
 // covers EVERY span.
 func ScoreStructure(res SBResult, truth SBTruth, endPos map[uint64]int64, deeQuads [][]byte) StructureResult {
+	var dees []bridge.DEEQuad
+	for _, q := range deeQuads {
+		var decoded []bridge.DEEQuad
+		var err error
+		if res.LehmerEE {
+			decoded, err = bridge.DecodeDEEQuadsLehmer(q, res.FPBits)
+		} else {
+			decoded, err = bridge.DecodeDEEQuads(q, res.FPBits)
+		}
+		if err != nil {
+			return StructureResult{Incomplete: true, Reason: err.Error()}
+		}
+		dees = append(dees, decoded...)
+	}
+	return ScoreStructureQuads(res, truth, endPos, dees)
+}
+
+// ScoreStructureQuads scores already-decoded, origin-trace-grouped DEE
+// evidence. It invokes the same production structure materializer used by SB3
+// before consulting truth; truth is used only for the final accuracy verdict.
+func ScoreStructureQuads(res SBResult, truth SBTruth, endPos map[uint64]int64, dees []bridge.DEEQuad) StructureResult {
 	if res.Root == nil {
 		return StructureResult{}
 	}
+	status := ApplyStructureEvidence(&res, dees)
+	if !status.Complete {
+		return StructureResult{
+			DEEAmbiguous: status.DEEAmbiguous > 0,
+			DEEUnplaced:  status.DEENoPlace > 0,
+			Incomplete:   true,
+			Reason:       status.Reason,
+		}
+	}
 
-	var cands []DEECandidate
 	stByID := map[uint64]*STNode{}
-	childrenByID := map[uint64][]SBChild{}
 
 	var build func(n *SBNode, trueID uint64, depth int) *STNode
 	build = func(n *SBNode, trueID uint64, depth int) *STNode {
-		st := &STNode{ID: trueID, Ord: n.Ord, Real: n.RealID != 0, Children: map[int]*STNode{}, EE: append([]int(nil), n.EE...)}
-		var kids []SBChild
-		childOrds := map[int]bool{}
-		witnessed := map[int]bool{} // ends already accounted in children's EE
+		st := &STNode{ID: trueID, Ord: n.Ord, Real: n.RealID != 0,
+			Children: map[int]*STNode{}, EE: append([]int(nil), n.EE...),
+			DEE: append([]int(nil), n.DEE...), EndOrder: append([]int(nil), n.EndOrder...)}
 		for ord, c := range n.Children {
 			childTrueID := truth.ChildByOrd[trueID][ord]
 			st.Children[ord] = build(c, childTrueID, depth+1)
-			kids = append(kids, SBChild{Ord: ord, EE: c.EE})
-			childOrds[ord] = true
-			for _, e := range c.EE {
-				witnessed[e] = true
-			}
 		}
 		stByID[trueID] = st
-		childrenByID[trueID] = kids
-		if len(n.Children) > 0 { // a possible DEE owner
-			cand := DEECandidate{ID: trueID, Survived: n.RealID != 0, RealID: n.RealID,
-				Depth: depth, ChildOrds: childOrds, EE: witnessed}
-			if !cand.Survived {
-				cand.FP, _ = nodeFP(n, res.FPBits) // recovered fpBits-wide fp for a dropped parent
-			}
-			cands = append(cands, cand)
-		}
 		return st
 	}
 	stRoot := build(res.Root, truth.RootID, 0)
-
-	// Attribute the trace's DEEs to their owning parents; >1 match -> ambiguous.
-	deeByParent := map[uint64][]int{}
-	ambiguous := false
-	for _, q := range deeQuads {
-		var quads []bridge.DEEQuad
-		var err error
-		if res.LehmerEE {
-			quads, err = bridge.DecodeDEEQuadsLehmer(q, res.FPBits)
-		} else {
-			quads, err = bridge.DecodeDEEQuads(q, res.FPBits)
-		}
-		if err != nil {
-			continue
-		}
-		for _, dq := range quads {
-			idx, st := AttributeDEE(dq.OwnerFP, dq.Depth, dq.Seqs, cands, res.FPBits)
-			switch st {
-			case DEEAmbiguous:
-				ambiguous = true
-			case DEEPlaced:
-				id := cands[idx].ID
-				deeByParent[id] = append(deeByParent[id], dq.Seqs...)
-			}
-		}
-	}
-
-	// Unresolved DEE ambiguity -> REJECT the trace: we refuse to reconstruct an
-	// ordering we can't attribute, rather than guess. It's reported as rejected,
-	// not folded into the correctness rates.
-	if ambiguous {
-		return StructureResult{DEEAmbiguous: true}
-	}
-
-	// Each parent's end-order = its children's EE blocks ++ its DEE leftovers.
-	for id, st := range stByID {
-		st.EndOrder = GatherEndOrder(childrenByID[id], deeByParent[id])
-		st.DEE = deeByParent[id]
-	}
 
 	// Order against order: each parent's recovered EndOrder vs its true end order.
 	// The trace's ordering is fully recovered iff EVERY multi-child parent matches.

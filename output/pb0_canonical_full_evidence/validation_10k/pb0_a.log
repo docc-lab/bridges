@@ -1,0 +1,29 @@
+Trace store: 10000 traces selected, 10 parallel replay workers
+PROGRESS traces=10000 elapsed=84s feasible=9825 empty=175 exclEmpty=96.18% per-edge-exact=99.944%
+PB0 traces=10000 nontrivial=9825 empty=175 | cleanNontrivial=9450 (96.18%) | cleanAll=9625 (96.25%)
+PB0 empties: n=175 score-clean=175 avgSurv=3.8 noDrop(trivial)=175 tiny(<=2 surv)=8
+PB0 per-fragment: reconnect-exact=99.944% (2520077/2521477) wrong/trace=0.14
+Wrote 10000 traces to output/pb0_canonical_full_evidence/validation_10k/pb0_a.json
+	Command being timed: "/tmp/trace_recon_pb0_max --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode pb0 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --prime-m --drop-rate 0.5 --seed 42 --per-trace-drop-seed --sample 10000 --sample-seed 29 --workers 10 --output output/pb0_canonical_full_evidence/validation_10k/pb0_a.json"
+	User time (seconds): 339.65
+	System time (seconds): 43.25
+	Percent of CPU this job got: 450%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:24.92
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 197324
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3756988
+	Voluntary context switches: 569680
+	Involuntary context switches: 4819
+	Swaps: 0
+	File system inputs: 520
+	File system outputs: 24
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

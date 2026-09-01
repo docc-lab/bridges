@@ -1,0 +1,107 @@
+flag provided but not defined: -fp-bits64
+usage: /tmp/trace_recon_sb3_full_day1 [flags] <input_dir>
+       /tmp/trace_recon_sb3_full_day1 --corpus <corpus_dir> [flags]
+  -bloom-fp float
+    	Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides) (default 0.0001)
+  -cgrp
+    	PCRS+CGP: run the PCRS solver on CGPRB (HA-bearing) payloads, ingesting the hash array so named dropped fan-outs become constraints (carriers hard, bloom-confirmers soft). Requires --mode pcrs.
+  -checkpoint-distance int
+    	Checkpoint distance (default 1)
+  -classify-wrong string
+    	Write one JSONL record per wrong-edge bridge (anchor not a true ancestor) locating the divergence against truth
+  -consistency string
+    	Anchor candidate consistency check: chain (test the candidate's nameable ancestry against the bloom) or none (default "chain")
+  -corpus string
+    	Read events.bin + meta.bin from this corpus dir
+  -drop-rate float
+    	Probability of dropping each non-checkpoint span (1.0 = drop all) (default 1)
+  -drop-rates string
+    	Comma-separated drop rates run on ONE decoded trace per pass (amortizes the corpus stream/emit across rates). cgp2/pb2 only; drops are per-trace-seeded (bit-identical to separate --drop-rate runs). --timing must contain {dc} (replaced per rate, e.g. d05).
+  -dump-only
+    	With --dump-survivors: dump the trace inputs and SKIP reconstruction (fast capture of slow traces for offline replay).
+  -dump-recon string
+    	Write per-trace reconstruction artifacts (JSONL.gz) for standalone auditing by recon_verify
+  -dump-survivors string
+    	Gob-dump each reconstructed trace's decoded survivors+truth+dropped+cfg to this file. Pair with --only-traces to capture one trace from a single corpus walk, then replay it offline with cmd/recon_one (no corpus walk).
+  -fp-bits int
+    	SB3 delayed-end owner fingerprint width in bits (default 16)
+  -fullsat
+    	PCRS: the single-pass ReconstructFullSAT engine — anchoring + all invariants compiled into one CP-SAT model per cluster, solved once (no pass-1 commit, no post-processing). Requires --mode pcrs and the cpsat build tag.
+  -fullsat-cgpb
+    	PCRS + HA: the --fullsat-pb model plus named-synthetic identities from the hash array (CGP) injected into the cluster occupancy — hard fan-out coalescing + exclusivity. Requires --mode pcrs and the cpsat build tag.
+  -fullsat-pb
+    	PCRS: solve each cluster as a general declarative CP-SAT model (docs/fullsat_shim.md) instead of the Go B&B — the full-SAT parity baseline (no HA). Requires --mode pcrs and the cpsat build tag.
+  -gap-policy string
+    	PCRB threading at a zero-candidate level: continue (default) or stop (maximally FP-averse) (default "continue")
+  -lehmer-ee
+    	SB3: Lehmer-code EE/DEE groups on emit and decode
+  -mode string
+    	Bridge mode: pb, pcr, pcrb, pcrs, cgprb, cgp*/pb*, or sb3 (default "pb")
+  -no-parents
+    	Ablation (--fullsat): ignore the intrinsic ParentID naming, so fragment roots get private anonymous synthetic parents and siblings never coalesce (pure connectivity, no recovered fan-out topology).
+  -o string
+    	Output JSON file (required)
+  -only-traces string
+    	Diagnostic: comma-separated hex trace IDs to reconstruct ONLY (corpus still streams and drop RNG still advances for all traces, so survivors are bit-identical to a full run). Lets you repro a single slow trace in seconds.
+  -order string
+    	Orphan processing order: bottom-up (deepest-first, default) or independent (default "bottom-up")
+  -output string
+    	Output JSON file (required)
+  -per-trace-drop-seed
+    	Seed the drop RNG per-trace from (traceID, seed) and draw over spans in spanID order, so each trace drops the same spans regardless of processing order or corpus partitioning. Required for partition-invariant parallel sweeps; differs bit-wise from the legacy global-stream drops.
+  -prefix-len int
+    	PCR mode: truncated checkpoint-root span ID length in bytes (1-8) (default 4)
+  -prime-m
+    	size blooms with a prime bit count (fixes small-m double-hash clustering; affects emit + recon together)
+  -prime-m-bytecap
+    	with --prime-m: keep the prime within the raw size's byte budget
+  -require-clean
+    	Cleanliness filter (JSON mode only) (default true)
+  -sample int
+    	If >0, process a RANDOM sample of this many traces (uniform over the trace order, seeded by --sample-seed) instead of the first --trace-count. Avoids prefix bias; same seed => same sample across runs/cells.
+  -sample-seed int
+    	Seed for --sample trace selection (independent of the drop --seed) (default 1)
+  -sb3-ignore-ordinals
+    	SB3 ablation: retain the same payload and hard/Bloom evidence but do not use sparse ordinals to select topology
+  -score-audit
+    	Fault-injection sensitivity audit: per trace, inject known scoring errors into a copy of the reconstruction and require ScorePCR to detect each with the exact predicted counter delta (report on stderr)
+  -seed int
+    	RNG seed for the drop policy (default 42)
+  -tie-policy string
+    	PCRS threading tie resolution: aware (global bit-accounting, default), id (span-ID coin), or stop (abstain) (default "aware")
+  -timing string
+    	Write a per-trace reconstruction-timing CSV here (tid,survivors,spans,dropped,recon_ns) and print a TIMING summary. (TRACE_RECON_TIMING=1 prints the summary without the CSV.)
+  -topo-only
+    	SB3: omit lateral EE/DEE evidence while retaining topology and sparse ordinals
+  -trace-count int
+    	Max number of traces to process (0 = all). Corpus mode: first N of the corpus trace order; events of other traces are skipped during streaming
+  -trace-store string
+    	Read a per-trace store (cmd/corpus_split output) instead of --corpus. Runs handler+drop+reconstruct per-trace in PARALLEL (no single-threaded event streaming); bit-identical results. Needs --corpus too (for meta: trace order + service names).
+  -verify
+    	Run the independent structural/evidence checker (package verify) in-process after every reconstruction; violations reported at exit
+  -workers int
+    	Reconstruction worker goroutines (0 = NumCPU). Drop decisions stay serial, so results are bit-identical at any worker count
+Command exited with non-zero status 2
+	Command being timed: "/tmp/trace_recon_sb3_full_day1 --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode sb3 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --drop-rate 0.5 --seed 42 --per-trace-drop-seed --workers 10 --fp-bits64 --lehmer-ee --output /users/tomislav/bridges/output/sb3_day1_reconstruction/cgp0_core_full_day1/sb3_ordinal.json"
+	User time (seconds): 0.00
+	System time (seconds): 0.00
+	Percent of CPU this job got: 133%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.00
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 4592
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 468
+	Voluntary context switches: 30
+	Involuntary context switches: 0
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 16
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 2

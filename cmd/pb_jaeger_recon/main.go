@@ -17,7 +17,8 @@
 // flows down first-child edges only; checkpoints reset), and attach it to the
 // _br-carrying spans — faking what the app should have appended.
 //
-// A trace is clean iff EdgeWrong==0; correctExclEmpty = clean/feasible.
+// A trace is clean iff the canonical score is Clean(); correctExclEmpty =
+// clean/feasible.
 //
 // Build (needs the CP-SAT solver): go build -tags cpsat -o pb_jaeger_recon ./cmd/pb_jaeger_recon
 package main
@@ -274,13 +275,13 @@ func processTrace(t *jTrace, rates []float64, cfg recon.Config, cgp bool, accs [
 		}
 		a.feas++
 		if cgp {
-			iso = recon.ScoreCGP2Strict(res, truth, dropped)
+			iso = recon.ScoreCGP2Strict(res, survivors, truth, dropped)
 		} else {
-			iso = recon.ScorePB2Path(res, truth, dropped)
+			iso = recon.ScorePBPathStrict(res, survivors, truth, dropped)
 		}
 		a.realNodes += iso.RealNodes
 		a.edgeExact += iso.EdgeExact
-		if iso.EdgeWrong == 0 {
+		if iso.Clean() {
 			a.clean++
 		}
 		if dbg && rate == 0.5 && dbgN.Add(1) <= 6 {

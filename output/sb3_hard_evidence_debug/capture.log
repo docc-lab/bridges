@@ -1,0 +1,29 @@
+only-traces: reconstructing 10 trace(s) only
+Trace store: 10 traces selected, 20 parallel replay workers
+SB3 traces=0 nontrivial=0 empty=0 | cleanNontrivial=0 (0.00%) | cleanAll=0 (0.00%)
+SB3 per-edge: exact=0.000% (0/0) wrong/trace=0.00 | survivor edges=0.000% | named-syn=0.00%
+SB3 greedy=sb3-greedy checked=0 compatible=0 (0.0000%) | candidate_evaluations=0 ordinal_overrides=0 hard_overrides=0 explicit_ordinals=0 implicit_first_labels=0 fanouts=0 ordinal_conflicts=0 hard_conflicts=0 (parent=0 ha=0)
+Wrote 10 traces to /dev/null
+	Command being timed: "output/trace_recon_first100k_matrix --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode sb3 --checkpoint-distance 8 --prefix-len 8 --bloom-fp 0.0001 --prime-m --fp-bits 64 --lehmer-ee --topo-only --drop-rate 0.5 --seed 42 --per-trace-drop-seed --trace-count 100000 --workers 20 --only-traces 017508c890ed943e,05dc5a41f20ee5dc,0ac8726696d025f1,1111ee33e5886a8c,1963ad2126bb434c,2074a44235c65b67,2336136b134e2ee2,23fb3b250c107d2c,246261ab00498975,23b51de1eee04ab2 --dump-survivors output/sb3_hard_evidence_debug/cpd8_d05.gob --dump-only --output /dev/null"
+	User time (seconds): 86.91
+	System time (seconds): 18.96
+	Percent of CPU this job got: 153%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:08.98
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 144256
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 1557603
+	Voluntary context switches: 278425
+	Involuntary context switches: 529
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 23584
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

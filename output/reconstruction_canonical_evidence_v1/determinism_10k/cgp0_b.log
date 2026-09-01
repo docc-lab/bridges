@@ -1,0 +1,7 @@
+Trace store: 10000 traces selected, 6 parallel replay workers
+PROGRESS traces=10000 elapsed=60s feasible=9825 empty=175 exclEmpty=94.28% per-edge-exact=96.234%
+CGP0 traces=10000 nontrivial=9825 empty=175 | cleanNontrivial=9263 (94.28%) | cleanAll=9438 (94.38%)
+CGP0 empties: n=175 score-clean=175 avgSurv=3.8 noDrop(trivial)=175 tiny(<=2 surv)=8
+CGP0 per-edge: exact=96.234% (8423814/8753439) wrong/trace=0.23 | survivor edges=100.000% | named-syn=80.14%
+CGP0 greedy=full-evidence checked=10000 | candidate_evaluations=1646036 hard_overrides=22 hard_conflicts=0 (parent=0 ha=0)
+Wrote 10000 traces to output/reconstruction_canonical_evidence_v1/determinism_10k/cgp0_b.json

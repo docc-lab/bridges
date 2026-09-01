@@ -1,0 +1,33 @@
+Trace store: 50000 traces selected, 12 parallel replay workers
+PROGRESS traces=10000 elapsed=17s feasible=9805 empty=195 exclEmpty=87.14% per-edge-exact=64.293%
+PROGRESS traces=20000 elapsed=29s feasible=19627 empty=373 exclEmpty=87.60% per-edge-exact=64.549%
+PROGRESS traces=30000 elapsed=41s feasible=29411 empty=589 exclEmpty=87.60% per-edge-exact=64.447%
+PROGRESS traces=40000 elapsed=54s feasible=39258 empty=742 exclEmpty=87.68% per-edge-exact=64.498%
+PROGRESS traces=50000 elapsed=69s feasible=49096 empty=904 exclEmpty=87.74% per-edge-exact=64.583%
+CGP0 traces=50000 feasible=49096 empty=904 | correct=86.15% (clean=43076) | correctExclEmpty=87.74% | correctCreditEmpty=87.96%
+CGP0 empties: n=904 avgSurv=3.9 noDrop(trivial)=904 tiny(<=2 surv)=41
+CGP0 per-edge: exact=64.583% (23147986/35842212) wrong/trace=0.86 | survivor edges=64.417% | named-syn=75.64%
+Wrote 50000 traces to output/sb3_day1_reconstruction/cgp0_core_50k/cgp0.json
+	Command being timed: "/tmp/trace_recon_sb3_cgp0_core_50k --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode cgp0 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --drop-rate 0.5 --seed 42 --per-trace-drop-seed --sample 50000 --sample-seed 29 --workers 12 --output output/sb3_day1_reconstruction/cgp0_core_50k/cgp0.json"
+	User time (seconds): 776.50
+	System time (seconds): 31.90
+	Percent of CPU this job got: 1170%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:09.05
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 427008
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3651641
+	Voluntary context switches: 480923
+	Involuntary context switches: 49367
+	Swaps: 0
+	File system inputs: 3632
+	File system outputs: 32
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

@@ -1,5 +1,5 @@
-// Command recon_one replays one (or more) gob-dumped trace(s) through CGPRB
-// reconstruction WITHOUT walking the corpus. Capture a trace once:
+// Command recon_one replays one (or more) gob-dumped trace(s) through CGPRB,
+// CGP0, or SB3 reconstruction WITHOUT walking the corpus. Capture a trace once:
 //
 //	trace_recon --corpus DIR --mode cgprb ... --only-traces <hex> --dump-survivors /tmp/t.gob -o /dev/null
 //
@@ -25,11 +25,16 @@ import (
 func main() {
 	reps := flag.Int("reps", 1, "reconstruct each trace this many times (report the fastest) to measure steady-state latency")
 	tidHex := flag.String("tid", "", "only replay this hex trace ID")
+	mode := flag.String("mode", "cgprb", "reconstructor: cgprb, cgp0, or sb3")
 	cpuprof := flag.String("cpuprofile", "", "write a CPU profile of the reconstruction(s) here")
 	profSecs := flag.Int("profsecs", 0, "with --cpuprofile: flush the profile and exit after this many seconds (capture a grind mid-flight)")
 	flag.Parse()
 	if flag.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: recon_one [--reps N] [--tid HEX] [--cpuprofile FILE] <dump.gob>")
+		fmt.Fprintln(os.Stderr, "usage: recon_one [--mode cgprb|cgp0|sb3] [--reps N] [--tid HEX] [--cpuprofile FILE] <dump.gob>")
+		os.Exit(2)
+	}
+	if *mode != "cgprb" && *mode != "cgp0" && *mode != "sb3" {
+		fmt.Fprintf(os.Stderr, "unsupported --mode %q\n", *mode)
 		os.Exit(2)
 	}
 
@@ -71,11 +76,20 @@ func main() {
 		}
 		dropped := dt.DroppedSet()
 		var res recon.Result
+		var sb3 recon.SB3Result
 		best := time.Duration(1<<62 - 1)
 		c0, ok0, bt0, cms0, btms0 := recon.ClusterStats()
 		for r := 0; r < *reps; r++ {
 			t0 := time.Now()
-			res = recon.ReconstructCGPRB(dt.Survivors, dt.Cfg)
+			switch *mode {
+			case "cgp0":
+				res = recon.ReconstructCGP0(dt.Survivors, dt.Cfg)
+			case "sb3":
+				sb3 = recon.ReconstructSB3(dt.Survivors, dt.Cfg)
+				res = sb3.Topology
+			default:
+				res = recon.ReconstructCGPRB(dt.Survivors, dt.Cfg)
+			}
 			if d := time.Since(t0); d < best {
 				best = d
 			}
@@ -91,5 +105,14 @@ func main() {
 		fmt.Printf("  score: %+v\n", score)
 		fmt.Printf("  topo:  conn=%t topo=%t sibPairs=%d recall=%d reconSib=%d prec=%d\n",
 			topo.ConnCorrect, topo.TopoCorrect, topo.TrueSibPairs, topo.RecallPairs, topo.ReconSibPairs, topo.PrecisionPairs)
+		if *mode == "sb3" {
+			fmt.Printf("  sb3:  compatible=%t ordinal_conflicts=%d hard=%d parent=%d ha=%d candidates=%d\n",
+				sb3.Compatible, sb3.Conflicts, sb3.HardConflicts, sb3.ParentConflicts,
+				sb3.HAConflicts, sb3.CandidateEvaluations)
+		} else if *mode == "cgp0" {
+			fmt.Printf("  cgp0: hard=%d parent=%d ha=%d candidates=%d\n",
+				res.GreedyHardConflicts, res.GreedyParentConflicts,
+				res.GreedyHAConflicts, res.GreedyCandidateEvaluations)
+		}
 	}
 }

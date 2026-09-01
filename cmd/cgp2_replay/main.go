@@ -1,6 +1,7 @@
 // cgp2_replay loads dumped traces (cmd/trace_recon --dump-survivors) and runs the
 // from-scratch CGP reconstructor (recon.ReconstructCGP2) over them, scoring with
-// ScoreCGP2Iso. Build with -tags cpsat so the solver is wired.
+// the canonical evidence-bounded scorer. Build with -tags cpsat so the solver
+// is wired.
 //
 //	cgp2_replay dump.gob [limit]
 //
@@ -62,16 +63,16 @@ func score(dt *recon.DumpedTrace, a *acc) {
 		return
 	}
 	a.feas++
-	iso := recon.ScoreCGP2Iso(res, dt.Truth, dt.DroppedSet())
+	iso := recon.ScoreCGP2Strict(res, dt.Survivors, dt.Truth, dt.DroppedSet())
 	a.realNodes += iso.RealNodes
 	a.edgeExact += iso.EdgeExact
 	a.edgeWrong += iso.EdgeWrong
-	a.totWrong += iso.EdgeWrong
+	a.totWrong += iso.Wrong()
 	a.survN += iso.SurvNodes
 	a.survEx += iso.SurvExact
 	a.named += iso.NamedSyn
 	a.namedEx += iso.NamedExact
-	if iso.EdgeWrong == 0 {
+	if iso.Clean() {
 		a.clean++
 	}
 }

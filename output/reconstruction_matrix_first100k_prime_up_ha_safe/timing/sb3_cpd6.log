@@ -1,0 +1,2 @@
+Trace store: 100000 traces selected, 8 parallel replay workers
+PROGRESS traces=10000 elapsed=366s | d005:excl=99.81% d025:excl=98.66% d05:excl=97.04% d075:excl=95.08% d095:excl=93.32% d10:excl=93.01%

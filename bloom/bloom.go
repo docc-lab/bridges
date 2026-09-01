@@ -261,6 +261,53 @@ func (f *Filter) PopCount() int {
 	return n
 }
 
+// BitMask64 returns the filter bitmap as a uint64 when its geometry fits in one
+// machine word. Bit i in the result is exactly Bloom position i. The boolean is
+// false for wider filters.
+func (f *Filter) BitMask64() (uint64, bool) {
+	if f.m > 64 || len(f.bits) > 8 {
+		return 0, false
+	}
+	var mask uint64
+	for i, b := range f.bits {
+		mask |= uint64(b) << (8 * i)
+	}
+	if f.m < 64 {
+		mask &= (uint64(1) << f.m) - 1
+	}
+	return mask, true
+}
+
+// ProbeMask64 returns the set of Bloom positions tested for data when the
+// supplied geometry fits in one word. It supports both on-wire hash schemes
+// and is useful for exact candidate indexes: f.Test(data) is equivalent to
+// probeMask &^ filterMask == 0.
+func ProbeMask64(data []byte, m, k uint32, prehashed bool) (uint64, bool) {
+	if m == 0 || k == 0 || m > 64 {
+		return 0, false
+	}
+	var mask uint64
+	if prehashed {
+		if len(data) == 16 {
+			var raw [8]byte
+			if _, err := hex.Decode(raw[:], data); err == nil {
+				data = raw[:]
+			}
+		}
+		h1, h2 := splitHashes(data)
+		for i := uint64(0); i < uint64(k); i++ {
+			mask |= uint64(1) << ((h1 + i*h2) % uint64(m))
+		}
+		return mask, true
+	}
+	h1, h2, h3, h4 := BaseHashes(data)
+	h := [4]uint64{h1, h2, h3, h4}
+	for i := uint32(0); i < k; i++ {
+		mask |= uint64(1) << (location(&h, i) % uint64(m))
+	}
+	return mask, true
+}
+
 // Add inserts data into the filter.
 func (f *Filter) Add(data []byte) {
 	h1, h2, h3, h4 := BaseHashes(data)

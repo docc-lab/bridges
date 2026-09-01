@@ -75,6 +75,10 @@ type SBridgeHandler struct {
 	cpd       uint32
 	deeLogger *DeeSizeLogger
 
+	// DEEStats, when non-nil, tracks queue lifecycle and final backlog totals.
+	// It changes no queue or payload behavior.
+	DEEStats *DEEQueueStats
+
 	// EmitOC charges the "_o" attribute that every interior span (not a
 	// checkpoint, not a leaf) exports: _o = varint(ordinal) || varint(depth) —
 	// its own start-ordinal under its parent and its absolute depth. That is all
@@ -120,6 +124,12 @@ type SBridgeHandler struct {
 	// concurrent same-parent calls to one service+endpoint occupy distinct
 	// simulated instances, each with an independent queue.
 	UseDEEQueueID bool
+
+	// DequeueOneDEE makes each start pick up only the oldest queued DEE quad.
+	// The default is false, which preserves the legacy behavior of draining and
+	// concatenating the entire selected queue. Any backlog left at the end of a
+	// simulation is intentionally retained and uncharged.
+	DequeueOneDEE bool
 
 	// EmitSink, when non-nil, receives the actual serialized _br payload at each
 	// emit point (checkpoint OnStart, leaf OnEnd) — the faithful bytes a span
@@ -190,7 +200,23 @@ func (h *SBridgeHandler) bumpEvent(tid, parentSpanID uint64) int {
 func (h *SBridgeHandler) drainDEE(queueID uint32, serviceID uint16, traceID uint64) []byte {
 	q, ok := h.deeQueue[queueID]
 	if !ok || len(q) == 0 {
+		h.DEEStats.recordPickupAttempt(false)
 		return nil
+	}
+	h.DEEStats.recordPickupAttempt(true)
+	if h.DequeueOneDEE {
+		out := q[0]
+		q[0] = nil // do not retain the dequeued payload in the backing array
+		if len(q) == 1 {
+			delete(h.deeQueue, queueID)
+		} else {
+			h.deeQueue[queueID] = q[1:]
+		}
+		if h.deeLogger != nil {
+			h.deeLogger.logPickup(serviceID, len(out), traceID)
+		}
+		h.DEEStats.recordDequeue(queueID, 1, len(out))
+		return out
 	}
 	total := 0
 	for _, b := range q {
@@ -201,6 +227,7 @@ func (h *SBridgeHandler) drainDEE(queueID uint32, serviceID uint16, traceID uint
 		out = append(out, b...)
 	}
 	delete(h.deeQueue, queueID)
+	h.DEEStats.recordDequeue(queueID, len(q), len(out))
 	if h.deeLogger != nil {
 		h.deeLogger.logPickup(serviceID, len(out), traceID)
 	}
@@ -213,6 +240,7 @@ func (h *SBridgeHandler) enqueueDEE(queueID uint32, serviceID uint16, triple []b
 		prev += len(b)
 	}
 	h.deeQueue[queueID] = append(h.deeQueue[queueID], triple)
+	h.DEEStats.recordEnqueue(queueID, len(triple))
 	if h.deeLogger != nil {
 		h.deeLogger.logEnqueueOverThreshold(serviceID, prev+len(triple), len(triple), traceID)
 	}

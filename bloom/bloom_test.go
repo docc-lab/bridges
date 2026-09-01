@@ -185,6 +185,45 @@ func TestDeserializeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestProbeMask64AgreesWithFilter(t *testing.T) {
+	for _, prehashed := range []bool{false, true} {
+		f, err := New(58, 14)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.prehashed = prehashed
+		keys := [][]byte{[]byte("0011223344556677"), []byte("8899aabbccddeeff")}
+		for _, key := range keys {
+			if prehashed {
+				var raw [8]byte
+				if _, err := hex.Decode(raw[:], key); err != nil {
+					t.Fatal(err)
+				}
+				h1, h2 := splitHashes(raw[:])
+				for i := uint64(0); i < uint64(f.k); i++ {
+					pos := (h1 + i*h2) % uint64(f.m)
+					f.bits[pos/8] |= 1 << (pos % 8)
+				}
+			} else {
+				f.Add(key)
+			}
+		}
+		filterMask, ok := f.BitMask64()
+		if !ok {
+			t.Fatal("58-bit filter did not produce a word mask")
+		}
+		for _, key := range append(keys, []byte("deadbeefdeadbeef")) {
+			probeMask, ok := ProbeMask64(key, f.m, f.k, prehashed)
+			if !ok {
+				t.Fatal("58-bit probes did not produce a word mask")
+			}
+			if got, want := probeMask&^filterMask == 0, f.Test(key); got != want {
+				t.Fatalf("prehashed=%v key=%q mask=%v test=%v", prehashed, key, got, want)
+			}
+		}
+	}
+}
+
 func TestDeserializeSizeMismatchEmpty(t *testing.T) {
 	m, k := EstimateParameters(3, 0.0001)
 	f := Deserialize([]byte{0xff, 0xff}, m, k)

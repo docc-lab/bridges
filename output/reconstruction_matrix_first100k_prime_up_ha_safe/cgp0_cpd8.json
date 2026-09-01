@@ -1,0 +1,216 @@
+{
+  "mode": "cgp0",
+  "corpus": "/mydata/uber/bignode_state/day1_unfilt_corpus",
+  "trace_store": "/mydata/uber/day1.store",
+  "checkpoint_distance": 8,
+  "drop_rates": [
+    0.05,
+    0.25,
+    0.5,
+    0.75,
+    0.95,
+    1
+  ],
+  "rate_summaries": [
+    {
+      "drop_rate": 0.05,
+      "drop_code": "d005",
+      "topology_summary": {
+        "score_policy": "evidence-bounded-v1",
+        "evidence_profile": "maximal",
+        "traces": 100000,
+        "feasible": 86409,
+        "empty": 13591,
+        "empty_clean": 13591,
+        "clean": 85954,
+        "clean_all": 99545,
+        "real_nodes": 90734857,
+        "edge_exact": 90676822,
+        "edge_anonymous_valid": 57108,
+        "edge_wrong": 927,
+        "constraint_wrong": 0,
+        "survivor_edges": 0,
+        "survivor_exact": 0,
+        "named_synthetic": 0,
+        "named_exact": 0
+      },
+      "greedy_summary": {
+        "mode": "full-evidence",
+        "checked": 100000,
+        "candidate_evaluations": 2368241,
+        "hard_overrides": 12,
+        "hard_conflicts": 0,
+        "parent_conflicts": 0,
+        "ha_conflicts": 0
+      }
+    },
+    {
+      "drop_rate": 0.25,
+      "drop_code": "d025",
+      "topology_summary": {
+        "score_policy": "evidence-bounded-v1",
+        "evidence_profile": "maximal",
+        "traces": 100000,
+        "feasible": 95976,
+        "empty": 4024,
+        "empty_clean": 4024,
+        "clean": 94119,
+        "clean_all": 98143,
+        "real_nodes": 90056247,
+        "edge_exact": 88753956,
+        "edge_anonymous_valid": 1297196,
+        "edge_wrong": 5095,
+        "constraint_wrong": 0,
+        "survivor_edges": 0,
+        "survivor_exact": 0,
+        "named_synthetic": 0,
+        "named_exact": 0
+      },
+      "greedy_summary": {
+        "mode": "full-evidence",
+        "checked": 100000,
+        "candidate_evaluations": 10646666,
+        "hard_overrides": 67,
+        "hard_conflicts": 0,
+        "parent_conflicts": 0,
+        "ha_conflicts": 0
+      }
+    },
+    {
+      "drop_rate": 0.5,
+      "drop_code": "d05",
+      "topology_summary": {
+        "score_policy": "evidence-bounded-v1",
+        "evidence_profile": "maximal",
+        "traces": 100000,
+        "feasible": 97999,
+        "empty": 2001,
+        "empty_clean": 2001,
+        "clean": 94314,
+        "clean_all": 96315,
+        "real_nodes": 85694889,
+        "edge_exact": 81129446,
+        "edge_anonymous_valid": 4551924,
+        "edge_wrong": 13519,
+        "constraint_wrong": 0,
+        "survivor_edges": 0,
+        "survivor_exact": 0,
+        "named_synthetic": 0,
+        "named_exact": 0
+      },
+      "greedy_summary": {
+        "mode": "full-evidence",
+        "checked": 100000,
+        "candidate_evaluations": 18204937,
+        "hard_overrides": 381,
+        "hard_conflicts": 0,
+        "parent_conflicts": 0,
+        "ha_conflicts": 0
+      }
+    },
+    {
+      "drop_rate": 0.75,
+      "drop_code": "d075",
+      "topology_summary": {
+        "score_policy": "evidence-bounded-v1",
+        "evidence_profile": "maximal",
+        "traces": 100000,
+        "feasible": 99085,
+        "empty": 915,
+        "empty_clean": 915,
+        "clean": 93591,
+        "clean_all": 94506,
+        "real_nodes": 78387799,
+        "edge_exact": 69566998,
+        "edge_anonymous_valid": 8791692,
+        "edge_wrong": 29109,
+        "constraint_wrong": 0,
+        "survivor_edges": 0,
+        "survivor_exact": 0,
+        "named_synthetic": 0,
+        "named_exact": 0
+      },
+      "greedy_summary": {
+        "mode": "full-evidence",
+        "checked": 100000,
+        "candidate_evaluations": 22364600,
+        "hard_overrides": 1353,
+        "hard_conflicts": 0,
+        "parent_conflicts": 0,
+        "ha_conflicts": 0
+      }
+    },
+    {
+      "drop_rate": 0.95,
+      "drop_code": "d095",
+      "topology_summary": {
+        "score_policy": "evidence-bounded-v1",
+        "evidence_profile": "maximal",
+        "traces": 100000,
+        "feasible": 99761,
+        "empty": 239,
+        "empty_clean": 239,
+        "clean": 92677,
+        "clean_all": 92916,
+        "real_nodes": 70435878,
+        "edge_exact": 58142792,
+        "edge_anonymous_valid": 12243435,
+        "edge_wrong": 49651,
+        "constraint_wrong": 0,
+        "survivor_edges": 0,
+        "survivor_exact": 0,
+        "named_synthetic": 0,
+        "named_exact": 0
+      },
+      "greedy_summary": {
+        "mode": "full-evidence",
+        "checked": 100000,
+        "candidate_evaluations": 22763854,
+        "hard_overrides": 3249,
+        "hard_conflicts": 0,
+        "parent_conflicts": 0,
+        "ha_conflicts": 0
+      }
+    },
+    {
+      "drop_rate": 1,
+      "drop_code": "d10",
+      "topology_summary": {
+        "score_policy": "evidence-bounded-v1",
+        "evidence_profile": "maximal",
+        "traces": 100000,
+        "feasible": 99919,
+        "empty": 81,
+        "empty_clean": 81,
+        "clean": 92484,
+        "clean_all": 92565,
+        "real_nodes": 68152499,
+        "edge_exact": 55044850,
+        "edge_anonymous_valid": 13051875,
+        "edge_wrong": 55774,
+        "constraint_wrong": 0,
+        "survivor_edges": 0,
+        "survivor_exact": 0,
+        "named_synthetic": 0,
+        "named_exact": 0
+      },
+      "greedy_summary": {
+        "mode": "full-evidence",
+        "checked": 100000,
+        "candidate_evaluations": 22314458,
+        "hard_overrides": 3899,
+        "hard_conflicts": 0,
+        "parent_conflicts": 0,
+        "ha_conflicts": 0
+      }
+    }
+  ],
+  "bloom_fp": 0.0001,
+  "prime_m": true,
+  "prefix_len": 8,
+  "per_trace_drop_seed": true,
+  "order": "bottom-up",
+  "consistency": "chain",
+  "seed": 42,
+  "num_traces": 100000
+}

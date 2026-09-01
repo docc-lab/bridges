@@ -1,0 +1,30 @@
+Trace store: 10000 traces selected, 8 parallel replay workers
+PROGRESS traces=10000 elapsed=66s feasible=9825 empty=175 exclEmpty=95.43% per-edge-exact=96.236%
+SB3 traces=10000 nontrivial=9825 empty=175 | cleanNontrivial=9376 (95.43%) | cleanAll=9551 (95.51%)
+SB3 empties: n=175 score-clean=175 avgSurv=3.8 noDrop(trivial)=175 tiny(<=2 surv)=8
+SB3 per-edge: exact=96.236% (8423979/8753439) wrong/trace=0.21 | survivor edges=100.000% | named-syn=80.15%
+SB3 greedy=sb3-greedy checked=10000 compatible=9577 (95.7700%) | candidate_evaluations=1647071 ordinal_overrides=847 hard_overrides=130 ordinal_placed=3741582 fanouts=571387 ordinal_conflicts=11143 hard_conflicts=0 (parent=0 ha=0)
+Wrote 10000 traces to output/reconstruction_canonical_evidence_v1/validation_10k/sb3.json
+	Command being timed: "/tmp/trace_recon_evidence_v1 --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode sb3 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --prime-m --fp-bits 64 --lehmer-ee --drop-rate 0.5 --seed 42 --per-trace-drop-seed --sample 10000 --sample-seed 29 --workers 8 --output output/reconstruction_canonical_evidence_v1/validation_10k/sb3.json"
+	User time (seconds): 546.47
+	System time (seconds): 32.24
+	Percent of CPU this job got: 871%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:06.41
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 457176
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 2929701
+	Voluntary context switches: 439380
+	Involuntary context switches: 8523
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 24
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

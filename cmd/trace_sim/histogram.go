@@ -6,6 +6,8 @@ import (
 	"os"
 	"sort"
 	"sync"
+
+	"bridges/bridge"
 )
 
 // sizeHistograms records exact, corpus-wide distributions at the event level.
@@ -76,13 +78,15 @@ func snapshotHistogram(m map[int]uint64) histogramOutput {
 }
 
 type sizeHistogramFile struct {
-	Schema             string          `json:"schema"`
-	Mode               string          `json:"mode"`
-	CheckpointDistance int             `json:"checkpoint_distance"`
-	LehmerEE           bool            `json:"lehmer_ee"`
-	DEEInstanceQueues  bool            `json:"dee_instance_queues"`
-	BaggageCallBytes   histogramOutput `json:"baggage_call_bytes"`
-	BridgePayloadBytes histogramOutput `json:"bridge_payload_bytes"`
+	Schema             string                        `json:"schema"`
+	Mode               string                        `json:"mode"`
+	CheckpointDistance int                           `json:"checkpoint_distance"`
+	LehmerEE           bool                          `json:"lehmer_ee"`
+	DEEInstanceQueues  bool                          `json:"dee_instance_queues"`
+	DEEDequeueOne      bool                          `json:"dee_dequeue_one"`
+	DEEQueueStats      *bridge.DEEQueueStatsSnapshot `json:"dee_queue_stats,omitempty"`
+	BaggageCallBytes   histogramOutput               `json:"baggage_call_bytes"`
+	BridgePayloadBytes histogramOutput               `json:"bridge_payload_bytes"`
 }
 
 func writeSizeHistograms(path string, c config, h *sizeHistograms) error {
@@ -93,8 +97,16 @@ func writeSizeHistograms(path string, c config, h *sizeHistograms) error {
 		CheckpointDistance: c.checkpointDistance,
 		LehmerEE:           c.lehmerEE,
 		DEEInstanceQueues:  c.deeQueueIDs != "",
+		DEEDequeueOne:      c.deeDequeueOne,
 		BaggageCallBytes:   snapshotHistogram(h.baggage),
 		BridgePayloadBytes: snapshotHistogram(h.payload),
+	}
+	if c.deeStats != nil {
+		snapshot := c.deeStats.Snapshot()
+		out.DEEQueueStats = &snapshot
+	} else if c.mergedDEEStats != nil {
+		snapshot := *c.mergedDEEStats
+		out.DEEQueueStats = &snapshot
 	}
 	h.mu.Unlock()
 	f, err := os.Create(path)
@@ -117,6 +129,8 @@ func runHistogramMerge(args []string) {
 	outPath, inputs := args[0], args[1:]
 	h := newSizeHistograms()
 	var base sizeHistogramFile
+	var mergedStats bridge.DEEQueueStatsSnapshot
+	hasStats := false
 	for i, path := range inputs {
 		f, err := os.Open(path)
 		if err != nil {
@@ -132,10 +146,12 @@ func runHistogramMerge(args []string) {
 		}
 		if i == 0 {
 			base = in
+			hasStats = in.DEEQueueStats != nil
 		} else if in.Schema != base.Schema || in.Mode != base.Mode ||
 			in.CheckpointDistance != base.CheckpointDistance || in.LehmerEE != base.LehmerEE ||
-			in.DEEInstanceQueues != base.DEEInstanceQueues {
-			fmt.Fprintf(os.Stderr, "incompatible histogram %s (schema/mode/cpd/lehmer/DEE-instance mismatch)\n", path)
+			in.DEEInstanceQueues != base.DEEInstanceQueues || in.DEEDequeueOne != base.DEEDequeueOne ||
+			(in.DEEQueueStats != nil) != hasStats {
+			fmt.Fprintf(os.Stderr, "incompatible histogram %s (schema/mode/cpd/lehmer/DEE-instance/dequeue mismatch)\n", path)
 			os.Exit(1)
 		}
 		for _, b := range in.BaggageCallBytes.Bins {
@@ -144,14 +160,40 @@ func runHistogramMerge(args []string) {
 		for _, b := range in.BridgePayloadBytes.Bins {
 			h.payload[b.Bytes] += b.Count
 		}
+		if in.DEEQueueStats != nil {
+			mergeDEEQueueStats(&mergedStats, *in.DEEQueueStats)
+		}
 	}
 	c := config{mode: base.Mode, checkpointDistance: base.CheckpointDistance, lehmerEE: base.LehmerEE}
 	if base.DEEInstanceQueues {
 		c.deeQueueIDs = "merged"
+	}
+	c.deeDequeueOne = base.DEEDequeueOne
+	if hasStats {
+		c.mergedDEEStats = &mergedStats
 	}
 	if err := writeSizeHistograms(outPath, c, h); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", outPath, err)
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "Merged %d histogram files into %s\n", len(inputs), outPath)
+}
+
+func mergeDEEQueueStats(dst *bridge.DEEQueueStatsSnapshot, src bridge.DEEQueueStatsSnapshot) {
+	dst.PickupAttempts += src.PickupAttempts
+	dst.EmptyPickups += src.EmptyPickups
+	dst.PickupCalls += src.PickupCalls
+	dst.EnqueuedRecords += src.EnqueuedRecords
+	dst.EnqueuedBytes += src.EnqueuedBytes
+	dst.DequeuedRecords += src.DequeuedRecords
+	dst.DequeuedBytes += src.DequeuedBytes
+	dst.BacklogQueues += src.BacklogQueues
+	dst.BacklogRecords += src.BacklogRecords
+	dst.BacklogBytes += src.BacklogBytes
+	if src.MaxQueueRecords > dst.MaxQueueRecords {
+		dst.MaxQueueRecords = src.MaxQueueRecords
+	}
+	if src.MaxQueueBytes > dst.MaxQueueBytes {
+		dst.MaxQueueBytes = src.MaxQueueBytes
+	}
 }

@@ -51,12 +51,21 @@ type config struct {
 	timingPath         string // non-empty: write per-trace reconstruction timing CSV here
 	checkpointDistance int
 	dropRate           float64
-	dropRates          string // comma list: one decode, all these rates reconstructed per pass (cgp2/pb2)
+	dropRates          string // comma list: one decode, all rates reconstructed per pass (CGP/PB/SB3 families)
 	seed               int64
 	traceCount         int
 	requireClean       bool
 	bottomUp           bool
 	bloomFP            float64
+	fpBits             int  // SB3 DEE-owner fingerprint width
+	topoOnly           bool // SB3: omit EE/DEE while retaining sparse ordinals
+	lehmerEE           bool // SB3: Lehmer-code EE/DEE groups
+	sb3IgnoreOrdinals  bool // SB3 ablation: reconstruct without ordinal-guided choices
+	cgp0Legacy         bool // CGP0 ablation: original first-match/anonymous-gap implementation
+	pb0Legacy          bool // PB0 ablation: original first-deepest-match implementation
+	greedyNoGrouped    bool // greedy ablation: no exact-parent/HA-group Bloom intersection
+	greedyNoHardHA     bool // greedy ablation: HA is optional naming evidence, not a hard carrier constraint
+	greedyNoFallback   bool // greedy ablation: evaluate only the ordinary first route
 	chainCheck         bool
 	prefixLen          int    // PCR truncated checkpoint-root ID length
 	classifyWrong      string // JSONL dump path for wrong-edge classification (pcr/pcrb)
@@ -82,7 +91,7 @@ func parseFlags() config {
 	flag.StringVar(&c.corpusDir, "corpus", "", "Read events.bin + meta.bin from this corpus dir")
 	flag.BoolVar(&c.dumpOnly, "dump-only", false, "With --dump-survivors: dump the trace inputs and SKIP reconstruction (fast capture of slow traces for offline replay).")
 	flag.StringVar(&c.traceStore, "trace-store", "", "Read a per-trace store (cmd/corpus_split output) instead of --corpus. Runs handler+drop+reconstruct per-trace in PARALLEL (no single-threaded event streaming); bit-identical results. Needs --corpus too (for meta: trace order + service names).")
-	flag.StringVar(&c.mode, "mode", "pb", "Bridge mode: pb (bloom membership), pcr (truncated checkpoint-root ID), or pcrb (checkpoint root + window bloom for in-window threading)")
+	flag.StringVar(&c.mode, "mode", "pb", "Bridge mode: pb, pcr, pcrb, pcrs, cgprb, cgp*/pb*, or sb3")
 	flag.BoolVar(&c.cgrp, "cgrp", false, "PCRS+CGP: run the PCRS solver on CGPRB (HA-bearing) payloads, ingesting the hash array so named dropped fan-outs become constraints (carriers hard, bloom-confirmers soft). Requires --mode pcrs.")
 	flag.BoolVar(&c.fullsatPB, "fullsat-pb", false, "PCRS: solve each cluster as a general declarative CP-SAT model (docs/fullsat_shim.md) instead of the Go B&B — the full-SAT parity baseline (no HA). Requires --mode pcrs and the cpsat build tag.")
 	flag.StringVar(&c.timingPath, "timing", "", "Write a per-trace reconstruction-timing CSV here (tid,survivors,spans,dropped,recon_ns) and print a TIMING summary. (TRACE_RECON_TIMING=1 prints the summary without the CSV.)")
@@ -94,8 +103,17 @@ func parseFlags() config {
 	flag.StringVar(&c.dumpSurvivors, "dump-survivors", "", "Gob-dump each reconstructed trace's decoded survivors+truth+dropped+cfg to this file. Pair with --only-traces to capture one trace from a single corpus walk, then replay it offline with cmd/recon_one (no corpus walk).")
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides)")
+	flag.IntVar(&c.fpBits, "fp-bits", 16, "SB3 delayed-end owner fingerprint width in bits")
+	flag.BoolVar(&c.topoOnly, "topo-only", false, "SB3: omit lateral EE/DEE evidence while retaining topology and sparse ordinals")
+	flag.BoolVar(&c.lehmerEE, "lehmer-ee", false, "SB3: Lehmer-code EE/DEE groups on emit and decode")
+	flag.BoolVar(&c.sb3IgnoreOrdinals, "sb3-ignore-ordinals", false, "SB3 ablation: retain the same payload and hard/Bloom evidence but do not use sparse ordinals to select topology")
+	flag.BoolVar(&c.cgp0Legacy, "cgp0-legacy", false, "CGP0 ablation: use the original lean first-match reconstructor (no exact-parent route units or global hard-evidence pruning)")
+	flag.BoolVar(&c.pb0Legacy, "pb0-legacy", false, "PB0 ablation: use the original lean first-deepest-match path reconstructor")
+	flag.BoolVar(&c.greedyNoGrouped, "greedy-no-grouped-evidence", false, "CGP0/SB3 ablation: do not intersect Bloom evidence across exact-parent or HA fanout groups")
+	flag.BoolVar(&c.greedyNoHardHA, "greedy-no-hard-ha", false, "CGP0/SB3 ablation: do not use HA carrier ancestry as a hard candidate constraint")
+	flag.BoolVar(&c.greedyNoFallback, "greedy-no-route-fallback", false, "CGP0/SB3 ablation: evaluate only the ordinary first deepest/named greedy route")
 	flag.Float64Var(&c.dropRate, "drop-rate", 1.0, "Probability of dropping each non-checkpoint span (1.0 = drop all)")
-	flag.StringVar(&c.dropRates, "drop-rates", "", "Comma-separated drop rates run on ONE decoded trace per pass (amortizes the corpus stream/emit across rates). cgp2/pb2 only; drops are per-trace-seeded (bit-identical to separate --drop-rate runs). --timing must contain {dc} (replaced per rate, e.g. d05).")
+	flag.StringVar(&c.dropRates, "drop-rates", "", "Comma-separated drop rates run on one decoded trace per pass for CGP/PB/SB3 family modes. Drops are per-trace-seeded and bit-identical to separate runs. --timing must contain {dc}.")
 	order := ""
 	flag.StringVar(&order, "order", "bottom-up", "Orphan processing order: bottom-up (deepest-first, default) or independent")
 	consistency := ""
@@ -125,12 +143,28 @@ func parseFlags() config {
 	flag.Parse()
 	bloom.PrimeM = primeM // set before any handler/config sizing (emit + recon must match)
 	bloom.PrimeMByteCap = primeMByteCap
-	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" && c.mode != "pb2" && c.mode != "cgp1" && c.mode != "pb1" && c.mode != "cgp0" && c.mode != "pb0" {
-		fmt.Fprintf(os.Stderr, "error: -mode must be pb, pcr, pcrb, pcrs, or cgprb (got %q)\n", c.mode)
+	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" && c.mode != "pb2" && c.mode != "cgp1" && c.mode != "pb1" && c.mode != "cgp0" && c.mode != "pb0" && c.mode != "sb3" {
+		fmt.Fprintf(os.Stderr, "error: unsupported reconstruction mode %q\n", c.mode)
 		os.Exit(2)
 	}
 	if c.cgrp && c.mode != "pcrs" {
 		fmt.Fprintf(os.Stderr, "error: --cgrp requires --mode pcrs (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	if c.cgp0Legacy && c.mode != "cgp0" {
+		fmt.Fprintf(os.Stderr, "error: --cgp0-legacy requires --mode cgp0 (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	if c.pb0Legacy && c.mode != "pb0" {
+		fmt.Fprintf(os.Stderr, "error: --pb0-legacy requires --mode pb0 (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	if (c.greedyNoGrouped || c.greedyNoFallback) && c.mode != "cgp0" && c.mode != "pb0" && c.mode != "sb3" {
+		fmt.Fprintf(os.Stderr, "error: grouped-evidence/route-fallback ablations require --mode cgp0, pb0, or sb3 (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	if c.greedyNoHardHA && c.mode != "cgp0" && c.mode != "sb3" {
+		fmt.Fprintf(os.Stderr, "error: --greedy-no-hard-ha requires --mode cgp0 or --mode sb3 (got %q)\n", c.mode)
 		os.Exit(2)
 	}
 	if c.fullsatPB && c.mode != "pcrs" {
@@ -206,6 +240,8 @@ type collSpan struct {
 	parentID uint64
 	depth    int    // handler-derived absolute depth (ground truth for scoring)
 	br       []byte // _br payload; nil = the span carried only _d
+	ordinal  int    // ground-truth start ordinal under parent
+	endPos   int64  // ground-truth END position in the trace event total-order
 }
 
 // harness drives the per-trace collect -> drop -> reconstruct -> score loop.
@@ -214,11 +250,11 @@ type harness struct {
 	mode          string // "pb" or "pcr": selects payload decode + reconstruction
 	fullsatEngine bool   // pcrs mode: use the single-pass ReconstructFullSAT engine
 	cfg           recon.Config
-	rng          *rand.Rand
-	dropAll      bool
-	rate         float64
-	seed         int64 // base drop seed (for per-trace reseeding)
-	perTraceSeed bool  // reseed the drop RNG per-trace (order/partition-invariant)
+	rng           *rand.Rand
+	dropAll       bool
+	rate          float64
+	seed          int64 // base drop seed (for per-trace reseeding)
+	perTraceSeed  bool  // reseed the drop RNG per-trace (order/partition-invariant)
 
 	spansByTID map[uint64][]collSpan
 	idxByKey   map[spanKey]int
@@ -226,11 +262,17 @@ type harness struct {
 	// nextSeq is nested per trace so a closed trace's counters can be freed;
 	// a flat (traceID, parentID) map grows with every parent span ever seen
 	// (gigabytes over the full corpus).
-	nextSeq map[uint64]map[uint64]int
+	nextSeq       map[uint64]map[uint64]int
+	eventPosByTID map[uint64]int64
+	// SB3 delayed-end records are captured when generated and keyed by their
+	// origin trace. This models the collector routing the embedded trace ID even
+	// when the record is physically picked up by a later trace.
+	deesByTID map[uint64][]bridge.DEEQuad
 
 	scores map[uint64]recon.Score
 
-	// cg2: inline cgp2 (ReconstructCGP2 + ScoreCGP2Iso) tallies, guarded by mu.
+	// cg2: inline from-scratch reconstruction + canonical evidence-bounded
+	// topology-score tallies, guarded by mu.
 	// Additive across the parallel workers; reported at drain.
 	cg2 cgp2acc
 
@@ -319,14 +361,77 @@ type finishJob struct {
 	spans        []collSpan
 	dropped      map[uint64]struct{}   // single-drop path
 	droppedMulti []map[uint64]struct{} // multi-drop path: one set per ha.mdRates
+	dees         []bridge.DEEQuad      // SB3 DEEs already grouped by origin trace
 }
 
 // cgp2acc accumulates the inline cgp2 per-trace scores (mirrors cmd/cgp2_replay).
 // All fields are additive so the parallel workers merge under harness.mu.
 type cgp2acc struct {
-	nt, feas, clean, empty                                                   int
-	realNodes, edgeExact, edgeWrong, survN, survEx, named, namedEx, totWrong int
-	emptySurvSum, emptyNoDrop, emptyTiny                                     int
+	nt, feas, clean, empty, emptyClean                                                                    int
+	realNodes, edgeExact, edgeAnonOK, edgeWrong, constraintWrong, survN, survEx, named, namedEx, totWrong int
+	emptySurvSum, emptyNoDrop, emptyTiny                                                                  int
+	greedyChecked, greedyCandidates, greedyHardOverrides                                                  int64
+	greedyHardConflicts, greedyParentConflicts, greedyHAConflicts                                         int64
+	sb3                                                                                                   sb3acc
+}
+
+// sb3acc preserves the evidence-specific telemetry returned by the dedicated
+// SB3 greedy reconstructor. Keeping it beside the shared topology tally makes
+// a long corpus run report whether sparse ordinals actually changed any
+// greedy decisions, rather than only reporting the resulting edge accuracy.
+type sb3acc struct {
+	checked, compatible                    int64
+	candidateEvaluations, ordinalOverrides int64
+	hardOverrides                          int64
+	ordinalPlaced, implicitOrdinals        int64
+	fanouts, conflicts                     int64
+	hardConflicts                          int64
+	parentConflicts, haConflicts           int64
+	structureChecked, structureComplete    int64
+	structureIncomplete                    int64
+	deePlaced, deeAmbiguous, deeNoPlace    int64
+	eventOK, criticalPathOK                int64
+	structureParents, endOrderOK           int64
+}
+
+func (a *sb3acc) add(r *recon.SB3Result) {
+	if r == nil {
+		return
+	}
+	a.checked++
+	if r.Compatible {
+		a.compatible++
+	}
+	a.candidateEvaluations += int64(r.CandidateEvaluations)
+	a.ordinalOverrides += int64(r.OrdinalOverrides)
+	a.hardOverrides += int64(r.HardOverrides)
+	a.ordinalPlaced += int64(r.OrdinalPlaced)
+	a.implicitOrdinals += int64(r.ImplicitOrdinals)
+	a.fanouts += int64(r.Fanouts)
+	a.conflicts += int64(r.Conflicts)
+	a.hardConflicts += int64(r.HardConflicts)
+	a.parentConflicts += int64(r.ParentConflicts)
+	a.haConflicts += int64(r.HAConflicts)
+}
+
+func (a *sb3acc) addStructure(r recon.StructureResult, status recon.SBStructureStatus) {
+	a.structureChecked++
+	a.deePlaced += int64(status.DEEPlaced)
+	a.deeAmbiguous += int64(status.DEEAmbiguous)
+	a.deeNoPlace += int64(status.DEENoPlace)
+	if r.Incomplete {
+		a.structureIncomplete++
+		return
+	}
+	a.structureComplete++
+	a.structureParents += int64(r.NParents)
+	a.endOrderOK += int64(r.EndOrderOK)
+	if r.EventOrderOK {
+		a.eventOK++
+	}
+	if r.CriticalPath {
+		a.criticalPathOK++
+	}
 }
 
 // wrongRec locates one wrong-edge bridge against the pre-drop truth.
@@ -378,7 +483,21 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
 		ph.Capture = true
 		return ph, pcrbCfg
-	case "cgprb", "cgp2", "pb2", "cgp1", "pb1", "cgp0", "pb0":
+	case "pb2", "pb1", "pb0":
+		// P-Bridge substrate: checkpoint prefix + window Bloom, with no HA
+		// topology extension. ParentID remains part of each ordinary span record
+		// and is fully available to the maximal-evidence path reconstructor.
+		ph := bridge.NewPCRBBridgeHandler(c.checkpointDistance, c.prefixLen, c.bloomFP)
+		ph.Capture = true
+		pcrbCfg := recon.NewPCRBConfig(c.checkpointDistance, c.prefixLen, c.bloomFP)
+		pcrbCfg.BottomUp, pcrbCfg.ChainCheck = cfg.BottomUp, cfg.ChainCheck
+		pcrbCfg.StopOnGap = c.stopOnGap
+		pcrbCfg.TiePolicy = c.tiePolicy
+		pcrbCfg.PB0Legacy = c.pb0Legacy
+		pcrbCfg.GreedyNoGroupedEvidence = c.greedyNoGrouped
+		pcrbCfg.GreedyNoRouteFallback = c.greedyNoFallback
+		return ph, pcrbCfg
+	case "cgprb", "cgp2", "cgp1", "cgp0":
 		// Call-graph-preserving: PCRB payload + window-local hash array. Same
 		// checkpoint-root + bloom geometry as PCRB, so it shares the PCRB
 		// config; reconstruction additionally consumes the HA. cgp2 reconstructs
@@ -389,6 +508,28 @@ func makeHandler(c config) (bridge.Handler, recon.Config) {
 		pcrbCfg.BottomUp, pcrbCfg.ChainCheck = cfg.BottomUp, cfg.ChainCheck
 		pcrbCfg.StopOnGap = c.stopOnGap
 		pcrbCfg.TiePolicy = c.tiePolicy
+		pcrbCfg.CGP0Legacy = c.cgp0Legacy
+		pcrbCfg.PB0Legacy = c.pb0Legacy
+		pcrbCfg.GreedyNoGroupedEvidence = c.greedyNoGrouped
+		pcrbCfg.GreedyNoHardHA = c.greedyNoHardHA
+		pcrbCfg.GreedyNoRouteFallback = c.greedyNoFallback
+		return ph, pcrbCfg
+	case "sb3":
+		// SB3 carries the same CGPRB topology substrate plus sparse branch
+		// ordinals and the lateral S-Bridge EE/DEE records.
+		ph := bridge.NewSB3Handler(c.checkpointDistance, c.prefixLen, c.bloomFP, nil)
+		ph.Capture = true
+		ph.TopoOnly = c.topoOnly
+		ph.LehmerEE = c.lehmerEE
+		ph.FPBits = c.fpBits
+		pcrbCfg := recon.NewPCRBConfig(c.checkpointDistance, c.prefixLen, c.bloomFP)
+		pcrbCfg.FPBits = c.fpBits
+		pcrbCfg.SBridgeLehmer = c.lehmerEE
+		pcrbCfg.SB3IgnoreOrdinals = c.sb3IgnoreOrdinals
+		pcrbCfg.SB3TopoOnly = c.topoOnly
+		pcrbCfg.GreedyNoGroupedEvidence = c.greedyNoGrouped
+		pcrbCfg.GreedyNoHardHA = c.greedyNoHardHA
+		pcrbCfg.GreedyNoRouteFallback = c.greedyNoFallback
 		return ph, pcrbCfg
 	default: // pb
 		pb := bridge.NewPathBridgeHandler(c.checkpointDistance, c.bloomFP)
@@ -414,29 +555,46 @@ func newHarness(c config) *harness {
 		workers = runtime.NumCPU()
 	}
 	ha := &harness{
-		h:          h,
-		mode:       c.mode,
-		topoOn:     os.Getenv("TRACE_RECON_TOPO") == "1",
-		cpd:        c.checkpointDistance,
-		wrongLog:   wlog,
-		cfg:        cfg,
-		rng:          rand.New(rand.NewSource(c.seed)),
-		dropAll:      c.dropRate >= 1.0,
-		rate:         c.dropRate,
-		seed:         c.seed,
-		perTraceSeed: c.perTraceDropSeed,
-		spansByTID: make(map[uint64][]collSpan),
-		idxByKey:   make(map[spanKey]int),
-		openByTID:  make(map[uint64]int),
-		nextSeq:    make(map[uint64]map[uint64]int),
-		jobs:       make(chan finishJob, workers*2),
+		h:             h,
+		mode:          c.mode,
+		topoOn:        os.Getenv("TRACE_RECON_TOPO") == "1",
+		cpd:           c.checkpointDistance,
+		wrongLog:      wlog,
+		cfg:           cfg,
+		rng:           rand.New(rand.NewSource(c.seed)),
+		dropAll:       c.dropRate >= 1.0,
+		rate:          c.dropRate,
+		seed:          c.seed,
+		perTraceSeed:  c.perTraceDropSeed,
+		spansByTID:    make(map[uint64][]collSpan),
+		idxByKey:      make(map[spanKey]int),
+		openByTID:     make(map[uint64]int),
+		nextSeq:       make(map[uint64]map[uint64]int),
+		eventPosByTID: make(map[uint64]int64),
+		deesByTID:     make(map[uint64][]bridge.DEEQuad),
+		jobs:          make(chan finishJob, workers*2),
+	}
+	if sh, ok := h.(*bridge.SB3Handler); ok {
+		sh.DEESink = func(tid uint64, raw []byte) {
+			var quads []bridge.DEEQuad
+			var err error
+			if cfg.SBridgeLehmer {
+				quads, err = bridge.DecodeDEEQuadsLehmer(raw, cfg.FPBits)
+			} else {
+				quads, err = bridge.DecodeDEEQuads(raw, cfg.FPBits)
+			}
+			if err != nil {
+				panic(fmt.Sprintf("decode generated SB3 DEE for trace %016x: %v", tid, err))
+			}
+			ha.deesByTID[tid] = append(ha.deesByTID[tid], quads...)
+		}
 	}
 	ha.fullsatEngine = c.fullsatEngine
 	ha.timingPath = c.timingPath
 	ha.timingOn = c.timingPath != "" || os.Getenv("TRACE_RECON_TIMING") == "1"
 	if c.dropRates != "" {
 		if !cg2Family(c.mode) {
-			fmt.Fprintln(os.Stderr, "--drop-rates supports only --mode cgp2/pb2/cgp1/pb1")
+			fmt.Fprintln(os.Stderr, "--drop-rates supports only CGP/PB/SB3 family modes")
 			os.Exit(2)
 		}
 		for _, tok := range strings.Split(c.dropRates, ",") {
@@ -568,7 +726,7 @@ func (ha *harness) drain() {
 	}
 	if cg2Family(ha.mode) {
 		label := strings.ToUpper(ha.mode) // CGP2 / PB2 / CGP1 / PB1
-		cgpFamily := ha.mode == "cgp0" || ha.mode == "cgp1" || ha.mode == "cgp2"
+		cgpFamily := ha.mode == "cgp0" || ha.mode == "cgp1" || ha.mode == "cgp2" || ha.mode == "sb3"
 		pct := func(x, y int) float64 {
 			if y == 0 {
 				return 0
@@ -580,11 +738,11 @@ func (ha *harness) drain() {
 			if a.feas > 0 {
 				wt = float64(a.totWrong) / float64(a.feas)
 			}
-			fmt.Fprintf(os.Stderr, "%s%s traces=%d feasible=%d empty=%d | correct=%.2f%% (clean=%d) | correctExclEmpty=%.2f%% | correctCreditEmpty=%.2f%%\n",
-				label, tag, a.nt, a.feas, a.empty, pct(a.clean, a.nt), a.clean, pct(a.clean, a.feas), pct(a.clean+a.empty, a.nt))
+			fmt.Fprintf(os.Stderr, "%s%s traces=%d nontrivial=%d empty=%d | cleanNontrivial=%d (%.2f%%) | cleanAll=%d (%.2f%%)\n",
+				label, tag, a.nt, a.feas, a.empty, a.clean, pct(a.clean, a.feas), a.clean+a.emptyClean, pct(a.clean+a.emptyClean, a.nt))
 			if a.empty > 0 {
-				fmt.Fprintf(os.Stderr, "%s%s empties: n=%d avgSurv=%.1f noDrop(trivial)=%d tiny(<=2 surv)=%d\n",
-					label, tag, a.empty, float64(a.emptySurvSum)/float64(a.empty), a.emptyNoDrop, a.emptyTiny)
+				fmt.Fprintf(os.Stderr, "%s%s empties: n=%d score-clean=%d avgSurv=%.1f noDrop(trivial)=%d tiny(<=2 surv)=%d\n",
+					label, tag, a.empty, a.emptyClean, float64(a.emptySurvSum)/float64(a.empty), a.emptyNoDrop, a.emptyTiny)
 			}
 			if cgpFamily {
 				fmt.Fprintf(os.Stderr, "%s%s per-edge: exact=%.3f%% (%d/%d) wrong/trace=%.2f | survivor edges=%.3f%% | named-syn=%.2f%%\n",
@@ -601,14 +759,60 @@ func (ha *harness) drain() {
 		} else {
 			emit("", ha.cg2)
 		}
+		if ha.mode == "sb3" {
+			emitSB3 := func(tag string, s sb3acc) {
+				fmt.Fprintf(os.Stderr,
+					"SB3%s greedy=sb3-greedy checked=%d compatible=%d (%.4f%%) | candidate_evaluations=%d ordinal_overrides=%d hard_overrides=%d explicit_ordinals=%d implicit_first_labels=%d fanouts=%d ordinal_conflicts=%d hard_conflicts=%d (parent=%d ha=%d)\n",
+					tag, s.checked, s.compatible, pct(int(s.compatible), int(s.checked)),
+					s.candidateEvaluations, s.ordinalOverrides, s.hardOverrides,
+					s.ordinalPlaced, s.implicitOrdinals, s.fanouts, s.conflicts, s.hardConflicts, s.parentConflicts, s.haConflicts)
+				if !ha.cfg.SB3TopoOnly {
+					fmt.Fprintf(os.Stderr,
+						"SB3%s structure topo-clean-checked=%d complete=%d (%.4f%%) incomplete=%d | DEE placed=%d ambiguous=%d no_place=%d | event_order=%d (%.4f%%) critical_path=%d (%.4f%%) parent_end_order=%d/%d (%.4f%%)\n",
+						tag, s.structureChecked, s.structureComplete, pct(int(s.structureComplete), int(s.structureChecked)), s.structureIncomplete,
+						s.deePlaced, s.deeAmbiguous, s.deeNoPlace,
+						s.eventOK, pct(int(s.eventOK), int(s.structureComplete)),
+						s.criticalPathOK, pct(int(s.criticalPathOK), int(s.structureComplete)),
+						s.endOrderOK, s.structureParents, pct(int(s.endOrderOK), int(s.structureParents)))
+				}
+			}
+			if len(ha.mdRates) > 0 {
+				for r := range ha.mdRates {
+					emitSB3("["+ha.mdDC[r]+"]", ha.mdAcc[r].sb3)
+				}
+			} else {
+				emitSB3("", ha.cg2.sb3)
+			}
+		} else if ha.mode == "cgp0" {
+			emitGreedy := func(tag string, a cgp2acc) {
+				mode := "full-evidence"
+				if ha.cfg.CGP0Legacy {
+					mode = "legacy-lean"
+				}
+				fmt.Fprintf(os.Stderr,
+					"CGP0%s greedy=%s checked=%d | candidate_evaluations=%d hard_overrides=%d hard_conflicts=%d (parent=%d ha=%d)\n",
+					tag, mode, a.greedyChecked, a.greedyCandidates, a.greedyHardOverrides,
+					a.greedyHardConflicts, a.greedyParentConflicts, a.greedyHAConflicts)
+			}
+			if len(ha.mdRates) > 0 {
+				for r := range ha.mdRates {
+					emitGreedy("["+ha.mdDC[r]+"]", ha.mdAcc[r])
+				}
+			} else {
+				emitGreedy("", ha.cg2)
+			}
+		}
 	}
 }
 
 func (ha *harness) beginTrace(tid uint64, spanCount int) {
 	ha.openByTID[tid] = 2 * spanCount
+	ha.eventPosByTID[tid] = 0
 }
 
 func (ha *harness) onEvent(ts int64, kind bridge.Kind, tid, sid, pid uint64, serviceID uint16) {
+	pos := ha.eventPosByTID[tid]
+	ha.eventPosByTID[tid] = pos + 1
 	ev := &bridge.Event{TraceID: tid, SpanID: sid, ParentID: pid, ServiceID: serviceID}
 	if kind == bridge.KindStart {
 		seqNum := 0
@@ -624,13 +828,14 @@ func (ha *harness) onEvent(ts int64, kind bridge.Kind, tid, sid, pid uint64, ser
 		r := ha.h.OnStart(ev, seqNum)
 		ha.idxByKey[spanKey{tid, sid}] = len(ha.spansByTID[tid])
 		ha.spansByTID[tid] = append(ha.spansByTID[tid], collSpan{
-			spanID: sid, parentID: pid, depth: -1, br: r.Payload,
+			spanID: sid, parentID: pid, depth: -1, br: r.Payload, ordinal: seqNum,
 		})
 	} else {
 		r := ha.h.OnEnd(ev)
 		if idx, ok := ha.idxByKey[spanKey{tid, sid}]; ok {
 			s := &ha.spansByTID[tid][idx]
 			s.depth = r.Depth
+			s.endPos = pos
 			if r.Payload != nil {
 				s.br = r.Payload
 			}
@@ -754,6 +959,7 @@ func (ha *harness) finishTrace(tid uint64) {
 	spans := ha.spansByTID[tid]
 	delete(ha.spansByTID, tid)
 	delete(ha.nextSeq, tid)
+	delete(ha.eventPosByTID, tid)
 	for _, s := range spans {
 		delete(ha.idxByKey, spanKey{tid, s.spanID})
 	}
@@ -762,20 +968,24 @@ func (ha *harness) finishTrace(tid uint64) {
 	// _br carriers ride the high-priority queue and are never dropped.
 	if len(ha.mdRates) > 0 {
 		dm := ha.computeDroppedMulti(tid, spans)
+		dees := append([]bridge.DEEQuad(nil), ha.deesByTID[tid]...)
+		delete(ha.deesByTID, tid)
 		if ha.only != nil && !ha.only[tid] {
 			return
 		}
-		ha.jobs <- finishJob{tid: tid, spans: spans, droppedMulti: dm}
+		ha.jobs <- finishJob{tid: tid, spans: spans, droppedMulti: dm, dees: dees}
 		return
 	}
 	dropped := ha.computeDropped(tid, spans)
+	dees := append([]bridge.DEEQuad(nil), ha.deesByTID[tid]...)
+	delete(ha.deesByTID, tid)
 	// --only-traces: the drop loop above still ran (RNG advanced identically),
 	// so survivors match a full run; we just skip the expensive reconstruct for
 	// non-target traces by not enqueueing them.
 	if ha.only != nil && !ha.only[tid] {
 		return
 	}
-	ha.jobs <- finishJob{tid: tid, spans: spans, dropped: dropped}
+	ha.jobs <- finishJob{tid: tid, spans: spans, dropped: dropped, dees: dees}
 }
 
 // process is the per-trace parallel work: decode, reconstruct, score.
@@ -897,18 +1107,51 @@ func (ha *harness) process(j finishJob) {
 		// (solver-based) and cgp1/pb1 (greedy baselines), all scored into the
 		// shared cg2 tally. Reconstruct+score off-lock; only the tally is guarded.
 		t0 := time.Now()
-		res := ha.cg2Reconstruct(survivors)
+		res, sb3 := ha.cg2Reconstruct(survivors, j.dees)
 		d := time.Since(t0)
-		empty := res.Reconnected == 0 // "did work" = >=1 fragment reconnected (consistent across cgp2/pb2/cgp1/pb1)
+		if ha.mode == "sb3" && os.Getenv("TRACE_RECON_SB3DIAG") != "" {
+			fmt.Fprintf(os.Stderr, "SB3STAGE harness_reconstruct elapsed=%s parents=%d bridges=%d\n", d, len(res.ReconParent), len(res.Bridges))
+		}
+		empty := !hasReconstructionObligation(survivors)
 		ha.recRecon(tid, len(survivors), len(truth), len(dropped), !empty, d)
-		var iso recon.CGP2Iso
-		if !empty {
-			iso = ha.cg2ScoreOf(res, truth, dropped)
+		scoreStart := time.Now()
+		iso := ha.cg2ScoreOf(res, survivors, truth, dropped)
+		var structure *recon.StructureResult
+		if sb3 != nil && iso.Clean() && sb3.Compatible && !ha.cfg.SB3TopoOnly {
+			stTruth, endPos := sb3StructureTruth(spans)
+			sr := recon.ScoreStructureQuads(sb3.Structure, stTruth, endPos, j.dees)
+			structure = &sr
+		}
+		if ha.mode == "sb3" && os.Getenv("TRACE_RECON_SB3DIAG") != "" {
+			fmt.Fprintf(os.Stderr, "SB3STAGE harness_score elapsed=%s\n", time.Since(scoreStart))
+		}
+		if sb3 != nil && sb3.HardConflicts > 0 && os.Getenv("TRACE_RECON_SB3_HARD_TIDS") != "" {
+			fmt.Fprintf(os.Stderr, "SB3HARTRACE tid=%016x survivors=%d parent_conflicts=%d ha_conflicts=%d\n",
+				tid, len(survivors), sb3.ParentConflicts, sb3.HAConflicts)
+		}
+		if ha.mode == "cgp0" && res.GreedyHardConflicts > 0 && os.Getenv("TRACE_RECON_GREEDY_HARD_TIDS") != "" {
+			fmt.Fprintf(os.Stderr, "CGP0HARDTRACE tid=%016x survivors=%d parent_conflicts=%d ha_conflicts=%d\n",
+				tid, len(survivors), res.GreedyParentConflicts, res.GreedyHAConflicts)
 		}
 		ha.mu.Lock()
 		ha.cg2.nt++
+		ha.cg2.sb3.add(sb3)
+		if structure != nil {
+			ha.cg2.sb3.addStructure(*structure, sb3.StructureStatus)
+		}
+		if res.GreedyMode != "" {
+			ha.cg2.greedyChecked++
+			ha.cg2.greedyCandidates += int64(res.GreedyCandidateEvaluations)
+			ha.cg2.greedyHardOverrides += int64(res.GreedyHardOverrides)
+			ha.cg2.greedyHardConflicts += int64(res.GreedyHardConflicts)
+			ha.cg2.greedyParentConflicts += int64(res.GreedyParentConflicts)
+			ha.cg2.greedyHAConflicts += int64(res.GreedyHAConflicts)
+		}
 		if empty {
 			ha.cg2.empty++
+			if iso.Clean() {
+				ha.cg2.emptyClean++
+			}
 			ha.cg2.emptySurvSum += len(survivors)
 			if len(dropped) == 0 {
 				ha.cg2.emptyNoDrop++
@@ -920,13 +1163,15 @@ func (ha *harness) process(j finishJob) {
 			ha.cg2.feas++
 			ha.cg2.realNodes += iso.RealNodes
 			ha.cg2.edgeExact += iso.EdgeExact
+			ha.cg2.edgeAnonOK += iso.EdgeAnonOK
 			ha.cg2.edgeWrong += iso.EdgeWrong
-			ha.cg2.totWrong += iso.EdgeWrong
+			ha.cg2.constraintWrong += iso.ConstraintWrong
+			ha.cg2.totWrong += iso.Wrong()
 			ha.cg2.survN += iso.SurvNodes
 			ha.cg2.survEx += iso.SurvExact
 			ha.cg2.named += iso.NamedSyn
 			ha.cg2.namedEx += iso.NamedExact
-			if iso.EdgeWrong == 0 {
+			if iso.Clean() {
 				ha.cg2.clean++
 			}
 		}
@@ -953,38 +1198,85 @@ func (ha *harness) process(j finishJob) {
 // the from-scratch reconstructors (cgp2/pb2 solver-based, cgp1/pb1 greedy).
 func cg2Family(mode string) bool {
 	switch mode {
-	case "cgp2", "pb2", "cgp1", "pb1", "cgp0", "pb0":
+	case "cgp2", "pb2", "cgp1", "pb1", "cgp0", "pb0", "sb3":
 		return true
 	}
 	return false
 }
 
+// hasReconstructionObligation classifies the input, not whether the chosen
+// algorithm emitted an answer. A survivor whose literal parent is absent is an
+// observable fragment root that must be reconnected; emitting zero bridges for
+// such a trace is a failed nontrivial reconstruction, not an empty trace.
+func hasReconstructionObligation(survivors []recon.Span) bool {
+	surviving := make(map[uint64]bool, len(survivors))
+	for i := range survivors {
+		surviving[survivors[i].SpanID] = true
+	}
+	for i := range survivors {
+		s := &survivors[i]
+		if s.ParentID != 0 && !surviving[s.ParentID] {
+			return true
+		}
+	}
+	return false
+}
+
+// sb3StructureTruth builds the scorer-only ordered truth tree and END-event
+// positions collected during the same trace replay. Neither is visible to the
+// reconstructor; they are consulted only after topology+structure finish.
+func sb3StructureTruth(spans []collSpan) (recon.SBTruth, map[uint64]int64) {
+	truth := recon.SBTruth{ChildByOrd: make(map[uint64]map[int]uint64)}
+	endPos := make(map[uint64]int64, len(spans))
+	for _, s := range spans {
+		endPos[s.spanID] = s.endPos
+		if s.parentID == 0 {
+			truth.RootID = s.spanID
+			continue
+		}
+		kids := truth.ChildByOrd[s.parentID]
+		if kids == nil {
+			kids = make(map[int]uint64)
+			truth.ChildByOrd[s.parentID] = kids
+		}
+		kids[s.ordinal] = s.spanID
+	}
+	return truth, endPos
+}
+
 // cg2Reconstruct dispatches to the right from-scratch reconstructor by mode.
-func (ha *harness) cg2Reconstruct(survivors []recon.Span) recon.Result {
+func (ha *harness) cg2Reconstruct(survivors []recon.Span, dees []bridge.DEEQuad) (recon.Result, *recon.SB3Result) {
 	switch ha.mode {
 	case "pb2":
-		return recon.ReconstructPB2(survivors, ha.cfg)
+		return recon.ReconstructPB2(survivors, ha.cfg), nil
 	case "cgp1":
-		return recon.ReconstructCGP1(survivors, ha.cfg)
+		return recon.ReconstructCGP1(survivors, ha.cfg), nil
 	case "pb1":
-		return recon.ReconstructPB1(survivors, ha.cfg)
+		return recon.ReconstructPB1(survivors, ha.cfg), nil
 	case "cgp0":
-		return recon.ReconstructCGP0(survivors, ha.cfg)
+		return recon.ReconstructCGP0(survivors, ha.cfg), nil
 	case "pb0":
-		return recon.ReconstructPB0(survivors, ha.cfg)
+		return recon.ReconstructPB0(survivors, ha.cfg), nil
+	case "sb3":
+		r := recon.ReconstructSB3WithDEE(survivors, dees, ha.cfg)
+		return r.Topology, &r
 	default: // cgp2
-		return recon.ReconstructCGP2(survivors, ha.cfg)
+		return recon.ReconstructCGP2(survivors, ha.cfg), nil
 	}
 }
 
 // cg2ScoreOf scores a from-scratch result: ancestor/path (pb-family) or strict
 // connectivity+topology (cgp-family), matching how the solver versions score.
-func (ha *harness) cg2ScoreOf(res recon.Result, truth []recon.TruthSpan, dropped map[uint64]struct{}) recon.CGP2Iso {
+func (ha *harness) cg2ScoreOf(res recon.Result, survivors []recon.Span, truth []recon.TruthSpan, dropped map[uint64]struct{}) recon.CGP2Iso {
 	switch ha.mode {
 	case "pb0", "pb1", "pb2":
-		return recon.ScorePB2Path(res, truth, dropped)
+		return recon.ScorePBPathStrict(res, survivors, truth, dropped)
 	}
-	return recon.ScoreCGP2Strict(res, truth, dropped) // cgp: connectivity AND topology
+	iso := recon.ScoreCGP2Strict(res, survivors, truth, dropped) // cgp: evidence-bounded topology
+	if ha.mode == "sb3" && res.SB3OrdinalChecked && !res.SB3OrdinalCompatible {
+		iso.ConstraintWrong++ // topology cannot support the emitted sparse structure
+	}
+	return iso
 }
 
 // decodeSpan turns one collected span into a recon.Span, decoding its carried
@@ -1008,7 +1300,7 @@ func (ha *harness) decodeSpan(tid uint64, s collSpan) recon.Span {
 		sp.Depth = d
 		sp.CkptPrefix = prefix
 		sp.LeafCarrier = d%ha.cpd != 0
-	case (ha.mode == "pcrb" || ha.mode == "pcrs") && !ha.cfg.CGRP:
+	case (ha.mode == "pcrb" || ha.mode == "pcrs" || ha.mode == "pb2" || ha.mode == "pb1" || ha.mode == "pb0") && !ha.cfg.CGRP:
 		d, prefix, bits, err := recon.DecodePCRBPayload(s.br, ha.cfg)
 		if err != nil {
 			die(err)
@@ -1017,7 +1309,18 @@ func (ha *harness) decodeSpan(tid uint64, s collSpan) recon.Span {
 		sp.CkptPrefix = prefix
 		sp.BloomBits = bits
 		sp.LeafCarrier = d%ha.cpd != 0
-	case ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "pb2" || ha.mode == "cgp1" || ha.mode == "pb1" || ha.mode == "cgp0" || ha.mode == "pb0" || ha.cfg.CGRP:
+	case ha.mode == "sb3":
+		d, prefix, bits, haEntries, ords, err := recon.DecodeSB3SpanPayload(s.br, ha.cfg)
+		if err != nil {
+			die(err)
+		}
+		sp.Depth = d
+		sp.CkptPrefix = prefix
+		sp.BloomBits = bits
+		sp.LeafCarrier = d%ha.cpd != 0
+		sp.HA = haEntries
+		sp.SparseOrdinals = ords
+	case ha.mode == "cgprb" || ha.mode == "cgp2" || ha.mode == "cgp1" || ha.mode == "cgp0" || ha.cfg.CGRP:
 		d, prefix, bits, haEntries, err := recon.DecodeCGPRBPayload(s.br, ha.cfg)
 		if err != nil {
 			die(err)
@@ -1048,10 +1351,18 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 		decoded[i] = ha.decodeSpan(tid, s)
 	}
 	type cell struct {
-		empty         bool
-		iso           recon.CGP2Iso
-		nsurv, ndrop  int
-		ns            int64
+		empty                 bool
+		iso                   recon.CGP2Iso
+		sb3                   *recon.SB3Result
+		structure             *recon.StructureResult
+		nsurv, ndrop          int
+		ns                    int64
+		greedyMode            string
+		greedyCandidates      int
+		greedyHardOverrides   int
+		greedyHardConflicts   int
+		greedyParentConflicts int
+		greedyHAConflicts     int
 	}
 	cells := make([]cell, len(ha.mdRates))
 	for r := range ha.mdRates {
@@ -1064,22 +1375,55 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			survivors = append(survivors, decoded[i])
 		}
 		t0 := time.Now()
-		res := ha.cg2Reconstruct(survivors)
+		res, sb3 := ha.cg2Reconstruct(survivors, j.dees)
 		ns := time.Since(t0).Nanoseconds()
-		empty := res.Reconnected == 0 // "did work" = >=1 fragment reconnected (consistent across cgp2/pb2/cgp1/pb1)
-		var iso recon.CGP2Iso
-		if !empty {
-			iso = ha.cg2ScoreOf(res, truth, dropped)
+		empty := !hasReconstructionObligation(survivors)
+		iso := ha.cg2ScoreOf(res, survivors, truth, dropped)
+		var structure *recon.StructureResult
+		if sb3 != nil && iso.Clean() && sb3.Compatible && !ha.cfg.SB3TopoOnly {
+			stTruth, endPos := sb3StructureTruth(spans)
+			sr := recon.ScoreStructureQuads(sb3.Structure, stTruth, endPos, j.dees)
+			structure = &sr
 		}
-		cells[r] = cell{empty, iso, len(survivors), len(dropped), ns}
+		cells[r] = cell{
+			empty: empty, iso: iso, nsurv: len(survivors), ndrop: len(dropped), ns: ns, sb3: sb3, structure: structure,
+			greedyMode: res.GreedyMode, greedyCandidates: res.GreedyCandidateEvaluations,
+			greedyHardOverrides: res.GreedyHardOverrides, greedyHardConflicts: res.GreedyHardConflicts,
+			greedyParentConflicts: res.GreedyParentConflicts, greedyHAConflicts: res.GreedyHAConflicts,
+		}
+	}
+	for r, c := range cells {
+		if c.sb3 != nil && c.sb3.HardConflicts > 0 && os.Getenv("TRACE_RECON_SB3_HARD_TIDS") != "" {
+			fmt.Fprintf(os.Stderr, "SB3HARTRACE tid=%016x drop=%s survivors=%d parent_conflicts=%d ha_conflicts=%d\n",
+				tid, ha.mdDC[r], c.nsurv, c.sb3.ParentConflicts, c.sb3.HAConflicts)
+		}
+		if ha.mode == "cgp0" && c.greedyHardConflicts > 0 && os.Getenv("TRACE_RECON_GREEDY_HARD_TIDS") != "" {
+			fmt.Fprintf(os.Stderr, "CGP0HARDTRACE tid=%016x drop=%s survivors=%d parent_conflicts=%d ha_conflicts=%d\n",
+				tid, ha.mdDC[r], c.nsurv, c.greedyParentConflicts, c.greedyHAConflicts)
+		}
 	}
 	ha.mu.Lock()
 	for r := range cells {
 		c := cells[r]
 		a := &ha.mdAcc[r]
 		a.nt++
+		a.sb3.add(c.sb3)
+		if c.structure != nil {
+			a.sb3.addStructure(*c.structure, c.sb3.StructureStatus)
+		}
+		if c.greedyMode != "" {
+			a.greedyChecked++
+			a.greedyCandidates += int64(c.greedyCandidates)
+			a.greedyHardOverrides += int64(c.greedyHardOverrides)
+			a.greedyHardConflicts += int64(c.greedyHardConflicts)
+			a.greedyParentConflicts += int64(c.greedyParentConflicts)
+			a.greedyHAConflicts += int64(c.greedyHAConflicts)
+		}
 		if c.empty {
 			a.empty++
+			if c.iso.Clean() {
+				a.emptyClean++
+			}
 			a.emptySurvSum += c.nsurv
 			if c.ndrop == 0 {
 				a.emptyNoDrop++
@@ -1091,9 +1435,11 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			a.feas++
 			a.realNodes += c.iso.RealNodes
 			a.edgeExact += c.iso.EdgeExact
+			a.edgeAnonOK += c.iso.EdgeAnonOK
 			a.edgeWrong += c.iso.EdgeWrong
-			a.totWrong += c.iso.EdgeWrong
-			if c.iso.EdgeWrong == 0 {
+			a.constraintWrong += c.iso.ConstraintWrong
+			a.totWrong += c.iso.Wrong()
+			if c.iso.Clean() {
 				a.clean++
 			}
 		}
@@ -1284,37 +1630,177 @@ func (ha *harness) scoresStore(tid uint64, sc recon.Score) {
 	}
 }
 
+type topologySummary struct {
+	ScorePolicy     string `json:"score_policy"`
+	EvidenceProfile string `json:"evidence_profile"`
+	Traces          int    `json:"traces"`
+	Feasible        int    `json:"feasible"`
+	Empty           int    `json:"empty"`
+	EmptyClean      int    `json:"empty_clean"`
+	Clean           int    `json:"clean"`
+	CleanAll        int    `json:"clean_all"`
+	RealNodes       int    `json:"real_nodes"`
+	EdgeExact       int    `json:"edge_exact"`
+	EdgeAnonOK      int    `json:"edge_anonymous_valid"`
+	EdgeWrong       int    `json:"edge_wrong"`
+	ConstraintWrong int    `json:"constraint_wrong"`
+	SurvivorEdges   int    `json:"survivor_edges"`
+	SurvivorExact   int    `json:"survivor_exact"`
+	NamedSyn        int    `json:"named_synthetic"`
+	NamedExact      int    `json:"named_exact"`
+}
+
+type sb3Summary struct {
+	GreedyMode           string `json:"greedy_mode"`
+	Checked              int64  `json:"checked"`
+	Compatible           int64  `json:"compatible"`
+	CandidateEvaluations int64  `json:"candidate_evaluations"`
+	OrdinalOverrides     int64  `json:"ordinal_overrides"`
+	HardOverrides        int64  `json:"hard_overrides"`
+	OrdinalPlaced        int64  `json:"ordinal_placed"`
+	ImplicitOrdinals     int64  `json:"implicit_first_labels"`
+	Fanouts              int64  `json:"fanouts"`
+	Conflicts            int64  `json:"conflicts"`
+	HardConflicts        int64  `json:"hard_conflicts"`
+	ParentConflicts      int64  `json:"parent_conflicts"`
+	HAConflicts          int64  `json:"ha_conflicts"`
+	StructureChecked     int64  `json:"structure_checked"`
+	StructureComplete    int64  `json:"structure_complete"`
+	StructureIncomplete  int64  `json:"structure_incomplete"`
+	DEEPlaced            int64  `json:"dee_placed"`
+	DEEAmbiguous         int64  `json:"dee_ambiguous"`
+	DEENoPlace           int64  `json:"dee_no_place"`
+	EventOrderOK         int64  `json:"event_order_ok"`
+	CriticalPathOK       int64  `json:"critical_path_ok"`
+	StructureParents     int64  `json:"structure_parents"`
+	EndOrderOK           int64  `json:"end_order_ok"`
+}
+
+type greedySummary struct {
+	Mode                 string `json:"mode"`
+	Checked              int64  `json:"checked"`
+	CandidateEvaluations int64  `json:"candidate_evaluations"`
+	HardOverrides        int64  `json:"hard_overrides"`
+	HardConflicts        int64  `json:"hard_conflicts"`
+	ParentConflicts      int64  `json:"parent_conflicts"`
+	HAConflicts          int64  `json:"ha_conflicts"`
+}
+
+type rateSummary struct {
+	DropRate        float64         `json:"drop_rate"`
+	DropCode        string          `json:"drop_code"`
+	TopologySummary topologySummary `json:"topology_summary"`
+	GreedySummary   *greedySummary  `json:"greedy_summary,omitempty"`
+	SB3Summary      *sb3Summary     `json:"sb3_summary,omitempty"`
+}
+
+func evidenceProfile(c config) string {
+	profile := "model-default"
+	if c.mode == "cgp0" || c.mode == "pb0" || c.mode == "sb3" {
+		profile = "maximal"
+		if c.cgp0Legacy || c.pb0Legacy || c.sb3IgnoreOrdinals || c.greedyNoGrouped || c.greedyNoHardHA || c.greedyNoFallback || c.topoOnly {
+			profile = "ablation"
+		}
+	}
+	return profile
+}
+
+func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *sb3Summary) {
+	scorePolicy := "evidence-bounded-v1"
+	if c.mode == "pb0" || c.mode == "pb1" || c.mode == "pb2" {
+		scorePolicy = "path-evidence-v1"
+	}
+	topo := topologySummary{
+		ScorePolicy: scorePolicy, EvidenceProfile: evidenceProfile(c),
+		Traces: a.nt, Feasible: a.feas, Empty: a.empty, EmptyClean: a.emptyClean,
+		Clean: a.clean, CleanAll: a.clean + a.emptyClean, RealNodes: a.realNodes,
+		EdgeExact: a.edgeExact, EdgeAnonOK: a.edgeAnonOK, EdgeWrong: a.edgeWrong,
+		ConstraintWrong: a.constraintWrong, SurvivorEdges: a.survN, SurvivorExact: a.survEx,
+		NamedSyn: a.named, NamedExact: a.namedEx,
+	}
+	var greedy *greedySummary
+	if c.mode == "cgp0" || c.mode == "pb0" {
+		mode := "full-evidence"
+		if c.cgp0Legacy || c.pb0Legacy {
+			mode = "legacy-lean"
+		}
+		greedy = &greedySummary{
+			Mode: mode, Checked: a.greedyChecked, CandidateEvaluations: a.greedyCandidates,
+			HardOverrides: a.greedyHardOverrides, HardConflicts: a.greedyHardConflicts,
+			ParentConflicts: a.greedyParentConflicts, HAConflicts: a.greedyHAConflicts,
+		}
+	}
+	var sb3 *sb3Summary
+	if c.mode == "sb3" {
+		s := a.sb3
+		sb3 = &sb3Summary{
+			GreedyMode: "sb3-greedy", Checked: s.checked, Compatible: s.compatible,
+			CandidateEvaluations: s.candidateEvaluations, OrdinalOverrides: s.ordinalOverrides,
+			HardOverrides: s.hardOverrides, OrdinalPlaced: s.ordinalPlaced,
+			ImplicitOrdinals: s.implicitOrdinals, Fanouts: s.fanouts, Conflicts: s.conflicts,
+			HardConflicts: s.hardConflicts, ParentConflicts: s.parentConflicts, HAConflicts: s.haConflicts,
+			StructureChecked: s.structureChecked, StructureComplete: s.structureComplete,
+			StructureIncomplete: s.structureIncomplete, DEEPlaced: s.deePlaced,
+			DEEAmbiguous: s.deeAmbiguous, DEENoPlace: s.deeNoPlace,
+			EventOrderOK: s.eventOK, CriticalPathOK: s.criticalPathOK,
+			StructureParents: s.structureParents, EndOrderOK: s.endOrderOK,
+		}
+	}
+	return topo, greedy, sb3
+}
+
 // output is the per-trace score arrays, in trace load order.
 type output struct {
-	Mode               string  `json:"mode"`
-	CheckpointDistance int     `json:"checkpoint_distance"`
-	DropRate           float64 `json:"drop_rate"`
-	BloomFP            float64 `json:"bloom_fp,omitempty"`
-	PrefixLen          int     `json:"prefix_len,omitempty"`
-	Order              string  `json:"order"`
-	Consistency        string  `json:"consistency"`
-	Seed               int64   `json:"seed"`
-	NumTraces          int     `json:"num_traces"`
-	NumSpans           []int   `json:"num_spans"`
-	NumDropped         []int   `json:"num_dropped"`
-	NumOrphans         []int   `json:"num_orphans"`
-	NumReconnected     []int   `json:"num_reconnected"`
-	NumAnchorCorrect   []int   `json:"num_anchor_correct"`
-	NumAnchorAncestor  []int   `json:"num_anchor_ancestor"`
-	NumGapCorrect      []int   `json:"num_gap_correct"`
-	NumMisattached     []int   `json:"num_misattached"`
-	NumUnanchored      []int   `json:"num_unanchored"`
-	NumSynthetic       []int   `json:"num_synthetic"`
-	NumBorrowed        []int   `json:"num_borrowed_bloom"`
-	NumFragmentsLost   []int   `json:"num_fragments_lost,omitempty"`    // PCR only
-	NumSpansLost       []int   `json:"num_spans_lost,omitempty"`        // PCR only
-	NumAncestorsSkip   []int   `json:"num_ancestors_skipped,omitempty"` // PCR only
-	NumSpansInSkipped  []int   `json:"num_spans_in_skipped,omitempty"`  // PCR only
-	NumOpenEnds        []int   `json:"num_open_ends,omitempty"`         // PCRB only
-	NumOpenEndsMatched []int   `json:"num_open_ends_matched,omitempty"` // PCRB only
-	NumForcedMatches   []int   `json:"num_forced_matches,omitempty"`    // PCRB only
-	NumOrphansPlaced   []int   `json:"num_orphans_placed,omitempty"`    // PCRB only
-	NumOrphanOpenEnds  []int   `json:"num_orphan_open_ends,omitempty"`  // PCRB only
+	Mode               string           `json:"mode"`
+	Corpus             string           `json:"corpus,omitempty"`
+	TraceStore         string           `json:"trace_store,omitempty"`
+	CheckpointDistance int              `json:"checkpoint_distance"`
+	DropRate           float64          `json:"drop_rate,omitempty"`
+	DropRates          []float64        `json:"drop_rates,omitempty"`
+	RateSummaries      []rateSummary    `json:"rate_summaries,omitempty"`
+	BloomFP            float64          `json:"bloom_fp,omitempty"`
+	PrimeM             bool             `json:"prime_m,omitempty"`
+	PrimeMByteCap      bool             `json:"prime_m_bytecap,omitempty"`
+	PrefixLen          int              `json:"prefix_len,omitempty"`
+	FPBits             int              `json:"fp_bits,omitempty"`
+	LehmerEE           bool             `json:"lehmer_ee,omitempty"`
+	TopoOnly           bool             `json:"topo_only,omitempty"`
+	SB3IgnoreOrdinals  bool             `json:"sb3_ignore_ordinals,omitempty"`
+	CGP0Legacy         bool             `json:"cgp0_legacy,omitempty"`
+	PB0Legacy          bool             `json:"pb0_legacy,omitempty"`
+	GreedyNoGrouped    bool             `json:"greedy_no_grouped_evidence,omitempty"`
+	GreedyNoHardHA     bool             `json:"greedy_no_hard_ha,omitempty"`
+	GreedyNoFallback   bool             `json:"greedy_no_route_fallback,omitempty"`
+	PerTraceDropSeed   bool             `json:"per_trace_drop_seed,omitempty"`
+	Order              string           `json:"order"`
+	Consistency        string           `json:"consistency"`
+	Seed               int64            `json:"seed"`
+	Sample             int              `json:"sample,omitempty"`
+	SampleSeed         int64            `json:"sample_seed,omitempty"`
+	NumTraces          int              `json:"num_traces"`
+	NumSpans           []int            `json:"num_spans,omitempty"`
+	NumDropped         []int            `json:"num_dropped,omitempty"`
+	NumOrphans         []int            `json:"num_orphans,omitempty"`
+	NumReconnected     []int            `json:"num_reconnected,omitempty"`
+	NumAnchorCorrect   []int            `json:"num_anchor_correct,omitempty"`
+	NumAnchorAncestor  []int            `json:"num_anchor_ancestor,omitempty"`
+	NumGapCorrect      []int            `json:"num_gap_correct,omitempty"`
+	NumMisattached     []int            `json:"num_misattached,omitempty"`
+	NumUnanchored      []int            `json:"num_unanchored,omitempty"`
+	NumSynthetic       []int            `json:"num_synthetic,omitempty"`
+	NumBorrowed        []int            `json:"num_borrowed_bloom,omitempty"`
+	NumFragmentsLost   []int            `json:"num_fragments_lost,omitempty"`    // PCR only
+	NumSpansLost       []int            `json:"num_spans_lost,omitempty"`        // PCR only
+	NumAncestorsSkip   []int            `json:"num_ancestors_skipped,omitempty"` // PCR only
+	NumSpansInSkipped  []int            `json:"num_spans_in_skipped,omitempty"`  // PCR only
+	NumOpenEnds        []int            `json:"num_open_ends,omitempty"`         // PCRB only
+	NumOpenEndsMatched []int            `json:"num_open_ends_matched,omitempty"` // PCRB only
+	NumForcedMatches   []int            `json:"num_forced_matches,omitempty"`    // PCRB only
+	NumOrphansPlaced   []int            `json:"num_orphans_placed,omitempty"`    // PCRB only
+	NumOrphanOpenEnds  []int            `json:"num_orphan_open_ends,omitempty"`  // PCRB only
+	TopologySummary    *topologySummary `json:"topology_summary,omitempty"`
+	GreedySummary      *greedySummary   `json:"greedy_summary,omitempty"`
+	SB3Summary         *sb3Summary      `json:"sb3_summary,omitempty"`
 }
 
 // slowReconMS: if >0 (set via TRACE_RECON_SLOW=<ms>), log any single cgprb
@@ -1393,67 +1879,105 @@ func main() {
 	}
 	out := output{
 		Mode:               c.mode,
+		Corpus:             c.corpusDir,
+		TraceStore:         c.traceStore,
 		CheckpointDistance: c.checkpointDistance,
 		DropRate:           c.dropRate,
+		PrimeM:             bloom.PrimeM,
+		PrimeMByteCap:      bloom.PrimeMByteCap,
+		PerTraceDropSeed:   c.perTraceDropSeed,
+		TopoOnly:           c.topoOnly,
+		SB3IgnoreOrdinals:  c.sb3IgnoreOrdinals,
+		CGP0Legacy:         c.cgp0Legacy,
+		PB0Legacy:          c.pb0Legacy,
+		GreedyNoGrouped:    c.greedyNoGrouped,
+		GreedyNoHardHA:     c.greedyNoHardHA,
+		GreedyNoFallback:   c.greedyNoFallback,
 		Order:              orderName,
 		Consistency:        map[bool]string{true: "chain", false: "none"}[c.chainCheck],
 		Seed:               c.seed,
+		Sample:             c.sampleCount,
 		NumTraces:          len(traceOrder),
+	}
+	if c.sampleCount > 0 {
+		out.SampleSeed = c.sampleSeed
+	}
+	if cg2Family(c.mode) {
+		if len(ha.mdRates) == 0 {
+			topo, greedy, sb3 := summariesFor(c, ha.cg2)
+			out.TopologySummary, out.GreedySummary, out.SB3Summary = &topo, greedy, sb3
+		} else {
+			out.DropRate = 0
+			out.DropRates = append([]float64(nil), ha.mdRates...)
+			for r, rate := range ha.mdRates {
+				topo, greedy, sb3 := summariesFor(c, ha.mdAcc[r])
+				out.RateSummaries = append(out.RateSummaries, rateSummary{
+					DropRate: rate, DropCode: ha.mdDC[r], TopologySummary: topo,
+					GreedySummary: greedy, SB3Summary: sb3,
+				})
+			}
+		}
 	}
 	switch c.mode {
 	case "pcr":
 		out.PrefixLen = c.prefixLen
-	case "pcrb", "pcrs", "cgprb":
+	case "pcrb", "pcrs", "cgprb", "cgp2", "pb2", "cgp1", "pb1", "cgp0", "pb0", "sb3":
 		out.PrefixLen = c.prefixLen
 		out.BloomFP = c.bloomFP
+		if c.mode == "sb3" {
+			out.FPBits = c.fpBits
+			out.LehmerEE = c.lehmerEE
+		}
 	default:
 		out.BloomFP = c.bloomFP
 	}
 	var agg recon.Score
-	for _, tid := range traceOrder {
-		sc := ha.scores[tid]
-		out.NumSpans = append(out.NumSpans, sc.Spans)
-		out.NumDropped = append(out.NumDropped, sc.Dropped)
-		out.NumOrphans = append(out.NumOrphans, sc.Orphans)
-		out.NumReconnected = append(out.NumReconnected, sc.Reconnected)
-		out.NumAnchorCorrect = append(out.NumAnchorCorrect, sc.AnchorCorrect)
-		out.NumAnchorAncestor = append(out.NumAnchorAncestor, sc.AnchorAncestor)
-		out.NumGapCorrect = append(out.NumGapCorrect, sc.GapCorrect)
-		out.NumMisattached = append(out.NumMisattached, sc.Misattached)
-		out.NumUnanchored = append(out.NumUnanchored, sc.Unanchored)
-		out.NumSynthetic = append(out.NumSynthetic, sc.Synthetic)
-		out.NumBorrowed = append(out.NumBorrowed, sc.Borrowed)
-		if c.mode == "pcr" || c.mode == "pcrb" || c.mode == "pcrs" || c.mode == "cgprb" {
-			out.NumFragmentsLost = append(out.NumFragmentsLost, sc.FragmentsLost)
-			out.NumSpansLost = append(out.NumSpansLost, sc.SpansLost)
-			out.NumAncestorsSkip = append(out.NumAncestorsSkip, sc.AncestorsSkipped)
-			out.NumSpansInSkipped = append(out.NumSpansInSkipped, sc.SpansInSkipped)
-			out.NumOpenEnds = append(out.NumOpenEnds, sc.OpenEnds)
-			out.NumOpenEndsMatched = append(out.NumOpenEndsMatched, sc.OpenEndsMatched)
-			out.NumForcedMatches = append(out.NumForcedMatches, sc.ForcedMatches)
-			out.NumOrphansPlaced = append(out.NumOrphansPlaced, sc.OrphansPlaced)
-			out.NumOrphanOpenEnds = append(out.NumOrphanOpenEnds, sc.OrphanOpenEnds)
+	if !cg2Family(c.mode) {
+		for _, tid := range traceOrder {
+			sc := ha.scores[tid]
+			out.NumSpans = append(out.NumSpans, sc.Spans)
+			out.NumDropped = append(out.NumDropped, sc.Dropped)
+			out.NumOrphans = append(out.NumOrphans, sc.Orphans)
+			out.NumReconnected = append(out.NumReconnected, sc.Reconnected)
+			out.NumAnchorCorrect = append(out.NumAnchorCorrect, sc.AnchorCorrect)
+			out.NumAnchorAncestor = append(out.NumAnchorAncestor, sc.AnchorAncestor)
+			out.NumGapCorrect = append(out.NumGapCorrect, sc.GapCorrect)
+			out.NumMisattached = append(out.NumMisattached, sc.Misattached)
+			out.NumUnanchored = append(out.NumUnanchored, sc.Unanchored)
+			out.NumSynthetic = append(out.NumSynthetic, sc.Synthetic)
+			out.NumBorrowed = append(out.NumBorrowed, sc.Borrowed)
+			if c.mode == "pcr" || c.mode == "pcrb" || c.mode == "pcrs" || c.mode == "cgprb" {
+				out.NumFragmentsLost = append(out.NumFragmentsLost, sc.FragmentsLost)
+				out.NumSpansLost = append(out.NumSpansLost, sc.SpansLost)
+				out.NumAncestorsSkip = append(out.NumAncestorsSkip, sc.AncestorsSkipped)
+				out.NumSpansInSkipped = append(out.NumSpansInSkipped, sc.SpansInSkipped)
+				out.NumOpenEnds = append(out.NumOpenEnds, sc.OpenEnds)
+				out.NumOpenEndsMatched = append(out.NumOpenEndsMatched, sc.OpenEndsMatched)
+				out.NumForcedMatches = append(out.NumForcedMatches, sc.ForcedMatches)
+				out.NumOrphansPlaced = append(out.NumOrphansPlaced, sc.OrphansPlaced)
+				out.NumOrphanOpenEnds = append(out.NumOrphanOpenEnds, sc.OrphanOpenEnds)
+			}
+			agg.Spans += sc.Spans
+			agg.Dropped += sc.Dropped
+			agg.Orphans += sc.Orphans
+			agg.Reconnected += sc.Reconnected
+			agg.AnchorCorrect += sc.AnchorCorrect
+			agg.AnchorAncestor += sc.AnchorAncestor
+			agg.GapCorrect += sc.GapCorrect
+			agg.Misattached += sc.Misattached
+			agg.Unanchored += sc.Unanchored
+			agg.Synthetic += sc.Synthetic
+			agg.Borrowed += sc.Borrowed
+			agg.FragmentsLost += sc.FragmentsLost
+			agg.SpansLost += sc.SpansLost
+			agg.AncestorsSkipped += sc.AncestorsSkipped
+			agg.SpansInSkipped += sc.SpansInSkipped
+			agg.OpenEnds += sc.OpenEnds
+			agg.OpenEndsMatched += sc.OpenEndsMatched
+			agg.ForcedMatches += sc.ForcedMatches
+			agg.OrphansPlaced += sc.OrphansPlaced
+			agg.OrphanOpenEnds += sc.OrphanOpenEnds
 		}
-		agg.Spans += sc.Spans
-		agg.Dropped += sc.Dropped
-		agg.Orphans += sc.Orphans
-		agg.Reconnected += sc.Reconnected
-		agg.AnchorCorrect += sc.AnchorCorrect
-		agg.AnchorAncestor += sc.AnchorAncestor
-		agg.GapCorrect += sc.GapCorrect
-		agg.Misattached += sc.Misattached
-		agg.Unanchored += sc.Unanchored
-		agg.Synthetic += sc.Synthetic
-		agg.Borrowed += sc.Borrowed
-		agg.FragmentsLost += sc.FragmentsLost
-		agg.SpansLost += sc.SpansLost
-		agg.AncestorsSkipped += sc.AncestorsSkipped
-		agg.SpansInSkipped += sc.SpansInSkipped
-		agg.OpenEnds += sc.OpenEnds
-		agg.OpenEndsMatched += sc.OpenEndsMatched
-		agg.ForcedMatches += sc.ForcedMatches
-		agg.OrphansPlaced += sc.OrphansPlaced
-		agg.OrphanOpenEnds += sc.OrphanOpenEnds
 	}
 
 	f, err := os.Create(c.outputPath)
@@ -1469,36 +1993,38 @@ func main() {
 	}
 	f.Close()
 
-	pct := func(n, d int) float64 {
-		if d == 0 {
-			return 0
+	if !cg2Family(c.mode) {
+		pct := func(n, d int) float64 {
+			if d == 0 {
+				return 0
+			}
+			return 100 * float64(n) / float64(d)
 		}
-		return 100 * float64(n) / float64(d)
-	}
-	fmt.Fprintf(os.Stderr, "traces=%d spans=%d dropped=%d orphans=%d\n",
-		len(traceOrder), agg.Spans, agg.Dropped, agg.Orphans)
-	fmt.Fprintf(os.Stderr, "reconnected=%d (%.2f%%) anchor_correct=%d (%.2f%%) anchor_ancestor=%d (%.2f%%) gap_correct=%d (%.2f%%)\n",
-		agg.Reconnected, pct(agg.Reconnected, agg.Orphans),
-		agg.AnchorCorrect, pct(agg.AnchorCorrect, agg.Orphans),
-		agg.AnchorAncestor, pct(agg.AnchorAncestor, agg.Orphans),
-		agg.GapCorrect, pct(agg.GapCorrect, agg.Orphans))
-	// "via_carrier": PB = bloom borrowed across reconstructed structure or
-	// by membership scan (a verified guess); PCR = exact inheritance from a
-	// real-edge in-fragment descendant carrier (not an error channel). The
-	// JSON field keeps its legacy name num_borrowed_bloom for script compat.
-	fmt.Fprintf(os.Stderr, "misattached=%d unanchored=%d synthetic=%d via_carrier=%d\n",
-		agg.Misattached, agg.Unanchored, agg.Synthetic, agg.Borrowed)
-	fmt.Fprintf(os.Stderr, "ambiguous=%d (of which misattached=%d); non-ambiguous misattached=%d\n",
-		agg.Ambiguous, agg.AmbiguousBad, agg.Misattached-agg.AmbiguousBad)
-	if c.mode == "pcr" || c.mode == "pcrb" || c.mode == "pcrs" {
-		fmt.Fprintf(os.Stderr, "fragments_lost=%d spans_lost=%d (%.2f%% of survivors thrown away)\n",
-			agg.FragmentsLost, agg.SpansLost, pct(agg.SpansLost, agg.Spans-agg.Dropped))
-		fmt.Fprintf(os.Stderr, "ancestors_skipped=%d spans_in_skipped_fragments=%d (%.2f%% of survivors)\n",
-			agg.AncestorsSkipped, agg.SpansInSkipped, pct(agg.SpansInSkipped, agg.Spans-agg.Dropped))
-		fmt.Fprintf(os.Stderr, "open_ends=%d matched=%d (%.2f%%) forced=%d\n",
-			agg.OpenEnds, agg.OpenEndsMatched, pct(agg.OpenEndsMatched, agg.OpenEnds), agg.ForcedMatches)
-		fmt.Fprintf(os.Stderr, "orphans_placed=%d orphan_open_ends_pending=%d\n",
-			agg.OrphansPlaced, agg.OrphanOpenEnds)
+		fmt.Fprintf(os.Stderr, "traces=%d spans=%d dropped=%d orphans=%d\n",
+			len(traceOrder), agg.Spans, agg.Dropped, agg.Orphans)
+		fmt.Fprintf(os.Stderr, "reconnected=%d (%.2f%%) anchor_correct=%d (%.2f%%) anchor_ancestor=%d (%.2f%%) gap_correct=%d (%.2f%%)\n",
+			agg.Reconnected, pct(agg.Reconnected, agg.Orphans),
+			agg.AnchorCorrect, pct(agg.AnchorCorrect, agg.Orphans),
+			agg.AnchorAncestor, pct(agg.AnchorAncestor, agg.Orphans),
+			agg.GapCorrect, pct(agg.GapCorrect, agg.Orphans))
+		// "via_carrier": PB = bloom borrowed across reconstructed structure or
+		// by membership scan (a verified guess); PCR = exact inheritance from a
+		// real-edge in-fragment descendant carrier (not an error channel). The
+		// JSON field keeps its legacy name num_borrowed_bloom for script compat.
+		fmt.Fprintf(os.Stderr, "misattached=%d unanchored=%d synthetic=%d via_carrier=%d\n",
+			agg.Misattached, agg.Unanchored, agg.Synthetic, agg.Borrowed)
+		fmt.Fprintf(os.Stderr, "ambiguous=%d (of which misattached=%d); non-ambiguous misattached=%d\n",
+			agg.Ambiguous, agg.AmbiguousBad, agg.Misattached-agg.AmbiguousBad)
+		if c.mode == "pcr" || c.mode == "pcrb" || c.mode == "pcrs" {
+			fmt.Fprintf(os.Stderr, "fragments_lost=%d spans_lost=%d (%.2f%% of survivors thrown away)\n",
+				agg.FragmentsLost, agg.SpansLost, pct(agg.SpansLost, agg.Spans-agg.Dropped))
+			fmt.Fprintf(os.Stderr, "ancestors_skipped=%d spans_in_skipped_fragments=%d (%.2f%% of survivors)\n",
+				agg.AncestorsSkipped, agg.SpansInSkipped, pct(agg.SpansInSkipped, agg.Spans-agg.Dropped))
+			fmt.Fprintf(os.Stderr, "open_ends=%d matched=%d (%.2f%%) forced=%d\n",
+				agg.OpenEnds, agg.OpenEndsMatched, pct(agg.OpenEndsMatched, agg.OpenEnds), agg.ForcedMatches)
+			fmt.Fprintf(os.Stderr, "orphans_placed=%d orphan_open_ends_pending=%d\n",
+				agg.OrphansPlaced, agg.OrphanOpenEnds)
+		}
 	}
 	if len(ha.mdRates) > 0 {
 		if ha.timingOn {
@@ -1695,10 +2221,10 @@ func runFromCorpus(c config, ha *harness) []uint64 {
 
 // replayTrace reconstructs one trace's collected spans by replaying its event
 // block through a per-worker handler — the exact span-building onEvent does in
-// the streaming path, but for one isolated trace. Handler state is strictly
-// per-trace, so feeding one trace's events to a fresh/evicted handler yields
-// byte-identical payloads to the interleaved streaming run. EvictTrace clears
-// the handler's per-trace state so the same handler can serve the next trace.
+// the streaming path, but for one isolated trace. EvictTrace clears the
+// handler's per-trace state so the same handler can serve the next trace.
+// SB3's cross-trace DEE queue is irrelevant to topology payload fields; the
+// generated DEE side records are captured separately by origin trace.
 func replayTrace(h bridge.Handler, st corpus.StoredTrace) []collSpan {
 	spans := make([]collSpan, 0, len(st.Events)/2)
 	idx := make(map[uint64]int, len(st.Events)/2)
@@ -1714,11 +2240,12 @@ func replayTrace(h bridge.Handler, st corpus.StoredTrace) []collSpan {
 			}
 			r := h.OnStart(ev, seqNum)
 			idx[e.SpanID] = len(spans)
-			spans = append(spans, collSpan{spanID: e.SpanID, parentID: e.ParentID, depth: -1, br: r.Payload})
+			spans = append(spans, collSpan{spanID: e.SpanID, parentID: e.ParentID, depth: -1, br: r.Payload, ordinal: seqNum})
 		} else {
 			r := h.OnEnd(ev)
 			if j, ok := idx[e.SpanID]; ok {
 				spans[j].depth = r.Depth
+				spans[j].endPos = int64(i)
 				if r.Payload != nil {
 					spans[j].br = r.Payload
 				}
@@ -1783,6 +2310,20 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 		os.Exit(1)
 	}
 	traceOrder, _ := pickTraces(meta.TraceOrder, nil, c)
+	// With per-trace seeded drops, a target trace's drop set is independent of
+	// every preceding trace. Filter --only-traces before opening/replaying the
+	// store so a one-trace diagnostic does not pointlessly simulate all 521k
+	// Day-1 traces first. Preserve the legacy full scan for the shared RNG mode,
+	// where advancing earlier draws is part of reproducibility.
+	if len(ha.only) > 0 && c.perTraceDropSeed {
+		filtered := make([]uint64, 0, len(ha.only))
+		for _, tid := range traceOrder {
+			if ha.only[tid] {
+				filtered = append(filtered, tid)
+			}
+		}
+		traceOrder = filtered
+	}
 	selected := make(map[uint64]bool, len(traceOrder))
 	for _, tid := range traceOrder {
 		selected[tid] = true
@@ -1808,6 +2349,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 		seq   int
 		tid   uint64
 		spans []collSpan
+		dees  []bridge.DEEQuad
 	}
 	inCh := make(chan seqTrace, nw*2)
 	outCh := make(chan prepped, nw*2)
@@ -1842,9 +2384,26 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 		p1wg.Add(1)
 		go func() {
 			defer p1wg.Done()
-			h, _ := makeHandler(c)
+			h, workerCfg := makeHandler(c)
 			for stx := range inCh {
-				outCh <- prepped{seq: stx.seq, tid: stx.st.TraceID, spans: replayTrace(h, stx.st)}
+				var dees []bridge.DEEQuad
+				if sh, ok := h.(*bridge.SB3Handler); ok {
+					sh.DEESink = func(tid uint64, raw []byte) {
+						var decoded []bridge.DEEQuad
+						var err error
+						if workerCfg.SBridgeLehmer {
+							decoded, err = bridge.DecodeDEEQuadsLehmer(raw, workerCfg.FPBits)
+						} else {
+							decoded, err = bridge.DecodeDEEQuads(raw, workerCfg.FPBits)
+						}
+						if err != nil {
+							panic(fmt.Sprintf("decode generated SB3 DEE for trace %016x: %v", tid, err))
+						}
+						dees = append(dees, decoded...)
+					}
+				}
+				spans := replayTrace(h, stx.st)
+				outCh <- prepped{seq: stx.seq, tid: stx.st.TraceID, spans: spans, dees: dees}
 			}
 		}()
 	}
@@ -1863,7 +2422,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 			if ha.only != nil && !ha.only[p.tid] {
 				return
 			}
-			ha.jobs <- finishJob{tid: p.tid, spans: p.spans, droppedMulti: dm}
+			ha.jobs <- finishJob{tid: p.tid, spans: p.spans, droppedMulti: dm, dees: p.dees}
 			return
 		}
 		dropped := ha.computeDropped(p.tid, p.spans)
@@ -1872,7 +2431,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 		if ha.only != nil && !ha.only[p.tid] {
 			return
 		}
-		ha.jobs <- finishJob{tid: p.tid, spans: p.spans, dropped: dropped}
+		ha.jobs <- finishJob{tid: p.tid, spans: p.spans, dropped: dropped, dees: p.dees}
 	}
 	for p := range outCh {
 		buf[p.seq] = p

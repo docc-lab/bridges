@@ -1,0 +1,81 @@
+Trace store: 521305 traces selected, 14 parallel replay workers
+PROGRESS traces=10000 elapsed=19s feasible=9246 empty=754 exclEmpty=91.86% per-edge-exact=96.025%
+PROGRESS traces=20000 elapsed=44s feasible=19127 empty=873 exclEmpty=89.77% per-edge-exact=96.043%
+PROGRESS traces=30000 elapsed=70s feasible=29003 empty=997 exclEmpty=89.00% per-edge-exact=96.081%
+PROGRESS traces=40000 elapsed=96s feasible=38879 empty=1121 exclEmpty=88.53% per-edge-exact=96.123%
+PROGRESS traces=50000 elapsed=120s feasible=48759 empty=1241 exclEmpty=88.63% per-edge-exact=96.131%
+PROGRESS traces=60000 elapsed=142s feasible=58603 empty=1397 exclEmpty=88.95% per-edge-exact=96.137%
+PROGRESS traces=70000 elapsed=165s feasible=68436 empty=1564 exclEmpty=89.13% per-edge-exact=96.149%
+PROGRESS traces=80000 elapsed=192s feasible=78264 empty=1736 exclEmpty=89.27% per-edge-exact=96.150%
+PROGRESS traces=90000 elapsed=217s feasible=88115 empty=1885 exclEmpty=89.47% per-edge-exact=96.173%
+PROGRESS traces=100000 elapsed=242s feasible=97986 empty=2014 exclEmpty=89.60% per-edge-exact=96.175%
+PROGRESS traces=110000 elapsed=266s feasible=107830 empty=2170 exclEmpty=89.63% per-edge-exact=96.196%
+PROGRESS traces=120000 elapsed=287s feasible=117689 empty=2311 exclEmpty=89.72% per-edge-exact=96.197%
+PROGRESS traces=130000 elapsed=309s feasible=127543 empty=2457 exclEmpty=89.76% per-edge-exact=96.195%
+PROGRESS traces=140000 elapsed=333s feasible=137382 empty=2618 exclEmpty=89.83% per-edge-exact=96.198%
+PROGRESS traces=150000 elapsed=358s feasible=147216 empty=2784 exclEmpty=89.83% per-edge-exact=96.203%
+PROGRESS traces=160000 elapsed=383s feasible=157066 empty=2934 exclEmpty=89.87% per-edge-exact=96.206%
+PROGRESS traces=170000 elapsed=406s feasible=166897 empty=3103 exclEmpty=89.89% per-edge-exact=96.208%
+PROGRESS traces=180000 elapsed=429s feasible=176733 empty=3267 exclEmpty=89.94% per-edge-exact=96.206%
+PROGRESS traces=190000 elapsed=452s feasible=186598 empty=3402 exclEmpty=89.97% per-edge-exact=96.210%
+PROGRESS traces=200000 elapsed=474s feasible=196429 empty=3571 exclEmpty=90.00% per-edge-exact=96.212%
+PROGRESS traces=210000 elapsed=500s feasible=206285 empty=3715 exclEmpty=89.98% per-edge-exact=96.212%
+PROGRESS traces=220000 elapsed=524s feasible=216113 empty=3887 exclEmpty=89.97% per-edge-exact=96.212%
+PROGRESS traces=230000 elapsed=547s feasible=225959 empty=4041 exclEmpty=89.97% per-edge-exact=96.213%
+PROGRESS traces=240000 elapsed=572s feasible=235819 empty=4181 exclEmpty=89.98% per-edge-exact=96.215%
+PROGRESS traces=250000 elapsed=595s feasible=245659 empty=4341 exclEmpty=89.98% per-edge-exact=96.214%
+PROGRESS traces=260000 elapsed=617s feasible=255495 empty=4505 exclEmpty=89.99% per-edge-exact=96.213%
+PROGRESS traces=270000 elapsed=634s feasible=264738 empty=5262 exclEmpty=90.06% per-edge-exact=96.209%
+PROGRESS traces=280000 elapsed=658s feasible=274600 empty=5400 exclEmpty=89.98% per-edge-exact=96.204%
+PROGRESS traces=290000 elapsed=682s feasible=284478 empty=5522 exclEmpty=89.88% per-edge-exact=96.201%
+PROGRESS traces=300000 elapsed=707s feasible=294387 empty=5613 exclEmpty=89.80% per-edge-exact=96.198%
+PROGRESS traces=310000 elapsed=730s feasible=304245 empty=5755 exclEmpty=89.75% per-edge-exact=96.196%
+PROGRESS traces=320000 elapsed=751s feasible=314087 empty=5913 exclEmpty=89.77% per-edge-exact=96.199%
+PROGRESS traces=330000 elapsed=774s feasible=323932 empty=6068 exclEmpty=89.78% per-edge-exact=96.200%
+PROGRESS traces=340000 elapsed=799s feasible=333792 empty=6208 exclEmpty=89.79% per-edge-exact=96.201%
+PROGRESS traces=350000 elapsed=820s feasible=343633 empty=6367 exclEmpty=89.80% per-edge-exact=96.203%
+PROGRESS traces=360000 elapsed=838s feasible=353480 empty=6520 exclEmpty=89.81% per-edge-exact=96.202%
+PROGRESS traces=370000 elapsed=855s feasible=363311 empty=6689 exclEmpty=89.83% per-edge-exact=96.203%
+PROGRESS traces=380000 elapsed=873s feasible=373161 empty=6839 exclEmpty=89.84% per-edge-exact=96.203%
+PROGRESS traces=390000 elapsed=890s feasible=383010 empty=6990 exclEmpty=89.85% per-edge-exact=96.204%
+PROGRESS traces=400000 elapsed=908s feasible=392857 empty=7143 exclEmpty=89.86% per-edge-exact=96.205%
+PROGRESS traces=410000 elapsed=924s feasible=402694 empty=7306 exclEmpty=89.88% per-edge-exact=96.206%
+PROGRESS traces=420000 elapsed=940s feasible=412534 empty=7466 exclEmpty=89.90% per-edge-exact=96.206%
+PROGRESS traces=430000 elapsed=956s feasible=422388 empty=7612 exclEmpty=89.93% per-edge-exact=96.207%
+PROGRESS traces=440000 elapsed=973s feasible=432242 empty=7758 exclEmpty=89.95% per-edge-exact=96.209%
+PROGRESS traces=450000 elapsed=991s feasible=442098 empty=7902 exclEmpty=89.96% per-edge-exact=96.208%
+PROGRESS traces=460000 elapsed=1008s feasible=451943 empty=8057 exclEmpty=89.97% per-edge-exact=96.208%
+PROGRESS traces=470000 elapsed=1025s feasible=461800 empty=8200 exclEmpty=89.98% per-edge-exact=96.208%
+PROGRESS traces=480000 elapsed=1042s feasible=471649 empty=8351 exclEmpty=89.99% per-edge-exact=96.208%
+PROGRESS traces=490000 elapsed=1060s feasible=481511 empty=8489 exclEmpty=90.00% per-edge-exact=96.207%
+PROGRESS traces=500000 elapsed=1076s feasible=491343 empty=8657 exclEmpty=90.01% per-edge-exact=96.207%
+PROGRESS traces=510000 elapsed=1093s feasible=501204 empty=8796 exclEmpty=90.01% per-edge-exact=96.206%
+PROGRESS traces=520000 elapsed=1108s feasible=511054 empty=8946 exclEmpty=90.02% per-edge-exact=96.207%
+SB3 traces=521305 feasible=512334 empty=8971 | correct=88.47% (clean=461219) | correctExclEmpty=90.02% | correctCreditEmpty=90.19%
+SB3 empties: n=8971 avgSurv=4.0 noDrop(trivial)=8971 tiny(<=2 surv)=446
+SB3 per-edge: exact=96.207% (437838761/455101667) wrong/trace=1.52 | survivor edges=100.000% | named-syn=80.12%
+SB3 greedy=sb3-greedy checked=521305 compatible=472959 (90.7260%) | candidate_evaluations=86306226 ordinal_overrides=118549 hard_overrides=57883 ordinal_placed=192432143 fanouts=29695107 ordinal_conflicts=2024945 hard_conflicts=0 (parent=0 ha=0)
+Wrote 521305 traces to /users/tomislav/bridges/output/sb3_day1_reconstruction/cgp0_core_full_day1/sb3_ordinal_ha_pairwise_full.json
+	Command being timed: "/tmp/trace_recon_sb3_ha_pairwise --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode sb3 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --fp-bits 64 --lehmer-ee --drop-rate 0.5 --seed 42 --per-trace-drop-seed --workers 14 --output /users/tomislav/bridges/output/sb3_day1_reconstruction/cgp0_core_full_day1/sb3_ordinal_ha_pairwise_full.json"
+	User time (seconds): 17856.41
+	System time (seconds): 236.41
+	Percent of CPU this job got: 1622%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 18:34.83
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1409964
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 5
+	Minor (reclaiming a frame) page faults: 32365768
+	Voluntary context switches: 5578650
+	Involuntary context switches: 1108149
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 448
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

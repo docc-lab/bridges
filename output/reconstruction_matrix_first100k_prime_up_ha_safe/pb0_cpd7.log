@@ -1,0 +1,53 @@
+Trace store: 100000 traces selected, 7 parallel replay workers
+PROGRESS traces=10000 elapsed=100s | d005:excl=99.68% d025:excl=98.86% d05:excl=98.40% d075:excl=98.33% d095:excl=99.27% d10:excl=100.00%
+PROGRESS traces=20000 elapsed=205s | d005:excl=99.58% d025:excl=98.68% d05:excl=97.93% d075:excl=97.95% d095:excl=99.09% d10:excl=100.00%
+PROGRESS traces=30000 elapsed=296s | d005:excl=99.55% d025:excl=98.63% d05:excl=97.86% d075:excl=97.86% d095:excl=99.06% d10:excl=100.00%
+PROGRESS traces=40000 elapsed=376s | d005:excl=99.53% d025:excl=98.56% d05:excl=97.81% d075:excl=97.80% d095:excl=99.08% d10:excl=100.00%
+PROGRESS traces=50000 elapsed=460s | d005:excl=99.53% d025:excl=98.56% d05:excl=97.78% d075:excl=97.81% d095:excl=99.07% d10:excl=100.00%
+PROGRESS traces=60000 elapsed=550s | d005:excl=99.53% d025:excl=98.58% d05:excl=97.81% d075:excl=97.83% d095:excl=99.09% d10:excl=100.00%
+PROGRESS traces=70000 elapsed=643s | d005:excl=99.52% d025:excl=98.58% d05:excl=97.83% d075:excl=97.83% d095:excl=99.09% d10:excl=100.00%
+PROGRESS traces=80000 elapsed=760s | d005:excl=99.52% d025:excl=98.56% d05:excl=97.83% d075:excl=97.82% d095:excl=99.09% d10:excl=100.00%
+PROGRESS traces=90000 elapsed=865s | d005:excl=99.51% d025:excl=98.57% d05:excl=97.82% d075:excl=97.81% d095:excl=99.10% d10:excl=100.00%
+PROGRESS traces=100000 elapsed=970s | d005:excl=99.50% d025:excl=98.56% d05:excl=97.82% d075:excl=97.82% d095:excl=99.09% d10:excl=100.00%
+PB0[d005] traces=100000 nontrivial=86475 empty=13525 | cleanNontrivial=86042 (99.50%) | cleanAll=99567 (99.57%)
+PB0[d005] empties: n=13525 score-clean=13525 avgSurv=57.1 noDrop(trivial)=13525 tiny(<=2 surv)=81
+PB0[d005] per-fragment: reconnect-exact=99.963% (3646223/3647574) wrong/trace=0.02
+PB0[d025] traces=100000 nontrivial=96001 empty=3999 | cleanNontrivial=94620 (98.56%) | cleanAll=98619 (98.62%)
+PB0[d025] empties: n=3999 score-clean=3999 avgSurv=8.8 noDrop(trivial)=3999 tiny(<=2 surv)=81
+PB0[d025] per-fragment: reconnect-exact=99.959% (16130534/16137099) wrong/trace=0.07
+PB0[d05] traces=100000 nontrivial=97999 empty=2001 | cleanNontrivial=95862 (97.82%) | cleanAll=97863 (97.86%)
+PB0[d05] empties: n=2001 score-clean=2001 avgSurv=3.8 noDrop(trivial)=2001 tiny(<=2 surv)=81
+PB0[d05] per-fragment: reconnect-exact=99.958% (27434613/27446185) wrong/trace=0.12
+PB0[d075] traces=100000 nontrivial=99085 empty=915 | cleanNontrivial=96920 (97.82%) | cleanAll=97835 (97.83%)
+PB0[d075] empties: n=915 score-clean=915 avgSurv=3.1 noDrop(trivial)=915 tiny(<=2 surv)=81
+PB0[d075] per-fragment: reconnect-exact=99.965% (33847427/33859248) wrong/trace=0.12
+PB0[d095] traces=100000 nontrivial=99761 empty=239 | cleanNontrivial=98857 (99.09%) | cleanAll=99096 (99.10%)
+PB0[d095] empties: n=239 score-clean=239 avgSurv=2.4 noDrop(trivial)=239 tiny(<=2 surv)=81
+PB0[d095] per-fragment: reconnect-exact=99.990% (35442760/35446286) wrong/trace=0.04
+PB0[d10] traces=100000 nontrivial=99919 empty=81 | cleanNontrivial=99919 (100.00%) | cleanAll=100000 (100.00%)
+PB0[d10] empties: n=81 score-clean=81 avgSurv=1.0 noDrop(trivial)=81 tiny(<=2 surv)=81
+PB0[d10] per-fragment: reconnect-exact=100.000% (35364902/35364902) wrong/trace=0.00
+Wrote 100000 traces to /users/tomislav/bridges/output/reconstruction_matrix_first100k_prime_up_ha_safe/pb0_cpd7.json
+	Command being timed: "/users/tomislav/bridges/output/trace_recon_first100k_matrix --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode pb0 --checkpoint-distance 7 --prefix-len 8 --bloom-fp 0.0001 --prime-m --drop-rates 0.05,0.25,0.5,0.75,0.95,1 --seed 42 --per-trace-drop-seed --trace-count 100000 --workers 7 --output /users/tomislav/bridges/output/reconstruction_matrix_first100k_prime_up_ha_safe/pb0_cpd7.json"
+	User time (seconds): 7554.81
+	System time (seconds): 94.01
+	Percent of CPU this job got: 762%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 16:42.89
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 555272
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1
+	Minor (reclaiming a frame) page faults: 15748208
+	Voluntary context switches: 2145349
+	Involuntary context switches: 155780
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 112
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

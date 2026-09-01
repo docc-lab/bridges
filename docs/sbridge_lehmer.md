@@ -58,3 +58,17 @@ Compatible day or partition outputs can be pooled exactly with:
 ```bash
 trace_sim histmerge overall.json day1.json day2.json
 ```
+
+For side-by-side distribution tables, `histtable` rebins one or more exact
+histograms into the shared byte ranges used by the S-Bridge comparison study.
+It writes numeric percentages as CSV for plotting, or a percentage-formatted
+Markdown table for reports. Every exact input bin must be accounted for; the
+final `131072+` row keeps oversized observations from disappearing.
+
+```bash
+trace_sim histtable --metric baggage --format csv --output baggage.csv \
+  B=baseline.json B+L=lehmer.json I=instances.json I+L=instances-lehmer.json
+
+trace_sim histtable --metric payload --format markdown --output payload.md \
+  B=baseline.json B+L=lehmer.json I=instances.json I+L=instances-lehmer.json
+```

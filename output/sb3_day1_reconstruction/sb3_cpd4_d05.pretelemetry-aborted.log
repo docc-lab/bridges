@@ -1,0 +1,15 @@
+Trace store: 521305 traces selected, 24 parallel replay workers
+WATCHDOG tid=0000da1ca047d969 in-flight 575s
+WATCHDOG tid=0013de9390e598e3 in-flight 432s
+WATCHDOG tid=0000596014bd2c82 in-flight 581s
+WATCHDOG tid=0009404361fbd2a1 in-flight 454s
+WATCHDOG tid=0000505623894d2d in-flight 585s
+WATCHDOG tid=00034d82f2712218 in-flight 534s
+WATCHDOG tid=000b090633f9b322 in-flight 411s
+WATCHDOG tid=00169825e0f0c8e6 in-flight 382s
+WATCHDOG tid=00064d907a46102c in-flight 518s
+WATCHDOG tid=0000a840987a0e33 in-flight 577s
+WATCHDOG tid=00002dabb697ef95 in-flight 591s
+WATCHDOG tid=00048597938607ce in-flight 533s
+WATCHDOG tid=0015a92c55d94f45 in-flight 416s
+PROGRESS traces=10000 elapsed=608s feasible=9246 empty=754 exclEmpty=96.89% per-edge-exact=95.999%

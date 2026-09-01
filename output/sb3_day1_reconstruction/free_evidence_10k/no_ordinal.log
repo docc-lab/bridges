@@ -1,0 +1,71 @@
+Trace store: 10000 traces selected, 12 parallel replay workers
+WATCHDOG tid=06d96bc7e1725d06 in-flight 596s
+WATCHDOG tid=23b51de1eee04ab2 in-flight 562s
+WATCHDOG tid=432b09ed76fc3a64 in-flight 515s
+WATCHDOG tid=03fea5fff47a43f6 in-flight 597s
+WATCHDOG tid=1d07d96aac9a757e in-flight 571s
+WATCHDOG tid=697a716dc38e5395 in-flight 310s
+WATCHDOG tid=23b51de1eee04ab2 in-flight 862s
+WATCHDOG tid=03fea5fff47a43f6 in-flight 897s
+WATCHDOG tid=84061809de61a8cf in-flight 333s
+WATCHDOG tid=1d07d96aac9a757e in-flight 871s
+WATCHDOG tid=697a716dc38e5395 in-flight 610s
+WATCHDOG tid=74ffb761ea088250 in-flight 492s
+WATCHDOG tid=7d095ffcdbf0a44e in-flight 460s
+WATCHDOG tid=74ffb761ea088250 in-flight 792s
+WATCHDOG tid=99ffcd606bb1b431 in-flight 401s
+WATCHDOG tid=03fea5fff47a43f6 in-flight 1197s
+WATCHDOG tid=84061809de61a8cf in-flight 633s
+WATCHDOG tid=1d07d96aac9a757e in-flight 1171s
+WATCHDOG tid=aecdd78815dadd6a in-flight 535s
+WATCHDOG tid=d3c33a5f7278a189 in-flight 334s
+WATCHDOG tid=74ffb761ea088250 in-flight 1092s
+WATCHDOG tid=99ffcd606bb1b431 in-flight 701s
+WATCHDOG tid=cdcc443d3b794207 in-flight 347s
+WATCHDOG tid=ca5a18f9167fd611 in-flight 386s
+WATCHDOG tid=cd9784ea80393630 in-flight 352s
+WATCHDOG tid=84061809de61a8cf in-flight 933s
+WATCHDOG tid=1d07d96aac9a757e in-flight 1471s
+WATCHDOG tid=aecdd78815dadd6a in-flight 835s
+WATCHDOG tid=d57e5bfafeeafdf9 in-flight 551s
+WATCHDOG tid=74ffb761ea088250 in-flight 1392s
+WATCHDOG tid=cdcc443d3b794207 in-flight 647s
+WATCHDOG tid=ca5a18f9167fd611 in-flight 686s
+WATCHDOG tid=84061809de61a8cf in-flight 1233s
+WATCHDOG tid=1d07d96aac9a757e in-flight 1771s
+WATCHDOG tid=d57e5bfafeeafdf9 in-flight 851s
+WATCHDOG tid=ef5ace246b9422ca in-flight 547s
+WATCHDOG tid=ca5a18f9167fd611 in-flight 986s
+WATCHDOG tid=84061809de61a8cf in-flight 1533s
+WATCHDOG tid=aecdd78815dadd6a in-flight 1135s
+PROGRESS traces=10000 elapsed=2343s feasible=9825 empty=175 exclEmpty=88.14% per-edge-exact=96.208%
+SB3 traces=10000 feasible=9825 empty=175 | correct=86.60% (clean=8660) | correctExclEmpty=88.14% | correctCreditEmpty=88.35%
+SB3 empties: n=175 avgSurv=3.8 noDrop(trivial)=175 tiny(<=2 surv)=8
+SB3 per-edge: exact=96.208% (8421504/8753438) wrong/trace=1.79 | survivor edges=100.000% | named-syn=80.00%
+SB3 greedy=sb3-greedy checked=10000 compatible=8837 (88.3700%) | candidate_evaluations=147221 ordinal_overrides=0 hard_overrides=250 ordinal_placed=3715662 fanouts=573516 ordinal_conflicts=75927 hard_conflicts=4
+TIMING[all] traces=10000 recon_total=6h33m52.676s mean=2363.268ms p50=3.163 p90=31.981 p99=2773.278 max=1914623.330 (ms)
+TIMING[exclEmpty] traces=9825 recon_total=6h33m52.657s mean=2405.359ms p50=3.277 p90=32.511 p99=2777.858 max=1914623.330 (ms)
+Wrote 10000 traces to /users/tomislav/bridges/output/sb3_day1_reconstruction/free_evidence_10k/no_ordinal.json
+	Command being timed: "/tmp/trace_recon_sb3_free --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode sb3 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --fp-bits 64 --lehmer-ee --drop-rate 0.5 --seed 42 --per-trace-drop-seed --sample 10000 --sample-seed 29 --workers 12 --sb3-ignore-ordinals --timing /users/tomislav/bridges/output/sb3_day1_reconstruction/free_evidence_10k/no_ordinal_timing.csv --output /users/tomislav/bridges/output/sb3_day1_reconstruction/free_evidence_10k/no_ordinal.json"
+	User time (seconds): 26108.80
+	System time (seconds): 146.14
+	Percent of CPU this job got: 1120%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 39:03.41
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1423916
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 6
+	Minor (reclaiming a frame) page faults: 33818065
+	Voluntary context switches: 2777488
+	Involuntary context switches: 79947
+	Swaps: 0
+	File system inputs: 592872
+	File system outputs: 752
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

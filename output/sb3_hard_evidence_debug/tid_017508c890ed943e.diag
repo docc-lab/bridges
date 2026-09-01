@@ -1,0 +1,53 @@
+loaded 10 trace(s) from output/sb3_hard_evidence_debug/cpd8_d05.gob
+SB3STAGE parse survivors=830 frags=345 elapsed=417.492µs
+SB3STAGE base_evidence elapsed=997.906µs
+SB3STAGE candidates elapsed=4.815529ms
+SB3STAGE fanout_groups units=242 elapsed=2.122164ms
+SB3STAGE ordinal_seed initial=168 invalid_windows=0 elapsed=1.021599ms
+SB3STAGE route_domains ambiguous=211 deterministic=31
+SB3STAGE ordinal_prune candidates=248 elapsed=4.251263ms
+SB3HASTATE pending=2 initial_conflicts=0
+SB3HAPENDING carrier=0c0aa440c3b4c93f fanout=2e4e53cb137dd05e fanout_depth=8 terminal=3db2824e71e68933 terminal_depth=11 owner_depth=11 owner_anchors=4 fanout_parent=c5491859672c182d
+SB3HAPENDING carrier=975dcac385309cdd fanout=475ea8277ecc083f fanout_depth=9 terminal=3db2824e71e68933 terminal_depth=11 owner_depth=11 owner_anchors=4 fanout_parent=d3c7d76197136571
+SB3ORDSTATE trial_added=334 quarantined_units=0 max_pending=23
+SB3HARD ha carrier=975dcac385309cdd carrier_depth=15 fanout=475ea8277ecc083f fanout_depth=9
+SB3HARD ha carrier=0c0aa440c3b4c93f carrier_depth=16 fanout=2e4e53cb137dd05e fanout_depth=8
+SB3HARDROUTE carrier=975dcac385309cdd root=975dcac385309cdd root_depth=15 parent=0330b762d329b90c unit_depth=14 fanout=475ea8277ecc083f fanout_depth=9 required=475ea8277ecc083f choice=0000000000000000 anchor=4332e61d253ba578 anchor_depth=12 anchors=4
+SB3HARDPATH 975dcac385309cdd(d=15) 0330b762d329b90c(d=-1) 4f41cdb6e4f4d91f(d=-1) 4271f837d3ac979d(d=12) 3db2824e71e68933(d=-1)
+SB3HARDROUTE carrier=0c0aa440c3b4c93f root=d49927c72e0406dc root_depth=14 parent=4f41cdb6e4f4d91f unit_depth=13 fanout=2e4e53cb137dd05e fanout_depth=8 required=2e4e53cb137dd05e choice=0000000000000000 anchor=4271f837d3ac979d anchor_depth=12 anchors=4
+SB3HARDPATH 0c0aa440c3b4c93f(d=16) 71ab4f4d2d861003(d=15) d49927c72e0406dc(d=14) 4f41cdb6e4f4d91f(d=-1) 4271f837d3ac979d(d=12) 3db2824e71e68933(d=-1)
+SB3GREEDY units=242 candidates=248 ordinal_prunes=0 hard_prunes=0 hard_conflicts=2
+SB3ORD survivor 975dcac385309cdd is disconnected from root
+SB3ORD survivor 4271f837d3ac979d is disconnected from root
+SB3ORD survivor d49927c72e0406dc is disconnected from root
+SB3ORD survivor 71ab4f4d2d861003 is disconnected from root
+SB3ORD survivor 0c0aa440c3b4c93f is disconnected from root
+SB3ORD survivor d86635af3b9475d6 is disconnected from root
+SB3ORD survivor a8409e2bf93fd2f9 is disconnected from root
+SB3ORD survivor 1f86f7906472c951 is disconnected from root
+SB3ORD survivor 0b4e63205a2d4d2d is disconnected from root
+SB3ORD survivor 33ffaabbfce79584 is disconnected from root
+SB3ORD survivor 752bec20d3e4f122 is disconnected from root
+SB3ORD survivor 4d3f51cf8c67c31a is disconnected from root
+SB3ORD survivor a9b4e1df0536d428 is disconnected from root
+SB3ORD carrier 975dcac385309cdd cannot reach checkpoint floor depth 8
+SB3ORD carrier 0c0aa440c3b4c93f cannot reach checkpoint floor depth 8
+SB3ORD carrier d86635af3b9475d6 cannot reach checkpoint floor depth 8
+SB3ORD carrier a8409e2bf93fd2f9 cannot reach checkpoint floor depth 16
+SB3ORD carrier 1f86f7906472c951 cannot reach checkpoint floor depth 8
+SB3ORD carrier 0b4e63205a2d4d2d cannot reach checkpoint floor depth 16
+SB3ORD carrier 33ffaabbfce79584 cannot reach checkpoint floor depth 8
+SB3ORD carrier 752bec20d3e4f122 cannot reach checkpoint floor depth 8
+SB3ORD carrier a9b4e1df0536d428 cannot reach checkpoint floor depth 8
+SB3ORD node 2e4e53cb137dd05e has 4 recovered children but 3 carrier child groups
+SB3ORD node 2e4e53cb137dd05e child 1a54dfb205197fa4 has no carrier in its window
+SB3ORD fanout 2e4e53cb137dd05e child 2640e8b39a7d11bd has inconsistent/out-of-range sparse ordinal 4
+SB3ORD fanout 7acb64f47d11fd56 has 0 implicit-first child candidates
+SB3ORD fanout 7acb64f47d11fd56 child 04cb8bf0068d76c8 has inconsistent/out-of-range sparse ordinal 4
+SB3ORD fanout 7acb64f47d11fd56 child 80642621d2819584 has inconsistent/out-of-range sparse ordinal 4
+SB3ORD fanout 3508fdee4c0fe7f1 has 0 implicit-first child candidates
+SB3ORD fanout 3508fdee4c0fe7f1 child bf62029e48c21c63 has inconsistent/out-of-range sparse ordinal 4
+SB3ORD fanout 3508fdee4c0fe7f1 child eca9c19aa8256f33 has inconsistent/out-of-range sparse ordinal 4
+SB3ORD fanout 3508fdee4c0fe7f1 child f39696744a04a0fc has inconsistent/out-of-range sparse ordinal 4
+SB3STAGE final_align conflicts=46 elapsed=2.949382ms
+SB3STAGE final_materialize elapsed=906.916µs

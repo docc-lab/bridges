@@ -1,0 +1,267 @@
+only-traces: reconstructing 6 trace(s) only
+Trace store: 6 traces selected, 1 parallel replay workers
+SB3STAGE parse survivors=2428 frags=821 elapsed=1.913256ms
+SB3STAGE base_evidence elapsed=3.915629ms
+SB3STAGE candidates elapsed=28.4403ms
+SB3STAGE fanout_groups units=651 elapsed=10.338034ms
+SB3STAGE route_domains ambiguous=336 deterministic=315
+SB3STAGE ordinal_prune candidates=654 elapsed=2.419299ms
+SB3HASTATE pending=0 initial_conflicts=0
+SB3GREEDY units=651 candidates=654 ordinal_prunes=0 hard_prunes=2 hard_conflicts=0
+SB3ORD fanout c9ee1d95cde9b358 child 3d022a0b7cd9a2a2 has inconsistent/out-of-range sparse ordinal 17
+SB3ORD carrier 24457661ce745f04 has 1 unconsumed ordinals at node 24457661ce745f04
+SB3ORD fanout 81dc7ec042c821ac child 7d597d29bb2fa5d6 has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout e59ace97e0c9cc1d child d645e81392c7b92f has inconsistent/out-of-range sparse ordinal 7
+SB3ORD carrier 0f1db480b015ddd9 has 1 unconsumed ordinals at node 0f1db480b015ddd9
+SB3ORD fanout 7730d37acfd30d22 has 0 implicit-first child candidates
+SB3ORD fanout 7730d37acfd30d22 child 6a71b1a25b90292a has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child 00793ef382c3a2ad has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child d5e011396cc09af4 has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child 3ba713fefe74a563 has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child 9fa2a3d026064866 has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child 4959a5c6a34688d9 has inconsistent/out-of-range sparse ordinal 34
+SB3ORD carrier 2dfc1cfa9cee6797 has 2 unconsumed ordinals at node 2dfc1cfa9cee6797
+SB3ORD carrier 237ad9691916e705 has 1 unconsumed ordinals at node 237ad9691916e705
+SB3ORD carrier d776168fb8f2c8ed has 2 unconsumed ordinals at node d776168fb8f2c8ed
+SB3ORD carrier 33aafd76a36ee25c has 2 unconsumed ordinals at node 33aafd76a36ee25c
+SB3ORD carrier 67eb85d2b4f8bbbf has 2 unconsumed ordinals at node 67eb85d2b4f8bbbf
+SB3ORD carrier 936ad1a7a80e44d4 has 2 unconsumed ordinals at node 936ad1a7a80e44d4
+SB3ORD fanout b8466a34b05c6010 child dbb9e0b9a15f70c4 has inconsistent/out-of-range sparse ordinal 17
+SB3ORD fanout b8466a34b05c6010 child b738cfafa1f08314 has inconsistent/out-of-range sparse ordinal 2
+SB3ORD carrier a8520ff2cc8e4d9a has 1 unconsumed ordinals at node a8520ff2cc8e4d9a
+SB3ORD fanout b738cfafa1f08314 has 0 implicit-first child candidates
+SB3ORD fanout b738cfafa1f08314 child 65fd2c2aad547178 has inconsistent/out-of-range sparse ordinal 2
+SB3ORD fanout b738cfafa1f08314 child fad7e4b1c32a25db has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout 65fd2c2aad547178 has 0 implicit-first child candidates
+SB3ORD fanout 65fd2c2aad547178 child f5cbe4e351c8251e has inconsistent/out-of-range sparse ordinal 11
+SB3ORD fanout 65fd2c2aad547178 child 70fbd851cac20a64 has inconsistent/out-of-range sparse ordinal 11
+SB3ORD carrier 237dd5c18a85b142 has 2 unconsumed ordinals at node 237dd5c18a85b142
+SB3ORD carrier a71bdc4ecba26062 has 1 unconsumed ordinals at node a71bdc4ecba26062
+SB3ORD carrier 5e27c13f742eac93 has 1 unconsumed ordinals at node 5e27c13f742eac93
+SB3ORD fanout 762fdadaeb1049b7 child c2f9b3d359b15585 has inconsistent/out-of-range sparse ordinal 8
+SB3ORD fanout 1df2b89a4a7abcc8 has 0 implicit-first child candidates
+SB3STAGE final_align conflicts=54 elapsed=16.053645ms
+SB3STAGE final_materialize elapsed=5.8045ms
+SB3STAGE harness_reconstruct elapsed=73.54036ms parents=3204 bridges=820
+SB3STAGE harness_score elapsed=1.668958ms
+SB3STAGE parse survivors=3973 frags=1637 elapsed=5.458414ms
+SB3STAGE base_evidence elapsed=10.706071ms
+SB3STAGE candidates elapsed=41.408226ms
+SB3STAGE fanout_groups units=1407 elapsed=19.890646ms
+SB3STAGE route_domains ambiguous=594 deterministic=813
+SB3STAGE ordinal_prune candidates=1411 elapsed=3.917918ms
+SB3HASTATE pending=0 initial_conflicts=0
+SB3GREEDY units=1407 candidates=1411 ordinal_prunes=0 hard_prunes=3 hard_conflicts=0
+SB3ORD node e00dd5a2c880f5d3 has 5 recovered children but 4 carrier child groups
+SB3ORD node e00dd5a2c880f5d3 child 948a868828c50a4b has no carrier in its window
+SB3ORD fanout e00dd5a2c880f5d3 has 0 implicit-first child candidates
+SB3ORD fanout e00dd5a2c880f5d3 child cefd6e0f22a9cb08 has inconsistent/out-of-range sparse ordinal 5
+SB3ORD carrier 35810ccdae575f3c has 1 unconsumed ordinals at node 35810ccdae575f3c
+SB3ORD fanout 7afa9951bfb3f443 child 6c7b3fb7750a31a4 has inconsistent/out-of-range sparse ordinal 65
+SB3ORD fanout 7afa9951bfb3f443 child 64d443dc044ae115 has inconsistent/out-of-range sparse ordinal 7
+SB3ORD carrier d3ca9367fb8ed777 has 1 unconsumed ordinals at node d3ca9367fb8ed777
+SB3ORD fanout 6c7b3fb7750a31a4 has 0 implicit-first child candidates
+SB3ORD fanout 6c7b3fb7750a31a4 child aa91a2410b5f4539 has inconsistent/out-of-range sparse ordinal 65
+SB3ORD fanout 6c7b3fb7750a31a4 child 55956fcf7e1f1c32 has inconsistent/out-of-range sparse ordinal 65
+SB3ORD fanout 6c7b3fb7750a31a4 child 35d30772f4b6f91e has inconsistent/out-of-range sparse ordinal 71
+SB3ORD fanout 55956fcf7e1f1c32 has 0 implicit-first child candidates
+SB3ORD fanout 55956fcf7e1f1c32 child b554f39aad1f7bc5 has inconsistent/out-of-range sparse ordinal 65
+SB3ORD fanout 55956fcf7e1f1c32 child 33b7d791b01d33e0 has inconsistent/out-of-range sparse ordinal 65
+SB3ORD carrier fb7edab377cf8d49 has 1 unconsumed ordinals at node fb7edab377cf8d49
+SB3ORD carrier e00dd5a2c880f5d3 has 2 unconsumed ordinals at node e00dd5a2c880f5d3
+SB3ORD carrier 0af8667ff87d7ef0 has 3 unconsumed ordinals at node 0af8667ff87d7ef0
+SB3ORD carrier aa91a2410b5f4539 has 2 unconsumed ordinals at node aa91a2410b5f4539
+SB3ORD fanout 64d443dc044ae115 has 0 implicit-first child candidates
+SB3ORD fanout 64d443dc044ae115 child a12a27ade72c5b1d has inconsistent/out-of-range sparse ordinal 7
+SB3ORD fanout 64d443dc044ae115 child 92ebc5892733f985 has inconsistent/out-of-range sparse ordinal 7
+SB3ORD fanout 64d443dc044ae115 child 9426faa22fcf69bd has inconsistent/out-of-range sparse ordinal 56
+SB3ORD carrier a12a27ade72c5b1d has 2 unconsumed ordinals at node a12a27ade72c5b1d
+SB3ORD fanout 92ebc5892733f985 has 0 implicit-first child candidates
+SB3ORD fanout 92ebc5892733f985 child 00494b597e3dcb55 has inconsistent/out-of-range sparse ordinal 7
+SB3ORD fanout 92ebc5892733f985 child e3756b2f903f545e has inconsistent/out-of-range sparse ordinal 7
+SB3ORD carrier 6366864dbe0a2b7c has 1 unconsumed ordinals at node 6366864dbe0a2b7c
+SB3ORD carrier d85cfb0d8832246f has 2 unconsumed ordinals at node d85cfb0d8832246f
+SB3ORD fanout 9426faa22fcf69bd has 0 implicit-first child candidates
+SB3ORD fanout 9426faa22fcf69bd child 5fd71de2a3c67ed5 has inconsistent/out-of-range sparse ordinal 56
+SB3ORD fanout 9426faa22fcf69bd child 0f27436c4672fcd0 has inconsistent/out-of-range sparse ordinal 56
+SB3STAGE final_align conflicts=41 elapsed=27.028919ms
+SB3STAGE final_materialize elapsed=12.322782ms
+SB3STAGE harness_reconstruct elapsed=129.891777ms parents=5554 bridges=1636
+SB3STAGE harness_score elapsed=3.4781ms
+SB3STAGE parse survivors=33586 frags=11353 elapsed=43.648336ms
+SB3STAGE base_evidence elapsed=448.187092ms
+SB3STAGE candidates elapsed=435.473193ms
+SB3STAGE fanout_groups units=7885 elapsed=128.872859ms
+SB3STAGE route_domains ambiguous=3236 deterministic=4649
+SB3STAGE ordinal_prune candidates=7888 elapsed=20.468796ms
+SB3HASTATE pending=0 initial_conflicts=0
+SB3GREEDY units=7885 candidates=7888 ordinal_prunes=0 hard_prunes=2 hard_conflicts=0
+SB3ORD carrier 80c01106f964bd95 has 1 unconsumed ordinals at node 80c01106f964bd95
+SB3ORD fanout fea90ecdc59810e2 has 2 implicit-first child candidates
+SB3ORD fanout fea90ecdc59810e2 child 23df3151eb29ad0f has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout fea90ecdc59810e2 child 64344d190ea5698f has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 38178205730853eb has 2 implicit-first child candidates
+SB3ORD fanout 38178205730853eb child 1dc8e045c14bbce0 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 38178205730853eb child 00000000000012d2 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 7162c72c3ad6dabe assigns ordinal 3 to both bf88c14ff5784529 and c3430e3c9660c523
+SB3ORD carrier 614cbc07c2cf6214 has 1 unconsumed ordinals at node 614cbc07c2cf6214
+SB3ORD fanout 4a9fecb541e050d3 child 0d94e166c6f08724 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD carrier a731496fba8a140b has 1 unconsumed ordinals at node a731496fba8a140b
+SB3ORD fanout 8f282d6afb18ea42 has 2 implicit-first child candidates
+SB3ORD fanout 8f282d6afb18ea42 child 092aed86fffaa8ac has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 8f282d6afb18ea42 child 0000000000000f77 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 6392a50ececf67f7 child 413cd3e69c9671eb has inconsistent/out-of-range sparse ordinal 5
+SB3ORD carrier 0048cd4144c467bb has 1 unconsumed ordinals at node 0048cd4144c467bb
+SB3ORD fanout 06d646799e9aa960 child 00000000000017e9 has inconsistent/out-of-range sparse ordinal 55
+SB3ORD fanout 06d646799e9aa960 child 81c0e47daafc0bc0 has inconsistent/out-of-range sparse ordinal 38
+SB3ORD fanout 81c0e47daafc0bc0 has 0 implicit-first child candidates
+SB3ORD fanout 81c0e47daafc0bc0 child 0026afc893a717b7 has inconsistent/out-of-range sparse ordinal 38
+SB3ORD fanout 81c0e47daafc0bc0 child f7c50315fb141d92 has inconsistent/out-of-range sparse ordinal 49
+SB3ORD carrier 0026afc893a717b7 has 1 unconsumed ordinals at node 0026afc893a717b7
+SB3ORD carrier 581b48dd26204c95 has 1 unconsumed ordinals at node 581b48dd26204c95
+SB3ORD carrier 4e0041827f9eac91 has 1 unconsumed ordinals at node 4e0041827f9eac91
+SB3ORD fanout c36ec53fba8f4784 child 7f903a904137c784 has inconsistent/out-of-range sparse ordinal 39
+SB3ORD fanout c36ec53fba8f4784 child 54750cd1bd73fce5 has inconsistent/out-of-range sparse ordinal 54
+SB3ORD fanout 7f903a904137c784 has 0 implicit-first child candidates
+SB3ORD fanout 7f903a904137c784 child dd6da01c0917289c has inconsistent/out-of-range sparse ordinal 39
+SB3ORD fanout 7f903a904137c784 child 2cb8d226f6090561 has inconsistent/out-of-range sparse ordinal 53
+SB3ORD carrier b88a5d1da3a13b34 has 1 unconsumed ordinals at node b88a5d1da3a13b34
+SB3ORD fanout de8f63855537af2d has 0 implicit-first child candidates
+SB3ORD fanout de8f63855537af2d child 54ed6c107974915b has inconsistent/out-of-range sparse ordinal 53
+SB3STAGE final_align conflicts=304 elapsed=246.621921ms
+SB3STAGE final_materialize elapsed=114.686768ms
+SB3STAGE harness_reconstruct elapsed=1.525696931s parents=43089 bridges=11352
+SB3STAGE harness_score elapsed=31.627617ms
+SB3STAGE parse survivors=8170 frags=3347 elapsed=9.348886ms
+SB3STAGE base_evidence elapsed=21.055108ms
+SB3STAGE candidates elapsed=105.326748ms
+SB3STAGE fanout_groups units=1824 elapsed=21.94451ms
+SB3STAGE route_domains ambiguous=710 deterministic=1114
+SB3STAGE ordinal_prune candidates=1825 elapsed=6.179375ms
+SB3HASTATE pending=0 initial_conflicts=0
+SB3GREEDY units=1824 candidates=1825 ordinal_prunes=0 hard_prunes=1 hard_conflicts=0
+SB3ORD fanout 8e3dde2c849d3c9c child 88bbac8ed11e1c07 has inconsistent/out-of-range sparse ordinal 11
+SB3ORD carrier 6de0a798670d4466 has 1 unconsumed ordinals at node 6de0a798670d4466
+SB3ORD node 24dff56ebe39e424 has 3 recovered children but 2 carrier child groups
+SB3ORD node 24dff56ebe39e424 child 7210e4a44c767ab6 has no carrier in its window
+SB3ORD fanout 643a6b42c0e3e8fb child 70f2552caf864787 has inconsistent/out-of-range sparse ordinal 4
+SB3ORD carrier 6181362bd928e63b has 1 unconsumed ordinals at node 6181362bd928e63b
+SB3STAGE final_align conflicts=6 elapsed=47.147107ms
+SB3STAGE final_materialize elapsed=24.322869ms
+SB3STAGE harness_reconstruct elapsed=246.269202ms parents=10331 bridges=3346
+SB3STAGE harness_score elapsed=5.325314ms
+SB3STAGE parse survivors=15460 frags=5886 elapsed=16.511572ms
+SB3STAGE base_evidence elapsed=91.354451ms
+SB3STAGE candidates elapsed=179.037615ms
+SB3STAGE fanout_groups units=2658 elapsed=46.505771ms
+SB3STAGE route_domains ambiguous=1221 deterministic=1437
+SB3STAGE ordinal_prune candidates=2661 elapsed=4.366655ms
+SB3HASTATE pending=0 initial_conflicts=0
+SB3GREEDY units=2658 candidates=2661 ordinal_prunes=0 hard_prunes=2 hard_conflicts=0
+SB3ORD fanout 44c2732613b78b85 child f92f2e34d5776545 has inconsistent/out-of-range sparse ordinal 98
+SB3ORD carrier f92f2e34d5776545 has 1 unconsumed ordinals at node f92f2e34d5776545
+SB3ORD fanout 4a1c8d5b7ffdffad has 2 implicit-first child candidates
+SB3ORD fanout 4a1c8d5b7ffdffad child 00000000000009a4 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 4a1c8d5b7ffdffad child a4801362eb0f8be5 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 0065af3fcb00d664 has 0 implicit-first child candidates
+SB3ORD fanout 0065af3fcb00d664 assigns ordinal 2 to both ea48218f7182f87d and 682a8e44ab8d434e
+SB3ORD fanout 0065af3fcb00d664 assigns ordinal 2 to both ea48218f7182f87d and ea81f9d5ab91b383
+SB3ORD carrier 682a8e44ab8d434e has 2 unconsumed ordinals at node 682a8e44ab8d434e
+SB3ORD carrier 38176c99ddfd7dff has 2 unconsumed ordinals at node 38176c99ddfd7dff
+SB3ORD fanout 7ed1ffaf7723e4dc has 2 implicit-first child candidates
+SB3ORD fanout 7ed1ffaf7723e4dc child 62f569f617802df9 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 7ed1ffaf7723e4dc child 41681f08508f4fe4 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout 41681f08508f4fe4 child b0f0f1223dcf4ec6 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout 41681f08508f4fe4 child 7a2bd5c3d45e6384 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout 41681f08508f4fe4 child 0000000000000090 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout 41681f08508f4fe4 child 00000000000005b7 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout 2e057560898f974e has 0 implicit-first child candidates
+SB3ORD fanout 2e057560898f974e child af98078a6c42a270 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout 2e057560898f974e child acbf90986f31eec0 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD carrier af98078a6c42a270 has 2 unconsumed ordinals at node af98078a6c42a270
+SB3ORD carrier acbf90986f31eec0 has 3 unconsumed ordinals at node acbf90986f31eec0
+SB3ORD carrier dea3960a48aa5e57 has 2 unconsumed ordinals at node dea3960a48aa5e57
+SB3ORD carrier b0f0f1223dcf4ec6 has 2 unconsumed ordinals at node b0f0f1223dcf4ec6
+SB3ORD carrier 7a2bd5c3d45e6384 has 1 unconsumed ordinals at node 7a2bd5c3d45e6384
+SB3ORD node 63e00902fe3a0141 has 3 recovered children but 2 carrier child groups
+SB3ORD node 63e00902fe3a0141 child 4041385aa0fbd88b has no carrier in its window
+SB3ORD node 3f0723f23a9455d4 has 307 recovered children but 304 carrier child groups
+SB3ORD node 3f0723f23a9455d4 child 86c848b950fb8add has no carrier in its window
+SB3ORD node 3f0723f23a9455d4 child 92d4c32ada627b93 has no carrier in its window
+SB3ORD node 3f0723f23a9455d4 child cbc8ddc1c58f3e51 has no carrier in its window
+SB3ORD fanout 3f0723f23a9455d4 child 0072dd471ef21fd0 has inconsistent/out-of-range sparse ordinal 305
+SB3STAGE final_align conflicts=272 elapsed=115.025556ms
+SB3STAGE final_materialize elapsed=45.00754ms
+SB3STAGE harness_reconstruct elapsed=525.687485ms parents=18854 bridges=5885
+SB3STAGE harness_score elapsed=10.445107ms
+SB3STAGE parse survivors=64735 frags=22425 elapsed=72.339694ms
+SB3STAGE base_evidence elapsed=2.763342764s
+SB3STAGE candidates elapsed=510.974249ms
+SB3STAGE fanout_groups units=14059 elapsed=104.661477ms
+SB3STAGE route_domains ambiguous=5848 deterministic=8211
+SB3STAGE ordinal_prune candidates=14091 elapsed=20.674814ms
+SB3HASTATE pending=0 initial_conflicts=0
+SB3GREEDY units=14059 candidates=14091 ordinal_prunes=0 hard_prunes=28 hard_conflicts=0
+SB3ORD fanout 2b9cc53100b8451b has 2 implicit-first child candidates
+SB3ORD fanout 2b9cc53100b8451b child 38ecf932d7fbc498 has inconsistent/out-of-range sparse ordinal 3
+SB3ORD fanout 2b9cc53100b8451b child 000000000000232f has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 116f7ff5a90c95c3 has 2 implicit-first child candidates
+SB3ORD fanout 116f7ff5a90c95c3 child 0c265b1e0df3288b has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 116f7ff5a90c95c3 assigns ordinal 2 to both 966806cc3c96f9f2 and f306801fd44bc1f6
+SB3ORD fanout 116f7ff5a90c95c3 child 73fabcdd01b98e10 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD carrier 047332249218aae3 has 1 unconsumed ordinals at node 047332249218aae3
+SB3ORD fanout ee89f1c48ee22eac has 2 implicit-first child candidates
+SB3ORD fanout ee89f1c48ee22eac child 08df5741b48389c1 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout ee89f1c48ee22eac child ad851e8d190cfc80 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout a800840440c2cd17 has 2 implicit-first child candidates
+SB3ORD fanout a800840440c2cd17 child 000000000000170e has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout a800840440c2cd17 child b9d769838596731e has inconsistent/out-of-range sparse ordinal 0
+SB3ORD carrier 9dd5c226b67f95ca has 1 unconsumed ordinals at node 9dd5c226b67f95ca
+SB3ORD fanout 8eea18605f6844b5 has 3 implicit-first child candidates
+SB3ORD fanout 8eea18605f6844b5 child 2a958a26eb4253ed has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 8eea18605f6844b5 child 3902beea0d0b15c5 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 8eea18605f6844b5 child 45c131bbf404d0d1 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 6d9f0f78317b3883 has 0 implicit-first child candidates
+SB3ORD fanout 6d9f0f78317b3883 child 4f772d6c7ebedc95 has inconsistent/out-of-range sparse ordinal 3
+SB3ORD carrier ca837fc7883e6037 has 1 unconsumed ordinals at node ca837fc7883e6037
+SB3ORD fanout 6811fabc345c99a7 has 2 implicit-first child candidates
+SB3ORD fanout 6811fabc345c99a7 child 0000000000000b99 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 6811fabc345c99a7 child c000cac8aaa1c006 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout ca700fd0076bfa6d assigns ordinal 5 to both 526808c76afe3c41 and 76ad5b4326c91e82
+SB3ORD fanout ca700fd0076bfa6d assigns ordinal 2 to both 1a8821f5f3173509 and a030078fe2248e0d
+SB3ORD fanout ca700fd0076bfa6d assigns ordinal 4 to both 2eff07a2659c179d and d5593437a700befe
+SB3ORD carrier ca3f9babbbcce9c6 has 1 unconsumed ordinals at node ca3f9babbbcce9c6
+SB3ORD carrier 62723fa5a14ed9cf has 1 unconsumed ordinals at node 62723fa5a14ed9cf
+SB3ORD carrier 30d1e13b95e2c09d has 1 unconsumed ordinals at node 30d1e13b95e2c09d
+SB3ORD fanout 2a3d524d2e8f55b3 child 8e8cff1f79b84c63 has inconsistent/out-of-range sparse ordinal 5
+SB3STAGE final_align conflicts=5450 elapsed=268.747061ms
+SB3STAGE final_materialize elapsed=107.782791ms
+SB3STAGE harness_reconstruct elapsed=3.932881224s parents=80859 bridges=22424
+SB3STAGE harness_score elapsed=37.372909ms
+SB3 traces=6 feasible=6 empty=0 | correct=0.00% (clean=0) | correctExclEmpty=0.00% | correctCreditEmpty=0.00%
+SB3 per-edge: exact=97.000% (152502/157219) wrong/trace=302.83 | survivor edges=100.000% | named-syn=83.66%
+SB3 greedy=sb3-greedy checked=6 compatible=0 (0.0000%) | candidate_evaluations=28530 ordinal_overrides=0 hard_overrides=38 ordinal_placed=59726 fanouts=10254 ordinal_conflicts=6127 hard_conflicts=0 (parent=0 ha=0)
+Wrote 6 traces to /users/tomislav/bridges/output/sb3_day1_reconstruction/cgp0_core_full_day1/sb3_no_ordinal_ha_pairwise_replay.json
+	Command being timed: "/tmp/trace_recon_sb3_ha_pairwise --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode sb3 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --fp-bits 64 --lehmer-ee --sb3-ignore-ordinals --drop-rate 0.5 --seed 42 --per-trace-drop-seed --workers 1 --only-traces 17b91d756ce5b415,89ec4fe347be996a,96e909b76e1770fb,a682d0fc031c10a3,c18772c20ec47b32,f1d721fc97193567 --output /users/tomislav/bridges/output/sb3_day1_reconstruction/cgp0_core_full_day1/sb3_no_ordinal_ha_pairwise_replay.json"
+	User time (seconds): 124.30
+	System time (seconds): 44.50
+	Percent of CPU this job got: 190%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:28.74
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 129072
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 4865591
+	Voluntary context switches: 685178
+	Involuntary context switches: 954
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 104
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

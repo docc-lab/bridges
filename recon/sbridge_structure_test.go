@@ -88,7 +88,7 @@ func TestAttributeDEE(t *testing.T) {
 	p := DEECandidate{ID: 1, FP: 0xabcd, Depth: 3,
 		ChildOrds: map[int]bool{1: true, 2: true, 3: true}, EE: map[int]bool{1: true}}
 	q := DEECandidate{ID: 2, FP: 0xabcd, Depth: 3, // same fp, same depth (collision)
-		ChildOrds: map[int]bool{1: true, 2: true}, EE: map[int]bool{1: true}}
+		ChildOrds: map[int]bool{1: true, 2: true, 4: true}, EE: map[int]bool{1: true}}
 	cands := []DEECandidate{p, q}
 
 	// seq 2 is valid + unwitnessed for BOTH -> truncated-fp collision survives -> ambiguous

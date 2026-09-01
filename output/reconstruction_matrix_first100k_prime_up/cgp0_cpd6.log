@@ -1,0 +1,9 @@
+Trace store: 100000 traces selected, 7 parallel replay workers
+PROGRESS traces=10000 elapsed=109s | d005:excl=99.42% d025:excl=98.01% d05:excl=96.39% d075:excl=94.54% d095:excl=92.90% d10:excl=92.72%
+PROGRESS traces=20000 elapsed=230s | d005:excl=99.10% d025:excl=97.34% d05:excl=95.33% d075:excl=93.14% d095:excl=91.22% d10:excl=90.73%
+PROGRESS traces=30000 elapsed=346s | d005:excl=99.02% d025:excl=97.19% d05:excl=95.05% d075:excl=92.64% d095:excl=90.54% d10:excl=89.96%
+PROGRESS traces=40000 elapsed=445s | d005:excl=99.04% d025:excl=97.09% d05:excl=94.81% d075:excl=92.29% d095:excl=90.02% d10:excl=89.41%
+PROGRESS traces=50000 elapsed=546s | d005:excl=99.07% d025:excl=97.17% d05:excl=94.88% d075:excl=92.31% d095:excl=90.07% d10:excl=89.45%
+PROGRESS traces=60000 elapsed=649s | d005:excl=99.14% d025:excl=97.35% d05:excl=95.09% d075:excl=92.61% d095:excl=90.51% d10:excl=89.96%
+PROGRESS traces=70000 elapsed=758s | d005:excl=99.18% d025:excl=97.43% d05:excl=95.18% d075:excl=92.75% d095:excl=90.72% d10:excl=90.19%
+PROGRESS traces=80000 elapsed=889s | d005:excl=99.21% d025:excl=97.49% d05:excl=95.27% d075:excl=92.88% d095:excl=90.92% d10:excl=90.39%

@@ -1,0 +1,34 @@
+Trace store: 50000 traces selected, 12 parallel replay workers
+PROGRESS traces=10000 elapsed=22s feasible=9805 empty=195 exclEmpty=89.22% per-edge-exact=96.177%
+PROGRESS traces=20000 elapsed=45s feasible=19627 empty=373 exclEmpty=89.78% per-edge-exact=96.214%
+PROGRESS traces=30000 elapsed=66s feasible=29411 empty=589 exclEmpty=89.56% per-edge-exact=96.181%
+PROGRESS traces=40000 elapsed=89s feasible=39258 empty=742 exclEmpty=89.78% per-edge-exact=96.195%
+PROGRESS traces=50000 elapsed=113s feasible=49096 empty=904 exclEmpty=89.92% per-edge-exact=96.195%
+SB3 traces=50000 feasible=49096 empty=904 | correct=88.30% (clean=44148) | correctExclEmpty=89.92% | correctCreditEmpty=90.10%
+SB3 empties: n=904 avgSurv=3.9 noDrop(trivial)=904 tiny(<=2 surv)=41
+SB3 per-edge: exact=96.195% (41972404/43632495) wrong/trace=1.59 | survivor edges=100.000% | named-syn=80.05%
+SB3 greedy=sb3-greedy checked=50000 compatible=45285 (90.5700%) | candidate_evaluations=8271635 ordinal_overrides=12485 hard_overrides=6461 ordinal_placed=18454596 fanouts=2854507 ordinal_conflicts=205268 hard_conflicts=0 (parent=0 ha=0)
+Wrote 50000 traces to /tmp/sb3_hafixed_50k.json
+	Command being timed: "/tmp/trace_recon_sb3_hafixed --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode sb3 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --fp-bits 64 --lehmer-ee --drop-rate 0.5 --seed 42 --per-trace-drop-seed --sample 50000 --sample-seed 29 --workers 12 --output /tmp/sb3_hafixed_50k.json"
+	User time (seconds): 2021.93
+	System time (seconds): 52.72
+	Percent of CPU this job got: 1829%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:53.38
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 762580
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 5632776
+	Voluntary context switches: 1063935
+	Involuntary context switches: 19384
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 56
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

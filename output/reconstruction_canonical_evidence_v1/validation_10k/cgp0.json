@@ -1,0 +1,38 @@
+{
+  "mode": "cgp0",
+  "checkpoint_distance": 4,
+  "drop_rate": 0.5,
+  "bloom_fp": 0.0001,
+  "per_trace_drop_seed": true,
+  "order": "bottom-up",
+  "consistency": "chain",
+  "seed": 42,
+  "num_traces": 10000,
+  "topology_summary": {
+    "score_policy": "evidence-bounded-v1",
+    "traces": 10000,
+    "feasible": 9825,
+    "empty": 175,
+    "empty_clean": 175,
+    "clean": 9263,
+    "clean_all": 9438,
+    "real_nodes": 8753439,
+    "edge_exact": 8423814,
+    "edge_anonymous_valid": 327376,
+    "edge_wrong": 2249,
+    "constraint_wrong": 0,
+    "survivor_edges": 7093594,
+    "survivor_exact": 7093594,
+    "named_synthetic": 1659845,
+    "named_exact": 1330220
+  },
+  "greedy_summary": {
+    "mode": "full-evidence",
+    "checked": 10000,
+    "candidate_evaluations": 1646036,
+    "hard_overrides": 22,
+    "hard_conflicts": 0,
+    "parent_conflicts": 0,
+    "ha_conflicts": 0
+  }
+}

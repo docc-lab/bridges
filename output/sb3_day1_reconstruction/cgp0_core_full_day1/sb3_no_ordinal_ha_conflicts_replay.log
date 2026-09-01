@@ -1,0 +1,345 @@
+only-traces: reconstructing 6 trace(s) only
+Trace store: 6 traces selected, 1 parallel replay workers
+SB3STAGE parse survivors=2428 frags=821 elapsed=2.892622ms
+SB3STAGE base_evidence elapsed=4.491202ms
+SB3STAGE candidates elapsed=28.183057ms
+SB3STAGE fanout_groups units=651 elapsed=9.233667ms
+SB3STAGE route_domains ambiguous=336 deterministic=315
+SB3STAGE ordinal_prune candidates=651 elapsed=2.16852ms
+SB3HASTATE pending=2 initial_conflicts=0
+SB3HAPENDING carrier=0fbdc2f440625205 fanout=fd915678d8c57a26 fanout_depth=12 terminal=84f55c041114e5ff terminal_depth=13 owner_depth=13 owner_anchors=2 fanout_parent=cd7ad701e5a7cacc
+SB3HAPENDING carrier=5bb17378767ae6e5 fanout=b8466a34b05c6010 fanout_depth=12 terminal=84f55c041114e5ff terminal_depth=13 owner_depth=13 owner_anchors=2 fanout_parent=333ac81342bf866f
+SB3HARD ha carrier=0fbdc2f440625205 carrier_depth=16 fanout=fd915678d8c57a26 fanout_depth=12
+SB3HARD ha carrier=5bb17378767ae6e5 carrier_depth=16 fanout=b8466a34b05c6010 fanout_depth=12
+SB3HARDROUTE carrier=0fbdc2f440625205 root=0fbdc2f440625205 root_depth=16 parent=342bb07c2c0ae750 unit_depth=15 fanout=fd915678d8c57a26 fanout_depth=12 required=fd915678d8c57a26 choice=0000000000000000 anchor=44cc11ecc44bec80 anchor_depth=14 anchors=3
+SB3HARDPATH 0fbdc2f440625205(d=16) 342bb07c2c0ae750(d=-1) 44cc11ecc44bec80(d=14) 84f55c041114e5ff(d=-1)
+SB3HARDROUTE carrier=5bb17378767ae6e5 root=5bb17378767ae6e5 root_depth=16 parent=d3c788e145cc1aac unit_depth=15 fanout=b8466a34b05c6010 fanout_depth=12 required=b8466a34b05c6010 choice=0000000000000000 anchor=44cc11ecc44bec80 anchor_depth=14 anchors=3
+SB3HARDPATH 5bb17378767ae6e5(d=16) d3c788e145cc1aac(d=-1) 44cc11ecc44bec80(d=14) 84f55c041114e5ff(d=-1)
+SB3GREEDY units=651 candidates=651 ordinal_prunes=0 hard_prunes=0 hard_conflicts=2
+SB3ORD survivor 0fbdc2f440625205 is disconnected from root
+SB3ORD survivor 73d7486863d147cb is disconnected from root
+SB3ORD survivor 44cc11ecc44bec80 is disconnected from root
+SB3ORD survivor 5bb17378767ae6e5 is disconnected from root
+SB3ORD survivor 58604c31ecfb8cd0 is disconnected from root
+SB3ORD survivor dbfc69077aa040ac is disconnected from root
+SB3ORD survivor e179bc9fde1d2f61 is disconnected from root
+SB3ORD survivor 50ac98f8abc5cfea is disconnected from root
+SB3ORD carrier 0fbdc2f440625205 cannot reach checkpoint floor depth 12
+SB3ORD carrier 73d7486863d147cb cannot reach checkpoint floor depth 16
+SB3ORD carrier 5bb17378767ae6e5 cannot reach checkpoint floor depth 12
+SB3ORD carrier e179bc9fde1d2f61 cannot reach checkpoint floor depth 16
+SB3ORD carrier 50ac98f8abc5cfea cannot reach checkpoint floor depth 16
+SB3ORD fanout b8466a34b05c6010 child dbb9e0b9a15f70c4 has inconsistent/out-of-range sparse ordinal 17
+SB3ORD carrier a8520ff2cc8e4d9a has 1 unconsumed ordinals at node a8520ff2cc8e4d9a
+SB3ORD fanout 81dc7ec042c821ac child 7d597d29bb2fa5d6 has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 has 0 implicit-first child candidates
+SB3ORD fanout 7730d37acfd30d22 child 6a71b1a25b90292a has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child 00793ef382c3a2ad has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child d5e011396cc09af4 has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child 3ba713fefe74a563 has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child 9fa2a3d026064866 has inconsistent/out-of-range sparse ordinal 16
+SB3ORD fanout 7730d37acfd30d22 child 4959a5c6a34688d9 has inconsistent/out-of-range sparse ordinal 34
+SB3ORD carrier 237ad9691916e705 has 1 unconsumed ordinals at node 237ad9691916e705
+SB3ORD carrier d776168fb8f2c8ed has 2 unconsumed ordinals at node d776168fb8f2c8ed
+SB3ORD carrier 33aafd76a36ee25c has 2 unconsumed ordinals at node 33aafd76a36ee25c
+SB3ORD carrier 67eb85d2b4f8bbbf has 2 unconsumed ordinals at node 67eb85d2b4f8bbbf
+SB3ORD carrier 936ad1a7a80e44d4 has 2 unconsumed ordinals at node 936ad1a7a80e44d4
+SB3ORD carrier 2dfc1cfa9cee6797 has 2 unconsumed ordinals at node 2dfc1cfa9cee6797
+SB3ORD fanout e59ace97e0c9cc1d child d645e81392c7b92f has inconsistent/out-of-range sparse ordinal 7
+SB3ORD carrier 0f1db480b015ddd9 has 1 unconsumed ordinals at node 0f1db480b015ddd9
+SB3ORD node fd915678d8c57a26 has 2 recovered children but 1 carrier child groups
+SB3STAGE final_align conflicts=54 elapsed=14.79009ms
+SB3STAGE final_materialize elapsed=6.387622ms
+SB3STAGE harness_reconstruct elapsed=74.617493ms parents=3204 bridges=819
+SB3STAGE harness_score elapsed=1.291055ms
+SB3HARTRACE tid=17b91d756ce5b415 survivors=2428 parent_conflicts=0 ha_conflicts=2
+SB3STAGE parse survivors=3973 frags=1637 elapsed=5.438598ms
+SB3STAGE base_evidence elapsed=9.452085ms
+SB3STAGE candidates elapsed=39.664586ms
+SB3STAGE fanout_groups units=1407 elapsed=21.97594ms
+SB3STAGE route_domains ambiguous=594 deterministic=813
+SB3STAGE ordinal_prune candidates=1408 elapsed=3.76156ms
+SB3HASTATE pending=2 initial_conflicts=0
+SB3HAPENDING carrier=a9b6dae0644d19dd fanout=b64347aa94535d1c fanout_depth=4 terminal=1f49c8ac2ae5d4f1 terminal_depth=5 owner_depth=5 owner_anchors=1 fanout_parent=8815d49ea97aabec
+SB3HAPENDING carrier=7ad209eb35a96e01 fanout=87173eea3104bb14 fanout_depth=4 terminal=1f49c8ac2ae5d4f1 terminal_depth=5 owner_depth=5 owner_anchors=1 fanout_parent=202cd2066b8409b3
+SB3HARD ha carrier=a9b6dae0644d19dd carrier_depth=8 fanout=b64347aa94535d1c fanout_depth=4
+SB3HARD ha carrier=7ad209eb35a96e01 carrier_depth=8 fanout=87173eea3104bb14 fanout_depth=4
+SB3HARDROUTE carrier=a9b6dae0644d19dd root=a9b6dae0644d19dd root_depth=8 parent=7860128bf55fd9e3 unit_depth=7 fanout=b64347aa94535d1c fanout_depth=4 required=b64347aa94535d1c choice=0000000000000000 anchor=208abd142d68ef09 anchor_depth=6 anchors=3
+SB3HARDPATH a9b6dae0644d19dd(d=8) 7860128bf55fd9e3(d=-1) 208abd142d68ef09(d=6) 1f49c8ac2ae5d4f1(d=-1)
+SB3HARDROUTE carrier=7ad209eb35a96e01 root=7ad209eb35a96e01 root_depth=8 parent=b1d0b32614eddfe1 unit_depth=7 fanout=87173eea3104bb14 fanout_depth=4 required=87173eea3104bb14 choice=0000000000000000 anchor=208abd142d68ef09 anchor_depth=6 anchors=2
+SB3HARDPATH 7ad209eb35a96e01(d=8) b1d0b32614eddfe1(d=-1) 208abd142d68ef09(d=6) 1f49c8ac2ae5d4f1(d=-1)
+SB3GREEDY units=1407 candidates=1408 ordinal_prunes=0 hard_prunes=1 hard_conflicts=2
+SB3ORD survivor a9b6dae0644d19dd is disconnected from root
+SB3ORD survivor 6c6a5b960a2313d1 is disconnected from root
+SB3ORD survivor 208abd142d68ef09 is disconnected from root
+SB3ORD survivor 7ad209eb35a96e01 is disconnected from root
+SB3ORD survivor 0f85bdf117bfff8f is disconnected from root
+SB3ORD survivor e94a0398c6a12a80 is disconnected from root
+SB3ORD survivor a0ae5f42cc91acd4 is disconnected from root
+SB3ORD survivor 506cff1bf137303a is disconnected from root
+SB3ORD survivor 80deeacaf1416253 is disconnected from root
+SB3ORD survivor 98965cc79df6a9d3 is disconnected from root
+SB3ORD survivor 0990b5748af71acc is disconnected from root
+SB3ORD survivor db93b93a5c86ab11 is disconnected from root
+SB3ORD survivor 7927666444c8108e is disconnected from root
+SB3ORD survivor 78af79b5c2612b60 is disconnected from root
+SB3ORD survivor cd4bb3ca779c2e46 is disconnected from root
+SB3ORD survivor e89183ce9307b085 is disconnected from root
+SB3ORD survivor e3aa772ebcbbbfdd is disconnected from root
+SB3ORD survivor 14fd8691f78da001 is disconnected from root
+SB3ORD survivor 3eb1fcb335ae9bdb is disconnected from root
+SB3ORD survivor 1d6c30d552faffe3 is disconnected from root
+SB3ORD survivor 4fed071d9c66f637 is disconnected from root
+SB3ORD survivor 43f0ea158fd5c7f4 is disconnected from root
+SB3ORD survivor 04adf0afe535d073 is disconnected from root
+SB3ORD survivor a8bcc55692856477 is disconnected from root
+SB3ORD survivor f4783d2046dec24f is disconnected from root
+SB3ORD survivor d4bf2f07f118d892 is disconnected from root
+SB3ORD survivor f074d4add661dc2c is disconnected from root
+SB3ORD survivor 07d16d882d6d5768 is disconnected from root
+SB3ORD survivor 2e9e1c7862aff87d is disconnected from root
+SB3ORD survivor 5845dd10cbede97d is disconnected from root
+SB3ORD survivor c81b6db61530de91 is disconnected from root
+SB3ORD survivor f7d589dde3c061d0 is disconnected from root
+SB3STAGE final_align conflicts=161 elapsed=24.559002ms
+SB3STAGE final_materialize elapsed=11.791299ms
+SB3STAGE harness_reconstruct elapsed=130.097846ms parents=5551 bridges=1635
+SB3STAGE harness_score elapsed=2.464475ms
+SB3HARTRACE tid=89ec4fe347be996a survivors=3973 parent_conflicts=0 ha_conflicts=2
+SB3STAGE parse survivors=33586 frags=11353 elapsed=36.620162ms
+SB3STAGE base_evidence elapsed=426.316447ms
+SB3STAGE candidates elapsed=442.285384ms
+SB3STAGE fanout_groups units=7885 elapsed=123.719137ms
+SB3STAGE route_domains ambiguous=3236 deterministic=4649
+SB3STAGE ordinal_prune candidates=7885 elapsed=21.137867ms
+SB3HASTATE pending=2 initial_conflicts=0
+SB3HAPENDING carrier=3830a392df7c2d4c fanout=3aaa02f16a85a7d9 fanout_depth=36 terminal=f5f0cd52bf376086 terminal_depth=37 owner_depth=37 owner_anchors=1 fanout_parent=4040b75136f2be44
+SB3HAPENDING carrier=38f9fd47e55610bd fanout=e01c870d9c72e7ea fanout_depth=36 terminal=f5f0cd52bf376086 terminal_depth=37 owner_depth=37 owner_anchors=1 fanout_parent=471a69d34a6e2ad9
+SB3HARD ha carrier=38f9fd47e55610bd carrier_depth=40 fanout=e01c870d9c72e7ea fanout_depth=36
+SB3HARD ha carrier=3830a392df7c2d4c carrier_depth=40 fanout=3aaa02f16a85a7d9 fanout_depth=36
+SB3HARDROUTE carrier=38f9fd47e55610bd root=38f9fd47e55610bd root_depth=40 parent=81c347a84303371a unit_depth=39 fanout=e01c870d9c72e7ea fanout_depth=36 required=e01c870d9c72e7ea choice=0000000000000000 anchor=82eb85593117db00 anchor_depth=38 anchors=2
+SB3HARDPATH 38f9fd47e55610bd(d=40) 81c347a84303371a(d=-1) 82eb85593117db00(d=38) f5f0cd52bf376086(d=-1)
+SB3HARDROUTE carrier=3830a392df7c2d4c root=3830a392df7c2d4c root_depth=40 parent=40b64b06fa481c10 unit_depth=39 fanout=3aaa02f16a85a7d9 fanout_depth=36 required=3aaa02f16a85a7d9 choice=0000000000000000 anchor=82eb85593117db00 anchor_depth=38 anchors=4
+SB3HARDPATH 3830a392df7c2d4c(d=40) 40b64b06fa481c10(d=-1) 82eb85593117db00(d=38) f5f0cd52bf376086(d=-1)
+SB3GREEDY units=7885 candidates=7885 ordinal_prunes=0 hard_prunes=1 hard_conflicts=2
+SB3ORD survivor 82eb85593117db00 is disconnected from root
+SB3ORD survivor 38f9fd47e55610bd is disconnected from root
+SB3ORD survivor 0be4dc30f695f32c is disconnected from root
+SB3ORD survivor b9118b7ee7c2f47d is disconnected from root
+SB3ORD survivor 65433b1c80390aff is disconnected from root
+SB3ORD survivor e471e61e03e15abb is disconnected from root
+SB3ORD survivor b54cb5ad5ea4bf56 is disconnected from root
+SB3ORD survivor cb1043b47b7dc054 is disconnected from root
+SB3ORD survivor 3830a392df7c2d4c is disconnected from root
+SB3ORD survivor bdb09e14e27a0ce3 is disconnected from root
+SB3ORD survivor 44a2e8d4398fea58 is disconnected from root
+SB3ORD survivor 77a2acad6cab9fad is disconnected from root
+SB3ORD survivor 1be2f00a92492642 is disconnected from root
+SB3ORD survivor 7f7dc6ea1232a174 is disconnected from root
+SB3ORD survivor 9121e3f3fdee6c69 is disconnected from root
+SB3ORD survivor 80e4edb5c883dd74 is disconnected from root
+SB3ORD survivor 8c46e4ea48f3d50c is disconnected from root
+SB3ORD survivor b78c0a1409cbf1ed is disconnected from root
+SB3ORD survivor deb66c5fe82c8148 is disconnected from root
+SB3ORD carrier 38f9fd47e55610bd cannot reach checkpoint floor depth 36
+SB3ORD carrier b9118b7ee7c2f47d cannot reach checkpoint floor depth 36
+SB3ORD carrier b54cb5ad5ea4bf56 cannot reach checkpoint floor depth 40
+SB3ORD carrier cb1043b47b7dc054 cannot reach checkpoint floor depth 40
+SB3ORD carrier 3830a392df7c2d4c cannot reach checkpoint floor depth 36
+SB3ORD carrier bdb09e14e27a0ce3 cannot reach checkpoint floor depth 36
+SB3ORD carrier 44a2e8d4398fea58 cannot reach checkpoint floor depth 40
+SB3ORD carrier 77a2acad6cab9fad cannot reach checkpoint floor depth 40
+SB3ORD carrier 80e4edb5c883dd74 cannot reach checkpoint floor depth 40
+SB3ORD carrier 8c46e4ea48f3d50c cannot reach checkpoint floor depth 40
+SB3ORD carrier b78c0a1409cbf1ed cannot reach checkpoint floor depth 40
+SB3ORD carrier deb66c5fe82c8148 cannot reach checkpoint floor depth 40
+SB3ORD fanout eb7e58a1c70909bb has 2 implicit-first child candidates
+SB3STAGE final_align conflicts=340 elapsed=223.259214ms
+SB3STAGE final_materialize elapsed=100.244266ms
+SB3STAGE harness_reconstruct elapsed=1.461112439s parents=43086 bridges=11351
+SB3STAGE harness_score elapsed=29.850843ms
+SB3HARTRACE tid=96e909b76e1770fb survivors=33586 parent_conflicts=0 ha_conflicts=2
+SB3STAGE parse survivors=8170 frags=3347 elapsed=8.559553ms
+SB3STAGE base_evidence elapsed=19.03109ms
+SB3STAGE candidates elapsed=104.497653ms
+SB3STAGE fanout_groups units=1824 elapsed=23.060477ms
+SB3STAGE route_domains ambiguous=710 deterministic=1114
+SB3STAGE ordinal_prune candidates=1824 elapsed=2.834779ms
+SB3HASTATE pending=2 initial_conflicts=0
+SB3HAPENDING carrier=cca49c2f02308509 fanout=24dff56ebe39e424 fanout_depth=36 terminal=fbc4514f068e34b8 terminal_depth=37 owner_depth=37 owner_anchors=1 fanout_parent=261f38ce36304a9c
+SB3HAPENDING carrier=043f5bf0253fd69c fanout=98b7c1bda32cc44a fanout_depth=36 terminal=fbc4514f068e34b8 terminal_depth=37 owner_depth=37 owner_anchors=1 fanout_parent=974e171ce724a200
+SB3HARD ha carrier=cca49c2f02308509 carrier_depth=40 fanout=24dff56ebe39e424 fanout_depth=36
+SB3HARD ha carrier=043f5bf0253fd69c carrier_depth=40 fanout=98b7c1bda32cc44a fanout_depth=36
+SB3HARDROUTE carrier=cca49c2f02308509 root=cca49c2f02308509 root_depth=40 parent=072467face1e6c83 unit_depth=39 fanout=24dff56ebe39e424 fanout_depth=36 required=24dff56ebe39e424 choice=0000000000000000 anchor=7086a8d26a5d53dc anchor_depth=38 anchors=3
+SB3HARDPATH cca49c2f02308509(d=40) 072467face1e6c83(d=-1) 7086a8d26a5d53dc(d=38) fbc4514f068e34b8(d=-1)
+SB3HARDROUTE carrier=043f5bf0253fd69c root=043f5bf0253fd69c root_depth=40 parent=dda893fb81b59246 unit_depth=39 fanout=98b7c1bda32cc44a fanout_depth=36 required=98b7c1bda32cc44a choice=0000000000000000 anchor=7086a8d26a5d53dc anchor_depth=38 anchors=2
+SB3HARDPATH 043f5bf0253fd69c(d=40) dda893fb81b59246(d=-1) 7086a8d26a5d53dc(d=38) fbc4514f068e34b8(d=-1)
+SB3GREEDY units=1824 candidates=1824 ordinal_prunes=0 hard_prunes=0 hard_conflicts=2
+SB3ORD survivor cca49c2f02308509 is disconnected from root
+SB3ORD survivor 36ddd09d4691f3ff is disconnected from root
+SB3ORD survivor c12bb4433a75cc0b is disconnected from root
+SB3ORD survivor 9414264ea8ae35c8 is disconnected from root
+SB3ORD survivor ac8ea03a1f925d4a is disconnected from root
+SB3ORD survivor ebd69c2163f3a2af is disconnected from root
+SB3ORD survivor dc2b45e6c627f9c6 is disconnected from root
+SB3ORD survivor 29a25cdb68c3767e is disconnected from root
+SB3ORD survivor 7086a8d26a5d53dc is disconnected from root
+SB3ORD survivor 043f5bf0253fd69c is disconnected from root
+SB3ORD survivor 65089a4abf1dccfb is disconnected from root
+SB3ORD survivor 989c185c60e620c8 is disconnected from root
+SB3ORD survivor cad2be5b527bc8a0 is disconnected from root
+SB3ORD carrier cca49c2f02308509 cannot reach checkpoint floor depth 36
+SB3ORD carrier 9414264ea8ae35c8 cannot reach checkpoint floor depth 40
+SB3ORD carrier ac8ea03a1f925d4a cannot reach checkpoint floor depth 44
+SB3ORD carrier dc2b45e6c627f9c6 cannot reach checkpoint floor depth 40
+SB3ORD carrier 29a25cdb68c3767e cannot reach checkpoint floor depth 44
+SB3ORD carrier 043f5bf0253fd69c cannot reach checkpoint floor depth 36
+SB3ORD carrier 65089a4abf1dccfb cannot reach checkpoint floor depth 36
+SB3ORD carrier 989c185c60e620c8 cannot reach checkpoint floor depth 40
+SB3ORD carrier cad2be5b527bc8a0 cannot reach checkpoint floor depth 40
+SB3ORD node 24dff56ebe39e424 has 2 recovered children but 1 carrier child groups
+SB3ORD node 24dff56ebe39e424 child 7210e4a44c767ab6 has no carrier in its window
+SB3ORD fanout 643a6b42c0e3e8fb child 70f2552caf864787 has inconsistent/out-of-range sparse ordinal 4
+SB3ORD carrier 6181362bd928e63b has 1 unconsumed ordinals at node 6181362bd928e63b
+SB3ORD fanout 98b7c1bda32cc44a child 000000000000061f has inconsistent/out-of-range sparse ordinal 6
+SB3ORD carrier 80d4768027581426 has 1 unconsumed ordinals at node 80d4768027581426
+SB3ORD fanout 8e3dde2c849d3c9c child 88bbac8ed11e1c07 has inconsistent/out-of-range sparse ordinal 11
+SB3ORD carrier 6de0a798670d4466 has 1 unconsumed ordinals at node 6de0a798670d4466
+SB3STAGE final_align conflicts=30 elapsed=48.684771ms
+SB3STAGE final_materialize elapsed=22.631756ms
+SB3STAGE harness_reconstruct elapsed=246.511125ms parents=10328 bridges=3345
+SB3STAGE harness_score elapsed=4.656873ms
+SB3HARTRACE tid=a682d0fc031c10a3 survivors=8170 parent_conflicts=0 ha_conflicts=2
+SB3STAGE parse survivors=15460 frags=5886 elapsed=13.399748ms
+SB3STAGE base_evidence elapsed=87.360172ms
+SB3STAGE candidates elapsed=172.186774ms
+SB3STAGE fanout_groups units=2658 elapsed=38.571099ms
+SB3STAGE route_domains ambiguous=1221 deterministic=1437
+SB3STAGE ordinal_prune candidates=2659 elapsed=4.517996ms
+SB3HASTATE pending=2 initial_conflicts=0
+SB3HAPENDING carrier=5e18b780eaf5e764 fanout=63e00902fe3a0141 fanout_depth=12 terminal=15aece211e472026 terminal_depth=13 owner_depth=13 owner_anchors=2 fanout_parent=2b4525ebd5a4680f
+SB3HAPENDING carrier=2ac3dd2fc52650b1 fanout=f72137b53051cd40 fanout_depth=12 terminal=15aece211e472026 terminal_depth=13 owner_depth=13 owner_anchors=2 fanout_parent=b6fcd792a01adbb9
+SB3HARD ha carrier=5e18b780eaf5e764 carrier_depth=16 fanout=63e00902fe3a0141 fanout_depth=12
+SB3HARD ha carrier=2ac3dd2fc52650b1 carrier_depth=16 fanout=f72137b53051cd40 fanout_depth=12
+SB3HARDROUTE carrier=5e18b780eaf5e764 root=5e18b780eaf5e764 root_depth=16 parent=1a4b72c5694d6c06 unit_depth=15 fanout=63e00902fe3a0141 fanout_depth=12 required=63e00902fe3a0141 choice=0000000000000000 anchor=ac3b5755455ed6ca anchor_depth=14 anchors=3
+SB3HARDPATH 5e18b780eaf5e764(d=16) 1a4b72c5694d6c06(d=-1) ac3b5755455ed6ca(d=14) 15aece211e472026(d=-1)
+SB3HARDROUTE carrier=2ac3dd2fc52650b1 root=2ac3dd2fc52650b1 root_depth=16 parent=972237737d2ff746 unit_depth=15 fanout=f72137b53051cd40 fanout_depth=12 required=f72137b53051cd40 choice=0000000000000000 anchor=ac3b5755455ed6ca anchor_depth=14 anchors=2
+SB3HARDPATH 2ac3dd2fc52650b1(d=16) 972237737d2ff746(d=-1) ac3b5755455ed6ca(d=14) 15aece211e472026(d=-1)
+SB3GREEDY units=2658 candidates=2659 ordinal_prunes=0 hard_prunes=1 hard_conflicts=2
+SB3ORD survivor 5e18b780eaf5e764 is disconnected from root
+SB3ORD survivor ac3b5755455ed6ca is disconnected from root
+SB3ORD survivor 2ac3dd2fc52650b1 is disconnected from root
+SB3ORD survivor 6d78c313f08f5809 is disconnected from root
+SB3ORD survivor 0812df7bbcf322e6 is disconnected from root
+SB3ORD carrier 5e18b780eaf5e764 cannot reach checkpoint floor depth 12
+SB3ORD carrier 2ac3dd2fc52650b1 cannot reach checkpoint floor depth 12
+SB3ORD carrier 6d78c313f08f5809 cannot reach checkpoint floor depth 12
+SB3ORD carrier 0812df7bbcf322e6 cannot reach checkpoint floor depth 12
+SB3ORD fanout d2b469ced43d691b has 2 implicit-first child candidates
+SB3ORD fanout d2b469ced43d691b child e2694a0281da9e58 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout d2b469ced43d691b child 98349fe0482cf871 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout c8f00e0cef587176 child ceb5e2a35d42127c has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout ceb5e2a35d42127c has 0 implicit-first child candidates
+SB3ORD fanout ceb5e2a35d42127c child 888b313d43c78f24 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout ceb5e2a35d42127c child 23da8987d5634620 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout ceb5e2a35d42127c child 26338d752a056d1d has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout ceb5e2a35d42127c child db273352d4abf690 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout ceb5e2a35d42127c child f7161c0970db2866 has inconsistent/out-of-range sparse ordinal 88
+SB3ORD carrier a75c89b50799e988 has 1 unconsumed ordinals at node a75c89b50799e988
+SB3ORD carrier 888b313d43c78f24 has 2 unconsumed ordinals at node 888b313d43c78f24
+SB3ORD fanout efa6135e8a30d4a7 has 0 implicit-first child candidates
+SB3ORD fanout efa6135e8a30d4a7 child 7913f6a7e6733885 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD fanout efa6135e8a30d4a7 child b5f6831b482db494 has inconsistent/out-of-range sparse ordinal 6
+SB3ORD carrier 7913f6a7e6733885 has 1 unconsumed ordinals at node 7913f6a7e6733885
+SB3ORD carrier b5f6831b482db494 has 2 unconsumed ordinals at node b5f6831b482db494
+SB3ORD carrier a350215e72782a6e has 2 unconsumed ordinals at node a350215e72782a6e
+SB3ORD carrier db273352d4abf690 has 2 unconsumed ordinals at node db273352d4abf690
+SB3ORD fanout 7059243adbd25b30 has 2 implicit-first child candidates
+SB3ORD fanout 7059243adbd25b30 child 9dbe85780386f114 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 7059243adbd25b30 child 0000000000000944 has inconsistent/out-of-range sparse ordinal 0
+SB3ORD fanout 4a1c8d5b7ffdffad has 2 implicit-first child candidates
+SB3STAGE final_align conflicts=282 elapsed=97.486946ms
+SB3STAGE final_materialize elapsed=39.202096ms
+SB3STAGE harness_reconstruct elapsed=483.91013ms parents=18851 bridges=5884
+SB3STAGE harness_score elapsed=10.041355ms
+SB3HARTRACE tid=c18772c20ec47b32 survivors=15460 parent_conflicts=0 ha_conflicts=2
+SB3STAGE parse survivors=64735 frags=22425 elapsed=87.463862ms
+SB3STAGE base_evidence elapsed=2.99719359s
+SB3STAGE candidates elapsed=477.313994ms
+SB3STAGE fanout_groups units=14059 elapsed=155.926225ms
+SB3STAGE route_domains ambiguous=5848 deterministic=8211
+SB3STAGE ordinal_prune candidates=14084 elapsed=17.696326ms
+SB3HASTATE pending=2 initial_conflicts=0
+SB3HAPENDING carrier=3d38f16090753691 fanout=92b0ca90d2da1956 fanout_depth=8 terminal=10a92480d8fb302f terminal_depth=9 owner_depth=9 owner_anchors=2 fanout_parent=e7ca290f29d1eca3
+SB3HAPENDING carrier=640f773e1cb1486e fanout=c6db3cb6dfe7a721 fanout_depth=8 terminal=10a92480d8fb302f terminal_depth=9 owner_depth=9 owner_anchors=2 fanout_parent=c955386afb058b9e
+SB3HARD ha carrier=3d38f16090753691 carrier_depth=12 fanout=92b0ca90d2da1956 fanout_depth=8
+SB3HARD ha carrier=640f773e1cb1486e carrier_depth=12 fanout=c6db3cb6dfe7a721 fanout_depth=8
+SB3HARDROUTE carrier=3d38f16090753691 root=3d38f16090753691 root_depth=12 parent=03f057579f161879 unit_depth=11 fanout=92b0ca90d2da1956 fanout_depth=8 required=92b0ca90d2da1956 choice=0000000000000000 anchor=4f119c252de69bcb anchor_depth=10 anchors=7
+SB3HARDPATH 3d38f16090753691(d=12) 03f057579f161879(d=-1) 4f119c252de69bcb(d=10) 10a92480d8fb302f(d=-1)
+SB3HARDROUTE carrier=640f773e1cb1486e root=640f773e1cb1486e root_depth=12 parent=da7f9086858f231a unit_depth=11 fanout=c6db3cb6dfe7a721 fanout_depth=8 required=c6db3cb6dfe7a721 choice=0000000000000000 anchor=4f119c252de69bcb anchor_depth=10 anchors=6
+SB3HARDPATH 640f773e1cb1486e(d=12) da7f9086858f231a(d=-1) 4f119c252de69bcb(d=10) 10a92480d8fb302f(d=-1)
+SB3GREEDY units=14059 candidates=14084 ordinal_prunes=0 hard_prunes=22 hard_conflicts=2
+SB3ORD survivor 3d38f16090753691 is disconnected from root
+SB3ORD survivor 274499b69814a948 is disconnected from root
+SB3ORD survivor 4f119c252de69bcb is disconnected from root
+SB3ORD survivor caedc24af8239ce4 is disconnected from root
+SB3ORD survivor 19da97b54e4c64ce is disconnected from root
+SB3ORD survivor 19ac3c68ed1bbdbb is disconnected from root
+SB3ORD survivor 43578d393c87222d is disconnected from root
+SB3ORD survivor 9b3927f98dd9aa98 is disconnected from root
+SB3ORD survivor ad7b90542d7394f7 is disconnected from root
+SB3ORD survivor e300cd83ca9d67db is disconnected from root
+SB3ORD survivor 1faabeec4e76daa0 is disconnected from root
+SB3ORD survivor 5b52f2a580346bed is disconnected from root
+SB3ORD survivor 7a15dbabe9d8e59b is disconnected from root
+SB3ORD survivor 7da934e3b7e5a9e4 is disconnected from root
+SB3ORD survivor 8167573e09f9be77 is disconnected from root
+SB3ORD survivor fe8226b072b8b876 is disconnected from root
+SB3ORD survivor a4440c913f9836d3 is disconnected from root
+SB3ORD survivor dd69543a000e3f69 is disconnected from root
+SB3ORD survivor 7a956474359c493e is disconnected from root
+SB3ORD survivor c29a372907047ba7 is disconnected from root
+SB3ORD survivor 640f773e1cb1486e is disconnected from root
+SB3ORD survivor cc6b33dfc6db9e5c is disconnected from root
+SB3ORD carrier 3d38f16090753691 cannot reach checkpoint floor depth 8
+SB3ORD carrier 274499b69814a948 cannot reach checkpoint floor depth 12
+SB3ORD carrier 19da97b54e4c64ce cannot reach checkpoint floor depth 8
+SB3ORD carrier 19ac3c68ed1bbdbb cannot reach checkpoint floor depth 12
+SB3ORD carrier 1faabeec4e76daa0 cannot reach checkpoint floor depth 8
+SB3ORD carrier 5b52f2a580346bed cannot reach checkpoint floor depth 8
+SB3ORD carrier 7a15dbabe9d8e59b cannot reach checkpoint floor depth 8
+SB3ORD carrier 7da934e3b7e5a9e4 cannot reach checkpoint floor depth 12
+SB3ORD carrier 8167573e09f9be77 cannot reach checkpoint floor depth 12
+SB3ORD carrier fe8226b072b8b876 cannot reach checkpoint floor depth 8
+SB3STAGE final_align conflicts=5453 elapsed=274.819978ms
+SB3STAGE final_materialize elapsed=115.710951ms
+SB3STAGE harness_reconstruct elapsed=4.233593497s parents=80854 bridges=22423
+SB3STAGE harness_score elapsed=24.875395ms
+SB3HARTRACE tid=f1d721fc97193567 survivors=64735 parent_conflicts=0 ha_conflicts=2
+SB3 traces=6 feasible=6 empty=0 | correct=0.00% (clean=0) | correctExclEmpty=0.00% | correctCreditEmpty=0.00%
+SB3 per-edge: exact=97.010% (152513/157213) wrong/trace=297.67 | survivor edges=100.000% | named-syn=83.72%
+SB3 greedy=sb3-greedy checked=6 compatible=0 (0.0000%) | candidate_evaluations=28511 ordinal_overrides=0 hard_overrides=25 ordinal_placed=59674 fanouts=10227 ordinal_conflicts=6320 hard_conflicts=12 (parent=0 ha=12)
+Wrote 6 traces to output/sb3_day1_reconstruction/cgp0_core_full_day1/sb3_no_ordinal_ha_conflicts_replay.json
+	Command being timed: "/tmp/trace_recon_sb3_full_day1 --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode sb3 --checkpoint-distance 4 --prefix-len 8 --bloom-fp 0.0001 --fp-bits 64 --lehmer-ee --sb3-ignore-ordinals --drop-rate 0.5 --seed 42 --per-trace-drop-seed --workers 1 --only-traces 17b91d756ce5b415,89ec4fe347be996a,96e909b76e1770fb,a682d0fc031c10a3,c18772c20ec47b32,f1d721fc97193567 --output output/sb3_day1_reconstruction/cgp0_core_full_day1/sb3_no_ordinal_ha_conflicts_replay.json"
+	User time (seconds): 123.95
+	System time (seconds): 40.26
+	Percent of CPU this job got: 186%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:28.06
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 121172
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 4468694
+	Voluntary context switches: 679349
+	Involuntary context switches: 676
+	Swaps: 0
+	File system inputs: 616
+	File system outputs: 112
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

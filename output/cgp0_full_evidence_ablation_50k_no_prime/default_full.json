@@ -1,0 +1,33 @@
+{
+  "mode": "cgp0",
+  "checkpoint_distance": 4,
+  "drop_rate": 0.5,
+  "bloom_fp": 0.0001,
+  "per_trace_drop_seed": true,
+  "order": "bottom-up",
+  "consistency": "chain",
+  "seed": 42,
+  "num_traces": 50000,
+  "topology_summary": {
+    "traces": 50000,
+    "feasible": 49096,
+    "empty": 904,
+    "clean": 43132,
+    "real_nodes": 43632494,
+    "edge_exact": 41970036,
+    "edge_wrong": 91865,
+    "survivor_edges": 35311313,
+    "survivor_exact": 35311313,
+    "named_synthetic": 8321181,
+    "named_exact": 6658723
+  },
+  "greedy_summary": {
+    "mode": "full-evidence",
+    "checked": 50000,
+    "candidate_evaluations": 8250919,
+    "hard_overrides": 500,
+    "hard_conflicts": 0,
+    "parent_conflicts": 0,
+    "ha_conflicts": 0
+  }
+}

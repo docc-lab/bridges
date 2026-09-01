@@ -1,0 +1,59 @@
+Trace store: 100000 traces selected, 7 parallel replay workers
+PROGRESS traces=10000 elapsed=50s | d005:excl=99.06% d025:excl=97.29% d05:excl=95.50% d075:excl=94.17% d095:excl=93.08% d10:excl=92.90%
+PROGRESS traces=20000 elapsed=114s | d005:excl=98.93% d025:excl=96.77% d05:excl=94.38% d075:excl=92.08% d095:excl=90.41% d10:excl=90.02%
+PROGRESS traces=30000 elapsed=185s | d005:excl=98.89% d025:excl=96.63% d05:excl=93.98% d075:excl=91.38% d095:excl=89.40% d10:excl=89.05%
+PROGRESS traces=40000 elapsed=251s | d005:excl=98.92% d025:excl=96.54% d05:excl=93.77% d075:excl=90.94% d095:excl=88.81% d10:excl=88.37%
+PROGRESS traces=50000 elapsed=313s | d005:excl=98.96% d025:excl=96.62% d05:excl=93.84% d075:excl=91.00% d095:excl=88.91% d10:excl=88.50%
+PROGRESS traces=60000 elapsed=371s | d005:excl=99.06% d025:excl=96.85% d05:excl=94.13% d075:excl=91.38% d095:excl=89.45% d10:excl=89.06%
+PROGRESS traces=70000 elapsed=432s | d005:excl=99.14% d025:excl=96.93% d05:excl=94.26% d075:excl=91.63% d095:excl=89.69% d10:excl=89.29%
+PROGRESS traces=80000 elapsed=501s | d005:excl=99.18% d025:excl=96.99% d05:excl=94.36% d075:excl=91.77% d095:excl=89.89% d10:excl=89.50%
+PROGRESS traces=90000 elapsed=566s | d005:excl=99.21% d025:excl=97.08% d05:excl=94.48% d075:excl=91.93% d095:excl=90.11% d10:excl=89.74%
+PROGRESS traces=100000 elapsed=627s | d005:excl=99.24% d025:excl=97.14% d05:excl=94.57% d075:excl=92.07% d095:excl=90.25% d10:excl=89.88%
+CGP0[d005] traces=100000 nontrivial=83207 empty=16793 | cleanNontrivial=82572 (99.24%) | cleanAll=99365 (99.36%)
+CGP0[d005] empties: n=16793 score-clean=16793 avgSurv=70.6 noDrop(trivial)=16793 tiny(<=2 surv)=81
+CGP0[d005] per-edge: exact=99.971% (90329266/90355280) wrong/trace=0.01 | survivor edges=0.000% | named-syn=0.00%
+CGP0[d025] traces=100000 nontrivial=95329 empty=4671 | cleanNontrivial=92602 (97.14%) | cleanAll=97273 (97.27%)
+CGP0[d025] empties: n=4671 score-clean=4671 avgSurv=15.4 noDrop(trivial)=4671 tiny(<=2 surv)=81
+CGP0[d025] per-edge: exact=99.316% (90244153/90865348) wrong/trace=0.08 | survivor edges=0.000% | named-syn=0.00%
+CGP0[d05] traces=100000 nontrivial=97827 empty=2173 | cleanNontrivial=92513 (94.57%) | cleanAll=94686 (94.69%)
+CGP0[d05] empties: n=2173 score-clean=2173 avgSurv=4.9 noDrop(trivial)=2173 tiny(<=2 surv)=81
+CGP0[d05] per-edge: exact=97.219% (86598994/89076185) wrong/trace=0.27 | survivor edges=0.000% | named-syn=0.00%
+CGP0[d075] traces=100000 nontrivial=99052 empty=948 | cleanNontrivial=91201 (92.07%) | cleanAll=92149 (92.15%)
+CGP0[d075] empties: n=948 score-clean=948 avgSurv=3.2 noDrop(trivial)=948 tiny(<=2 surv)=81
+CGP0[d075] per-edge: exact=93.509% (80415454/85997465) wrong/trace=0.67 | survivor edges=0.000% | named-syn=0.00%
+CGP0[d095] traces=100000 nontrivial=99761 empty=239 | cleanNontrivial=90037 (90.25%) | cleanAll=90276 (90.28%)
+CGP0[d095] empties: n=239 score-clean=239 avgSurv=2.4 noDrop(trivial)=239 tiny(<=2 surv)=81
+CGP0[d095] per-edge: exact=89.154% (73683096/82646756) wrong/trace=1.17 | survivor edges=0.000% | named-syn=0.00%
+CGP0[d10] traces=100000 nontrivial=99919 empty=81 | cleanNontrivial=89807 (89.88%) | cleanAll=89888 (89.89%)
+CGP0[d10] empties: n=81 score-clean=81 avgSurv=1.0 noDrop(trivial)=81 tiny(<=2 surv)=81
+CGP0[d10] per-edge: exact=87.837% (71750134/81685236) wrong/trace=1.32 | survivor edges=0.000% | named-syn=0.00%
+CGP0[d005] greedy=full-evidence checked=100000 | candidate_evaluations=1766475 hard_overrides=7 hard_conflicts=0 (parent=0 ha=0)
+CGP0[d025] greedy=full-evidence checked=100000 | candidate_evaluations=8329004 hard_overrides=51 hard_conflicts=0 (parent=0 ha=0)
+CGP0[d05] greedy=full-evidence checked=100000 | candidate_evaluations=15352579 hard_overrides=218 hard_conflicts=0 (parent=0 ha=0)
+CGP0[d075] greedy=full-evidence checked=100000 | candidate_evaluations=20921093 hard_overrides=767 hard_conflicts=0 (parent=0 ha=0)
+CGP0[d095] greedy=full-evidence checked=100000 | candidate_evaluations=24100302 hard_overrides=1805 hard_conflicts=0 (parent=0 ha=0)
+CGP0[d10] greedy=full-evidence checked=100000 | candidate_evaluations=24642910 hard_overrides=2151 hard_conflicts=0 (parent=0 ha=0)
+Wrote 100000 traces to /users/tomislav/bridges/output/reconstruction_matrix_first100k_prime_up_ha_safe/cgp0_cpd3.json
+	Command being timed: "/users/tomislav/bridges/output/trace_recon_first100k_matrix --corpus /mydata/uber/bignode_state/day1_unfilt_corpus --trace-store /mydata/uber/day1.store --mode cgp0 --checkpoint-distance 3 --prefix-len 8 --bloom-fp 0.0001 --prime-m --drop-rates 0.05,0.25,0.5,0.75,0.95,1 --seed 42 --per-trace-drop-seed --trace-count 100000 --workers 7 --output /users/tomislav/bridges/output/reconstruction_matrix_first100k_prime_up_ha_safe/cgp0_cpd3.json"
+	User time (seconds): 5137.95
+	System time (seconds): 113.31
+	Percent of CPU this job got: 788%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 11:06.03
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 522364
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 18666468
+	Voluntary context switches: 2498735
+	Involuntary context switches: 130378
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 120
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

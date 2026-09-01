@@ -1,0 +1,5 @@
+  clusters: 0 solved (cpsat_ok=0 bt_fallback=0) | cpsat=0ms bt=0ms
+tid=017508c890ed943e survivors=830 dropped=301 recon=18.465ms | bridges=342
+  score: {Spans:1131 Dropped:301 Orphans:344 Reconnected:342 AnchorCorrect:338 AnchorAncestor:341 GapCorrect:338 Misattached:4 MisattachAncestor:3 Unanchored:2 Synthetic:550 Borrowed:45 Ambiguous:303 AmbiguousBad:4 FragmentsLost:2 SpansLost:3 OpenEnds:0 OpenEndsMatched:0 ForcedMatches:0 OrphansPlaced:0 OrphanOpenEnds:0 AncestorsSkipped:0 SpansInSkipped:0}
+  topo:  conn=false topo=false sibPairs=435 recall=435 reconSib=435 prec=435
+  sb3:  compatible=false ordinal_conflicts=46 hard=2 parent=0 ha=2 candidates=248

@@ -86,10 +86,16 @@ const (
 // (real-id top4 if it survived, else the 2-byte recovered fp), the set of valid
 // child ordinals, and the end-ordinals already witnessed in its EE.
 type DEECandidate struct {
-	ID        uint64
-	Survived  bool
-	RealID    uint64 // top-fpBits used for the match when Survived
-	FP        uint64 // recovered fp (top fpBits of the span id, right-aligned) when lost
+	ID       uint64
+	Survived bool
+	RealID   uint64 // top-fpBits used for the match when Survived
+	FP       uint64 // recovered fp (top fpBits of the span id, right-aligned) when lost
+	// FPKnown distinguishes a genuine all-zero fingerprint from an anonymous
+	// topology node whose fingerprint is not known yet. An unknown fingerprint
+	// is a wildcard: DEE content/topology may identify the node and thereby
+	// supply its fingerprint. FP!=0 remains accepted as known for compatibility
+	// with older callers that predate this field.
+	FPKnown   bool
 	Depth     int
 	ChildOrds map[int]bool
 	EE        map[int]bool // ends already witnessed (a child cannot also be a DEE leftover)
@@ -114,15 +120,22 @@ func AttributeDEE(ownerFP uint64, depth int, seqs []int, cands []DEECandidate, f
 			if c.RealID>>uint(64-fpBits) != ownerFP { // top-fpBits of the real id vs owner fp
 				continue
 			}
-		} else if c.FP != ownerFP { // recovered fp vs owner fp (both top-fpBits, right-aligned)
+		} else if (c.FPKnown || c.FP != 0) && c.FP != ownerFP { // known recovered fp vs owner fp
 			continue
 		}
 		ok := true
+		fresh := make(map[int]bool, len(seqs))
 		for _, s := range seqs {
-			if !c.ChildOrds[s] || c.EE[s] { // not a child, or already ended -> can't be this parent
+			if !c.ChildOrds[s] || c.EE[s] || fresh[s] { // invalid child or duplicate end
 				ok = false
 				break
 			}
+			fresh[s] = true
+		}
+		// Exactly one child end is implicit. A batch that would account for all
+		// child ends (or more) cannot belong to this parent.
+		if ok && len(c.EE)+len(fresh) > len(c.ChildOrds)-1 {
+			ok = false
 		}
 		if !ok {
 			continue

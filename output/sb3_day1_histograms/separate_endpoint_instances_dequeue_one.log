@@ -1,0 +1,13 @@
+Opened corpus (521305 traces, 1150 services) in 54ms
+PROGRESS traces=50000 elapsed=344s
+PROGRESS traces=100000 elapsed=787s
+PROGRESS traces=150000 elapsed=1198s
+PROGRESS traces=200000 elapsed=1589s
+PROGRESS traces=250000 elapsed=1999s
+PROGRESS traces=300000 elapsed=2419s
+PROGRESS traces=350000 elapsed=2844s
+PROGRESS traces=400000 elapsed=3287s
+PROGRESS traces=450000 elapsed=3751s
+PROGRESS traces=500000 elapsed=4190s
+Simulated in 1h12m55.929s
+Wrote size histograms to output/sb3_day1_histograms/sb3_lehmer_fw_cpd4_day1_separate_endpoint_instances_dequeue_one.json

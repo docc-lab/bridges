@@ -53,11 +53,11 @@ type cgpFragment struct {
 	carrier *Span   // a span in the fragment carrying a _br payload — checkpoint OR leaf-carrier; both give own window evidence (prefix+bloom). nil => orphan.
 
 	// Filled in later phases:
-	bf         *bloom.Filter // window bloom (own carrier's, or borrowed for an orphan)
-	prefix     []byte        // checkpoint prefix (own, or borrowed)
-	viaCarrier uint64        // span the prefix/bloom was borrowed from (0 = own)
-	anchorCkpt *Span         // prefix-matched window-top checkpoint (the routing ceiling); nil if unresolved
-	anchorAmbig bool         // >1 checkpoint matched the prefix
+	bf          *bloom.Filter // window bloom (own carrier's, or borrowed for an orphan)
+	prefix      []byte        // checkpoint prefix (own, or borrowed)
+	viaCarrier  uint64        // span the prefix/bloom was borrowed from (0 = own)
+	anchorCkpt  *Span         // prefix-matched window-top checkpoint (the routing ceiling); nil if unresolved
+	anchorAmbig bool          // >1 checkpoint matched the prefix
 }
 
 // isOrphan reports whether the fragment is carrier-less: no checkpoint and no
@@ -88,9 +88,9 @@ type cgpFanout struct {
 // cgpSkeleton is the output of Phase 1: the structural facts derived purely from
 // the survivors and their carried evidence, before any bloom guessing.
 type cgpSkeleton struct {
-	byID      map[uint64]*Span     // SpanID -> survivor
-	childrenS map[uint64][]*Span   // surviving-edge children (parent must survive)
-	frags     []*cgpFragment       // connected components
+	byID      map[uint64]*Span      // SpanID -> survivor
+	childrenS map[uint64][]*Span    // surviving-edge children (parent must survive)
+	frags     []*cgpFragment        // connected components
 	fanouts   map[uint64]*cgpFanout // HA-witnessed dropped fan-outs, by id
 }
 
@@ -140,7 +140,8 @@ func cgpParse(survivors []Span, cfg Config) *cgpSkeleton {
 			f.spans = append(f.spans, n)
 			// A carrier is any span with a _br payload — checkpoint or leaf-carrier;
 			// both anchor a window. Prefer the shallowest (closest to the window top).
-			if n.BloomBits != nil && (f.carrier == nil || n.Depth < f.carrier.Depth) {
+			if n.BloomBits != nil && (f.carrier == nil || n.Depth < f.carrier.Depth ||
+				(n.Depth == f.carrier.Depth && n.SpanID < f.carrier.SpanID)) {
 				f.carrier = n
 			}
 			stack = append(stack, sk.childrenS[n.SpanID]...)
@@ -170,7 +171,7 @@ func cgpParse(survivors []Span, cfg Config) *cgpSkeleton {
 			fo := sk.fanouts[e.ParentID]
 			if fo == nil {
 				sk.fanouts[e.ParentID] = &cgpFanout{id: e.ParentID, depth: e.Depth - 1, witness: s}
-			} else if s.Depth < fo.witness.Depth {
+			} else if s.Depth < fo.witness.Depth || (s.Depth == fo.witness.Depth && s.SpanID < fo.witness.SpanID) {
 				fo.witness = s
 			}
 		}
@@ -284,6 +285,11 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 		if s.BloomBits != nil {
 			carriersByDepth[s.Depth] = append(carriersByDepth[s.Depth], s)
 		}
+	}
+	for d := range carriersByDepth {
+		sort.Slice(carriersByDepth[d], func(i, j int) bool {
+			return carriersByDepth[d][i].SpanID < carriersByDepth[d][j].SpanID
+		})
 	}
 	for _, f := range orphans {
 		r := f.root
@@ -577,9 +583,9 @@ type cgpOption struct {
 }
 
 type cgpFragOpts struct {
-	frag      *cgpFragment
-	fanouts   []uint64 // confirmed fan-out ids on this fragment's chain (for routing/≥2)
-	options   []cgpOption
+	frag    *cgpFragment
+	fanouts []uint64 // confirmed fan-out ids on this fragment's chain (for routing/≥2)
+	options []cgpOption
 }
 
 // cgpGenOptions builds each fragment's one-hot anchor options: its confirmed
@@ -1082,21 +1088,35 @@ func GrandparentDecomp(survivors []Span, truth []TruthSpan, res Result, dropped 
 // parent? This is the isomorphism measure — a faithful reconstruction has every
 // edge correct, with synthetics standing in for dropped spans.
 type CGP2Iso struct {
-	RealNodes int // nodes with a real span id (survivor or named synthetic) that have a reconstructed parent
-	EdgeExact int // reconstructed parent identity == true parent (CORRECT edge)
+	RealNodes  int // nodes with a real span id (survivor or named synthetic) that have a reconstructed parent
+	EdgeExact  int // reconstructed parent identity == true parent (CORRECT edge)
 	EdgeAnonOK int // reconstructed parent is an anonymous synthetic AND the true parent is dropped (right shape, identity not recovered)
-	EdgeWrong int // wrong parent identity, or anonymous parent where the true parent actually survived
+	EdgeWrong  int // wrong parent identity, or anonymous parent where the true parent actually survived
+	// ConstraintWrong counts trace-level structural evidence failures which are
+	// not themselves parent segments (currently SB3 sparse-ordinal
+	// incompatibility).  Keeping these separate preserves
+	// EdgeExact+EdgeAnonOK+EdgeWrong == RealNodes.
+	ConstraintWrong int
 
-	SurvNodes int // of RealNodes, survivors
-	SurvExact int // of survivor edges, exactly correct
-	NamedSyn  int // recovered named-synthetic (dropped-span) nodes with a parent
+	SurvNodes  int // of RealNodes, survivors
+	SurvExact  int // of survivor edges, exactly correct
+	NamedSyn   int // recovered named-synthetic (dropped-span) nodes with a parent
 	NamedExact int // ... with the correct parent identity
 }
 
-// ScoreCGP2Iso scores the full reconstructed tree against truth by per-edge
-// identity correctness. Anonymous synthetic nodes (no recovered identity) are
-// not scored as sources; their use as a parent is judged by whether the true
-// parent was indeed dropped.
+// Wrong is the complete reconstruction-error count used for trace cleanliness.
+func (s CGP2Iso) Wrong() int { return s.EdgeWrong + s.ConstraintWrong }
+
+// Clean reports whether both topology segments and non-edge structural
+// constraints agree with the emitted evidence.
+func (s CGP2Iso) Clean() bool { return s.Wrong() == 0 }
+
+// ScoreCGP2Iso is the historical permissive per-edge diagnostic. Anonymous
+// synthetic nodes (no recovered identity) are not scored as sources; their use
+// as a parent is judged only by whether the true parent was dropped. That means
+// it cannot detect an anonymous chain which terminates at the wrong survivor,
+// nor require a dropped identity exposed by another surviving record. Do not
+// use it for canonical accuracy; use ScoreCGP2Strict.
 func ScoreCGP2Iso(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
 	var iso CGP2Iso
 	if res.ReconParent == nil {
@@ -1135,6 +1155,125 @@ func ScoreCGP2Iso(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CG
 			}
 		default:
 			iso.EdgeWrong++
+		}
+	}
+	return iso
+}
+
+// ScoreCGP2Evidence scores the reconstructed topology against exactly the
+// identities exposed by surviving records.  An identity is nameable when it
+// appears as a surviving SpanID, a survivor's literal ParentID, or an HA
+// ParentID.  Those identities must appear at their exact truth positions.
+//
+// Between two nameable identities, a truth node whose identity appears in no
+// surviving record is intrinsically unnameable.  One anonymous reconstructed
+// node may stand in for each such truth node, but the complete chain must still
+// terminate at the correct next nameable ancestor.  In particular, a surviving
+// span (or a different named synthetic) can never be accepted in an anonymous
+// slot merely because the true occupant was dropped.
+//
+// The unit being scored is therefore one evidence-bounded parent segment for
+// every nameable non-root truth node.  Missing nodes/edges, extra or missing
+// anonymous levels, cycles, and wrong terminal ancestors all make that segment
+// wrong.  Dropped truth nodes which are not nameable and have no nameable
+// descendant are intentionally outside the score: no surviving record could
+// have told any reconstructor that they existed.
+func ScoreCGP2Evidence(res Result, survivors []Span, truth []TruthSpan) CGP2Iso {
+	var iso CGP2Iso
+
+	tparent := make(map[uint64]uint64, len(truth))
+	for _, t := range truth {
+		tparent[t.SpanID] = t.ParentID
+	}
+
+	surviving := make(map[uint64]bool, len(survivors))
+	nameable := make(map[uint64]bool, len(survivors)*2)
+	for i := range survivors {
+		s := &survivors[i]
+		surviving[s.SpanID] = true
+		nameable[s.SpanID] = true
+		if s.ParentID != 0 {
+			nameable[s.ParentID] = true
+		}
+		for _, h := range s.HA {
+			if h.ParentID != 0 {
+				nameable[h.ParentID] = true
+			}
+		}
+	}
+
+	for source := range nameable {
+		if tp, exists := tparent[source]; !exists || tp == 0 {
+			continue
+		}
+		iso.RealNodes++
+		isSurvivor := surviving[source]
+		if isSurvivor {
+			iso.SurvNodes++
+		} else {
+			iso.NamedSyn++
+		}
+
+		truthNode := tparent[source]
+		reconNode, reconEdge := res.ReconParent[source]
+		usedAnon := false
+		ok := true
+
+		// At most len(truth) truth-parent steps can exist in a valid tree.
+		// The bound also makes malformed truth or reconstructed cycles fail
+		// closed instead of hanging the scorer.
+		for steps := 0; ; steps++ {
+			if steps > len(truth) {
+				ok = false
+				break
+			}
+			if truthNode == 0 {
+				// Roots normally are nameable survivors.  This case handles a
+				// truth chain with no nameable root without inventing an edge.
+				if reconEdge && reconNode != 0 {
+					ok = false
+				}
+				break
+			}
+
+			if nameable[truthNode] {
+				if !reconEdge || reconNode != truthNode || res.ReconAnon[reconNode] {
+					ok = false
+				}
+				break
+			}
+
+			// This truth level is genuinely unnameable.  Its reconstructed
+			// counterpart must be anonymous: accepting a survivor here is the
+			// exact wrong-survivor-in-a-synthetic-slot bug this scorer forbids.
+			if !reconEdge || reconNode == 0 || !res.ReconAnon[reconNode] {
+				ok = false
+				break
+			}
+			usedAnon = true
+
+			nextTruth, exists := tparent[truthNode]
+			if !exists {
+				ok = false
+				break
+			}
+			truthNode = nextTruth
+			reconNode, reconEdge = res.ReconParent[reconNode]
+		}
+
+		if !ok {
+			iso.EdgeWrong++
+			continue
+		}
+		if usedAnon {
+			iso.EdgeAnonOK++
+			continue
+		}
+		iso.EdgeExact++
+		if isSurvivor {
+			iso.SurvExact++
+		} else {
+			iso.NamedExact++
 		}
 	}
 	return iso
@@ -1273,9 +1412,9 @@ func DumpCGP2WrongDepths(truth []TruthSpan, res Result, dropped map[uint64]struc
 		}
 		// isolate the wrong "true parent survived, but we placed anon" cases
 		if res.ReconAnon[r] && !isDropped(tp) && cpd > 0 {
-			dx := tdepth[x]            // x = M_F, at R.Depth-1
-			lo := (dx / cpd) * cpd     // root's window top (R.Depth = dx+1)
-			gDepth := dx - 1           // true parent G depth = R.Depth-2
+			dx := tdepth[x]        // x = M_F, at R.Depth-1
+			lo := (dx / cpd) * cpd // root's window top (R.Depth = dx+1)
+			gDepth := dx - 1       // true parent G depth = R.Depth-2
 			if gDepth <= lo {
 				anonSurvExclBound++
 			} else {
@@ -1565,13 +1704,9 @@ func ReconstructPB2(survivors []Span, cfg Config) Result {
 	return ReconstructCGP2(survivors, cfg)
 }
 
-// ScorePB2Path grades a reconstruction by PATH correctness only: each emitted
-// bridge (fragment root -> chosen surviving anchor) is correct iff the anchor is
-// the fragment root's TRUE nearest surviving ancestor. Fan-out arity and the
-// synthetic chain between them are NOT graded — that is exactly what pb2 gives
-// up relative to cgp2. Returned in CGP2Iso shape so the harness tally/reporting
-// is shared: RealNodes = bridges scored, EdgeExact = correct reconnections,
-// EdgeWrong = wrong. A trace is "clean" (exclEmpty-correct) iff EdgeWrong == 0.
+// ScorePB2Path is the historical emitted-bridge-only diagnostic. It checks only
+// anchors, not missing obligations or synthetic gap lengths. Do not use it for
+// canonical accuracy; use ScorePBPathStrict.
 func ScorePB2Path(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
 	var iso CGP2Iso
 	if len(res.Bridges) == 0 {
@@ -1603,21 +1738,84 @@ func ScorePB2Path(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CG
 	return iso
 }
 
-// ScoreCGP2Strict grades a CGP reconstruction STRICTLY, and strictly harder than
-// the path scorer: a trace is correct only if BOTH
-//   (1) connectivity is right -- every fragment reconnects to its TRUE nearest
-//       surviving ancestor (exactly the check pb is graded on, via ScorePB2Path),
-//       so a wrong reconnection counts as wrong even when its synthetic chain is
-//       anonymous (it can't hide behind AnonOK), AND
-//   (2) topology is right -- the per-edge call-graph shape (ScoreCGP2Iso).
-// EdgeWrong sums both, so a clean trace (EdgeWrong==0) requires connectivity-clean
-// AND topology-clean; hence cgp-clean implies pb-clean, never the reverse. The
-// per-edge exact stats reported are the topology ones.
-func ScoreCGP2Strict(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
-	topo := ScoreCGP2Iso(res, truth, dropped)
-	conn := ScorePB2Path(res, truth, dropped) // connectivity: fragment -> true nearest surviving ancestor
-	topo.EdgeWrong += conn.EdgeWrong
-	return topo
+// ScorePBPathStrict is the canonical P-Bridge scorer. Every surviving fragment
+// root whose literal parent did not survive creates one observable
+// reconstruction obligation. Exactly one emitted bridge must reconnect that
+// root to its true nearest surviving ancestor with the depth-implied number of
+// anonymous synthetic levels. Missing bridges, duplicates, wrong anchors,
+// wrong gap lengths, and bridges for non-fragment roots are errors.
+//
+// Dropped subtrees with no surviving descendant create no fragment root and
+// are intentionally outside the score: no surviving P-Bridge record can reveal
+// them. This is the path-model counterpart of evidence-bounded CGP/SB3 scoring.
+func ScorePBPathStrict(res Result, survivors []Span, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
+	_ = dropped
+	var iso CGP2Iso
+	tparent := make(map[uint64]uint64, len(truth))
+	tdepth := make(map[uint64]int, len(truth))
+	for _, t := range truth {
+		tparent[t.SpanID] = t.ParentID
+		tdepth[t.SpanID] = t.Depth
+	}
+	surviving := make(map[uint64]bool, len(survivors))
+	for i := range survivors {
+		surviving[survivors[i].SpanID] = true
+	}
+
+	bridges := make(map[uint64][]Bridge, len(res.Bridges))
+	for _, b := range res.Bridges {
+		bridges[b.OrphanID] = append(bridges[b.OrphanID], b)
+	}
+	expected := make(map[uint64]bool)
+	for i := range survivors {
+		s := &survivors[i]
+		if s.ParentID == 0 || surviving[s.ParentID] {
+			continue
+		}
+		expected[s.SpanID] = true
+		iso.RealNodes++
+
+		anchor := tparent[s.SpanID]
+		for anchor != 0 && !surviving[anchor] {
+			next, exists := tparent[anchor]
+			if !exists {
+				anchor = 0
+				break
+			}
+			anchor = next
+		}
+		bs := bridges[s.SpanID]
+		if len(bs) != 1 || anchor == 0 {
+			iso.EdgeWrong++
+			continue
+		}
+		wantSynthetic := s.Depth - tdepth[anchor] - 1
+		if bs[0].AnchorID == anchor && bs[0].Synthetic == wantSynthetic {
+			iso.EdgeExact++
+		} else {
+			iso.EdgeWrong++
+		}
+	}
+	for orphan, bs := range bridges {
+		if !expected[orphan] {
+			iso.ConstraintWrong += len(bs)
+		}
+	}
+	return iso
+}
+
+// ScoreCGP2Strict is the canonical CGP/SB3 topology scorer.  It uses every
+// exact identity exposed by surviving records and forgives anonymous synthetic
+// identities only where no surviving record could name the corresponding truth
+// span.  The evidence-bounded path check also subsumes the old separate bridge
+// anchor audit: a chain ending at the wrong survivor is itself a wrong segment.
+//
+// dropped remains in the signature so all reconstruction harnesses use the
+// same truth/drop inputs; survivor records, rather than the drop set, define
+// what identities were actually observable.
+func ScoreCGP2Strict(res Result, survivors []Span, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
+	_ = dropped
+	return ScoreCGP2Evidence(res, survivors, truth)
 }
 
 // cgpGreedyCandidates is the LEAN candidate step for the greedy baselines. For
@@ -1863,27 +2061,59 @@ func ReconstructCGP1(survivors []Span, cfg Config) Result {
 	return greedyPathEmit(sk, cand, cfg)
 }
 
-// ReconstructPB0 / ReconstructCGP0 are the LEAN greedy baselines: identical to
-// pb1/cgp1 but with cgpGreedyCandidates (deepest match only, no candidate
-// forest). Same output as pb1/cgp1, just faster -- the faithful cost of the
-// original greedy algorithm. (cgp1/pb1 are kept as the in-between rung that
-// reuses the solver's full candidate generation.)
+// ReconstructPB0 is the maximal-evidence non-SAT path reconstructor. It shares
+// CGP0's exact-parent route units, same-parent Bloom corroboration, complete
+// admissible-anchor enumeration, and deterministic route fallback, but
+// NoFanout excludes HA topology evidence and sparse ordinals. Config.PB0Legacy
+// restores the former first-deepest-match implementation for diagnostics.
 func ReconstructPB0(survivors []Span, cfg Config) Result {
+	if cfg.PB0Legacy {
+		return ReconstructPB0Legacy(survivors, cfg)
+	}
+	cfg.NoFanout = true
+	cfg.SB3IgnoreOrdinals = true
+	topo, _ := reconstructFullEvidenceGreedyTopology(survivors, cfg)
+	return topo
+}
+
+func ReconstructPB0Legacy(survivors []Span, cfg Config) Result {
 	cfg.NoFanout = true
 	cfg.PoolJoinBlooms = false
 	sk := cgpParse(survivors, cfg)
 	cgpResolveEvidence(sk, cfg)
 	cgpResolveAnchors(sk, cfg)
 	cand := cgpGreedyCandidates(sk, cfg)
-	return greedyPathEmit(sk, cand, cfg)
+	res := greedyPathEmit(sk, cand, cfg)
+	res.GreedyMode = "legacy-lean"
+	res.GreedyParentConflicts, _, _ = sb3CheckHardEvidenceForMode(survivors, res, false)
+	res.GreedyHardConflicts = res.GreedyParentConflicts
+	return res
 }
 
 func ReconstructCGP0(survivors []Span, cfg Config) Result {
+	if cfg.CGP0Legacy {
+		return ReconstructCGP0Legacy(survivors, cfg)
+	}
+	// CGPRB has no sparse ordinal payload. Force the shared topology engine's
+	// ordinal layer off even if a caller accidentally reuses an SB3 config.
+	cfg.SB3IgnoreOrdinals = true
+	topo, _ := reconstructFullEvidenceGreedyTopology(survivors, cfg)
+	return topo
+}
+
+// ReconstructCGP0Legacy is the former CGP0 algorithm: choose only the deepest
+// Bloom-admissible anchor and opportunistically merge Bloom-confirmed HA
+// fanouts, without exact-parent route units or global hard-evidence pruning.
+func ReconstructCGP0Legacy(survivors []Span, cfg Config) Result {
 	cfg.NoFanout = false
 	cfg.PoolJoinBlooms = false
 	sk := cgpParse(survivors, cfg)
 	cgpResolveEvidence(sk, cfg)
 	cgpResolveAnchors(sk, cfg)
 	cand := cgpGreedyCandidates(sk, cfg)
-	return greedyPathEmit(sk, cand, cfg)
+	res := greedyPathEmit(sk, cand, cfg)
+	res.GreedyMode = "legacy-lean"
+	res.GreedyParentConflicts, res.GreedyHAConflicts, _ = sb3CheckHardEvidence(survivors, res)
+	res.GreedyHardConflicts = res.GreedyParentConflicts + res.GreedyHAConflicts
+	return res
 }

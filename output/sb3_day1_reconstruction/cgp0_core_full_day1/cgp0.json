@@ -1,0 +1,24 @@
+{
+  "mode": "cgp0",
+  "checkpoint_distance": 4,
+  "drop_rate": 0.5,
+  "bloom_fp": 0.0001,
+  "per_trace_drop_seed": true,
+  "order": "bottom-up",
+  "consistency": "chain",
+  "seed": 42,
+  "num_traces": 521305,
+  "topology_summary": {
+    "traces": 521305,
+    "feasible": 512334,
+    "empty": 8971,
+    "clean": 449871,
+    "real_nodes": 373784250,
+    "edge_exact": 241482021,
+    "edge_wrong": 399443,
+    "survivor_edges": 368249023,
+    "survivor_exact": 237288502,
+    "named_synthetic": 5535227,
+    "named_exact": 4193519
+  }
+}

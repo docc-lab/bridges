@@ -103,6 +103,11 @@ type Span struct {
 	// cgprb mode. Used to materialize dropped branch points and attach their
 	// direct children losslessly before bloom-threading.
 	HA []HAEntry
+
+	// SparseOrdinals is SB3's window-local sequence of non-first branch
+	// choices from the covering checkpoint to this carrier. Entries retain
+	// their lateral EE groups. Nil on non-carriers and outside SB3 mode.
+	SparseOrdinals []bridge.SB3Branch
 }
 
 // HAEntry is one decoded CGPRB hash-array record: a branching parent's exact
@@ -128,6 +133,48 @@ type Config struct {
 	// SBridgeLehmer selects the optional Lehmer-coded EE/DEE wire format.
 	// It must match SBridgeHandler.LehmerEE on the emitting side.
 	SBridgeLehmer bool
+
+	// SB3IgnoreOrdinals is a reconstruction ablation: retain the exact same SB3
+	// payload and all hard surviving-record/Bloom evidence, but do not use sparse
+	// ordinals to choose among greedy topology candidates. Final ordinal alignment
+	// remains available diagnostically but is not included in topology scoring.
+	SB3IgnoreOrdinals bool
+
+	// SB3TopoOnly records that the emitter intentionally omitted EE/DEE. The
+	// topology and sparse-ordinal layers still run, but callers should not score
+	// the lateral structure status as missing evidence.
+	SB3TopoOnly bool
+
+	// CGP0Legacy restores the original lean CGP0 implementation: pick the first
+	// deepest Bloom-admissible anchor, use HA only for opportunistic named joins,
+	// and leave ordinary dropped parents anonymous. The default CGP0 instead uses
+	// the full greedy evidence engine shared with SB3 (without sparse ordinals).
+	CGP0Legacy bool
+
+	// PB0Legacy restores the original first-deepest-match path baseline. The
+	// default PB0 uses the shared full-evidence greedy engine in NoFanout mode:
+	// exact ParentID route units, same-parent Bloom pooling, and admissible-route
+	// fallback, while deliberately ignoring HA/ordinal evidence unavailable to
+	// the P-Bridge model.
+	PB0Legacy bool
+
+	// GreedyNoGroupedEvidence disables cross-fragment Bloom intersection at
+	// exact ParentID and HA-witnessed fanout groups. Exact parent identities and
+	// hard HA ancestry remain enforced; this isolates the accuracy/runtime value
+	// of pooling Blooms that are proven to describe one upstream path.
+	GreedyNoGroupedEvidence bool
+
+	// GreedyNoHardHA treats HA identities only as optional Bloom-confirmed named
+	// fanouts instead of exact carrier-ancestry constraints. Final diagnostics
+	// still report violated HA facts. This is an evidence ablation, never the
+	// default.
+	GreedyNoHardHA bool
+
+	// GreedyNoRouteFallback evaluates only the ordinary first greedy route: the
+	// deepest anchor and preferred named intermediate nodes. By default, hard
+	// evidence may reject that route and the engine greedily tries the next
+	// admissible candidate.
+	GreedyNoRouteFallback bool
 
 	// NoOrdinal: place severed survivors by (depth, own-fp, parent-fp) only,
 	// dropping the ordinal discriminator (own-fp distinguishes siblings). Pairs
@@ -308,6 +355,23 @@ type Result struct {
 	// to have >=2 children). A named synthetic may be an exact parent, an HA
 	// fan-out, or both; this set marks the HA-witnessed ones.
 	ReconHAFanouts map[uint64]bool
+
+	// Greedy telemetry is populated by the full-evidence CGP0/SB3 topology
+	// engine. It remains zero-valued for legacy and non-greedy reconstructors.
+	GreedyMode                 string
+	GreedyCandidateEvaluations int
+	GreedyHardOverrides        int
+	GreedyHardConflicts        int
+	GreedyParentConflicts      int
+	GreedyHAConflicts          int
+
+	// SB3OrdinalChecked marks a topology produced by the SB3 reconstructor.
+	// Compatible is true only when every sparse chain aligned to its recovered
+	// fanouts without a missing carrier, duplicate/range error, or leftover
+	// ordinal. These fields stay zero-valued for all other reconstructors.
+	SB3OrdinalChecked    bool
+	SB3OrdinalCompatible bool
+	SB3OrdinalConflicts  int
 }
 
 // ReconstructPB reattaches orphaned spans using P-Bridge payloads. This is

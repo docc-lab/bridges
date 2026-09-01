@@ -635,9 +635,9 @@ func evalCGPRB(st *stats, tid uint64, events []corpus.StoredEvent, cfg recon.Con
 		cgp2DumpOnce.Do(func() { recon.DumpCGP2Edges(survivors, truth, res, dropped) })
 	}
 	if os.Getenv("TRACE_RECON_CGP2ISO") == "1" {
-		iso := recon.ScoreCGP2Iso(res, truth, dropped)
-		fmt.Fprintf(os.Stderr, "CGP2ISO realNodes=%d edgeExact=%d edgeAnonOK=%d edgeWrong=%d | survNodes=%d survExact=%d | namedSyn=%d namedExact=%d\n",
-			iso.RealNodes, iso.EdgeExact, iso.EdgeAnonOK, iso.EdgeWrong, iso.SurvNodes, iso.SurvExact, iso.NamedSyn, iso.NamedExact)
+		iso := recon.ScoreCGP2Strict(res, survivors, truth, dropped)
+		fmt.Fprintf(os.Stderr, "CGP2ISO realNodes=%d edgeExact=%d edgeAnonOK=%d edgeWrong=%d constraintWrong=%d | survNodes=%d survExact=%d | namedSyn=%d namedExact=%d\n",
+			iso.RealNodes, iso.EdgeExact, iso.EdgeAnonOK, iso.EdgeWrong, iso.ConstraintWrong, iso.SurvNodes, iso.SurvExact, iso.NamedSyn, iso.NamedExact)
 	}
 	if os.Getenv("TRACE_RECON_CGP2WRONGDEPTH") == "1" && len(res.ReconParent) > 0 {
 		recon.DumpCGP2WrongDepths(truth, res, dropped, cpd)

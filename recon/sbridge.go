@@ -42,6 +42,8 @@ type SBNode struct {
 	FPBits   int    // width in bits of FP: window root = ckpt-anchor bits (CkptBytes*8), interior fp width (e.g. 16), or 0 = none (bare leaf)
 	IsRoot   bool   // this node is a window anchor (its FP is the checkpoint-root prefix, never overwritten by an interior fp)
 	EE       []int  // this node's witnessed end-block (earlier-sibling ends before it started)
+	DEE      []int  // this node's attributed delayed-end block as a parent
+	EndOrder []int  // this node's children's reconstructed end ordinals
 	Children map[int]*SBNode
 }
 

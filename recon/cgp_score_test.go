@@ -23,6 +23,34 @@ func TestScoreCGP2EvidenceRequiresLiteralSurvivorParent(t *testing.T) {
 	}
 }
 
+func TestScoreCGP2HistoricalStrictForgivesNamedParentAsAnonymous(t *testing.T) {
+	truth := []TruthSpan{
+		{SpanID: 1, ParentID: 0, Depth: 0},
+		{SpanID: 2, ParentID: 1, Depth: 1},
+		{SpanID: 3, ParentID: 2, Depth: 2},
+	}
+	survivors := []Span{
+		{SpanID: 1, ParentID: 0, Depth: 0},
+		{SpanID: 3, ParentID: 2, Depth: 2},
+	}
+	res := Result{
+		ReconParent: map[uint64]uint64{3: 9, 9: 1},
+		ReconAnon:   map[uint64]bool{9: true},
+		Bridges:     []Bridge{{OrphanID: 3, AnchorID: 1, Synthetic: 1}},
+		Reconnected: 1,
+	}
+	dropped := map[uint64]struct{}{2: {}}
+
+	historical := ScoreCGP2HistoricalStrict(res, truth, dropped)
+	if !historical.Clean() {
+		t.Fatalf("historical control unexpectedly rejected anonymous named parent: %+v", historical)
+	}
+	canonical := ScoreCGP2Evidence(res, survivors, truth)
+	if canonical.EdgeWrong != 2 {
+		t.Fatalf("canonical EdgeWrong=%d, want 2 (wrong edge from 3 and missing named source 2): %+v", canonical.EdgeWrong, canonical)
+	}
+}
+
 func TestScoreCGP2EvidenceForgivesOnlyGenuinelyUnnameableSlots(t *testing.T) {
 	// Span 2 is absent from every surviving record.  Span 3 is nameable from
 	// survivor 4's ParentID, so only the single slot for span 2 may be anonymous.

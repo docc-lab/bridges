@@ -92,10 +92,10 @@ type Span struct {
 	// Mutually exclusive with BloomBits — a corpus is run in one mode.
 	CkptPrefix []byte
 
-	// LeafCarrier marks a span provably a leaf: it carries a _br payload at
-	// a non-checkpoint depth, and only leaves emit there. A leaf has no
-	// descendants, so it can never be a threading candidate — any bloom
-	// positive on it is a structurally impossible attachment.
+	// LeafCarrier distinguishes a leaf checkpoint from a periodic checkpoint:
+	// both carry _br and terminate a reconstruction window, but only a leaf
+	// checkpoint is provably unable to be a threading candidate. Any Bloom
+	// positive on a leaf is therefore a structurally impossible attachment.
 	LeafCarrier bool
 
 	// HA is the decoded CGPRB hash array: the in-window branch points this
@@ -365,6 +365,15 @@ type Result struct {
 	GreedyParentConflicts      int
 	GreedyHAConflicts          int
 
+	// GreedyChain records how the full-evidence CGP0/PB0/SB3 engine used
+	// nameable ancestor chains.  The reconstructor records evidence only; the
+	// evaluation harness joins Routes to ground truth after reconstruction.
+	GreedyChain GreedyChainStats
+
+	// GreedyFanout records how much HA/fanout evidence was available and used by
+	// the full-evidence topology engine. It is reconstruction telemetry only.
+	GreedyFanout GreedyFanoutStats
+
 	// SB3OrdinalChecked marks a topology produced by the SB3 reconstructor.
 	// Compatible is true only when every sparse chain aligned to its recovered
 	// fanouts without a missing carrier, duplicate/range error, or leftover
@@ -372,6 +381,67 @@ type Result struct {
 	SB3OrdinalChecked    bool
 	SB3OrdinalCompatible bool
 	SB3OrdinalConflicts  int
+}
+
+// GreedyRouteEvidence describes the probabilistic chain evidence supporting
+// one exact-parent route unit.  MatchedLevels counts distinct, non-checkpoint
+// ancestor IDs on the selected anchor-to-checkpoint chain that passed every
+// applicable carrier Bloom.  PositiveBloomChecks counts the individual
+// carrier lookups behind those level-wide matches.  The checkpoint itself is
+// exact prefix evidence and is deliberately not counted as a Bloom match.
+type GreedyRouteEvidence struct {
+	ParentID            uint64
+	OrphanIDs           []uint64
+	Routed              bool
+	AnchorID            uint64
+	AnchorDepth         int
+	CheckpointDepth     int
+	MatchedLevels       int
+	PositiveBloomChecks int
+	SupportingCarriers  int
+	// Fanout fields expose the branch-point evidence actually applicable to
+	// this route decision. They are measured before route selection and do not
+	// use ground truth.
+	RequiredHAFanouts           int
+	ApplicableFanoutGroups      int
+	ApplicableMultiBloomGroups  int
+	FanoutCandidateTests        int
+	FanoutBloomTests            int
+	FanoutCandidatesPruned      int
+	HardRouteCandidatesRejected int
+}
+
+// GreedyChainStats contains candidate-pruning and accepted-route telemetry.
+// CandidateInitialHits are surviving-anchor candidates returned by at least
+// one Bloom lookup.  Accepted/RejectedByMatchedLevels are keyed by the number
+// of complete nameable levels that passed before acceptance or rejection.
+type GreedyChainStats struct {
+	CandidateInitialHits         int
+	CandidateAccepted            int
+	CandidateRejected            int
+	CandidatePositiveBloomChecks int
+	AcceptedByMatchedLevels      map[int]int
+	RejectedAfterMatchedLevels   map[int]int
+	Routes                       []GreedyRouteEvidence
+}
+
+// GreedyFanoutStats separates evidence availability from its use. Counts are
+// per reconstructed trace and are aggregated by the evaluation harness.
+type GreedyFanoutStats struct {
+	HAEnabled                     bool
+	HAEntriesAvailable            int
+	HACarriersAvailable           int
+	DistinctHAFanoutsAvailable    int
+	RecoveredHAFanoutsUsed        int
+	RouteUnits                    int
+	RouteUnitsWithRequiredHA      int
+	RequiredHAConstraints         int
+	EvidenceGroups                int
+	WitnessedFanoutGroups         int
+	MultiBloomEvidenceGroups      int
+	GroupedAnchorCandidatesPruned int
+	GroupedFanoutCandidatesPruned int
+	HardRouteCandidatesRejected   int
 }
 
 // ReconstructPB reattaches orphaned spans using P-Bridge payloads. This is

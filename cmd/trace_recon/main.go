@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -73,6 +74,7 @@ type config struct {
 	tiePolicy          string // PCRS: thread-item tie resolution (aware|id|stop)
 	workers            int    // reconstruction worker goroutines (0 = NumCPU)
 	scoreAudit         bool   // fault-injection sensitivity audit of the scorer
+	compareScorers     bool   // CGP0 diagnostic: evaluate canonical and historical score/denominator contracts together
 	dumpRecon          string // serialize per-trace reconstruction artifacts (JSONL.gz) for recon_verify
 	verifyInline       bool   // run the independent checker in-process after every reconstruction
 	onlyTraces         string // comma-separated hex trace IDs: reconstruct ONLY these (drop RNG still advances for all -> exact survivors). Diagnostic.
@@ -130,6 +132,7 @@ func parseFlags() config {
 	flag.StringVar(&gapPolicy, "gap-policy", "continue", "PCRB threading at a zero-candidate level: continue (default) or stop (maximally FP-averse)")
 	flag.StringVar(&c.tiePolicy, "tie-policy", "aware", "PCRS threading tie resolution: aware (global bit-accounting, default), id (span-ID coin), or stop (abstain)")
 	flag.BoolVar(&c.scoreAudit, "score-audit", false, "Fault-injection sensitivity audit: per trace, inject known scoring errors into a copy of the reconstruction and require ScorePCR to detect each with the exact predicted counter delta (report on stderr)")
+	flag.BoolVar(&c.compareScorers, "compare-scorers", false, "CGP0 diagnostic: apply canonical evidence-bounded and historical permissive scorers to the same reconstruction and report both input-obligation and emitted-output denominators")
 	flag.StringVar(&c.dumpRecon, "dump-recon", "", "Write per-trace reconstruction artifacts (JSONL.gz) for standalone auditing by recon_verify")
 	flag.BoolVar(&c.verifyInline, "verify", false, "Run the independent structural/evidence checker (package verify) in-process after every reconstruction; violations reported at exit")
 	flag.Usage = func() {
@@ -153,6 +156,10 @@ func parseFlags() config {
 	}
 	if c.cgp0Legacy && c.mode != "cgp0" {
 		fmt.Fprintf(os.Stderr, "error: --cgp0-legacy requires --mode cgp0 (got %q)\n", c.mode)
+		os.Exit(2)
+	}
+	if c.compareScorers && c.mode != "cgp0" {
+		fmt.Fprintf(os.Stderr, "error: --compare-scorers requires --mode cgp0 (got %q)\n", c.mode)
 		os.Exit(2)
 	}
 	if c.pb0Legacy && c.mode != "pb0" {
@@ -246,15 +253,16 @@ type collSpan struct {
 
 // harness drives the per-trace collect -> drop -> reconstruct -> score loop.
 type harness struct {
-	h             bridge.Handler
-	mode          string // "pb" or "pcr": selects payload decode + reconstruction
-	fullsatEngine bool   // pcrs mode: use the single-pass ReconstructFullSAT engine
-	cfg           recon.Config
-	rng           *rand.Rand
-	dropAll       bool
-	rate          float64
-	seed          int64 // base drop seed (for per-trace reseeding)
-	perTraceSeed  bool  // reseed the drop RNG per-trace (order/partition-invariant)
+	h              bridge.Handler
+	mode           string // "pb" or "pcr": selects payload decode + reconstruction
+	fullsatEngine  bool   // pcrs mode: use the single-pass ReconstructFullSAT engine
+	cfg            recon.Config
+	rng            *rand.Rand
+	dropAll        bool
+	rate           float64
+	seed           int64 // base drop seed (for per-trace reseeding)
+	perTraceSeed   bool  // reseed the drop RNG per-trace (order/partition-invariant)
+	compareScorers bool  // emit a controlled canonical-vs-historical score comparison
 
 	spansByTID map[uint64][]collSpan
 	idxByKey   map[spanKey]int
@@ -373,6 +381,688 @@ type cgp2acc struct {
 	greedyChecked, greedyCandidates, greedyHardOverrides                                                  int64
 	greedyHardConflicts, greedyParentConflicts, greedyHAConflicts                                         int64
 	sb3                                                                                                   sb3acc
+	scoreComparison                                                                                       scorerComparisonAcc
+	chainEvidence                                                                                         chainEvidenceAcc
+	fanoutEvidence                                                                                        fanoutEvidenceAcc
+}
+
+type fanoutTraceBinAcc struct {
+	traces, clean int64
+}
+
+type fanoutWindowBinAcc struct {
+	windows, correct int64
+}
+
+type fanoutEvidenceAcc struct {
+	traces, clean, haEnabled, tracesWithHA int64
+	haEntries, haCarriers, distinctHA      int64
+	recoveredHA, routeUnits                int64
+	unitsWithRequiredHA, requiredHA        int64
+	evidenceGroups, witnessedGroups        int64
+	multiBloomGroups                       int64
+	groupedAnchorsPruned                   int64
+	groupedFanoutsPruned                   int64
+	hardRoutesRejected                     int64
+	sumDistinct, sumDistinctSq             float64
+	sumDistinctClean                       float64
+	byDistinctBucket                       map[int]*fanoutTraceBinAcc
+	windows, correctWindows                int64
+	haEntriesOnWindowPaths                 int64
+	haEntriesOffWindowPaths                int64
+	truthFanoutOccurrences                 int64
+	knownFanoutOccurrences                 int64
+	windowByHACount                        map[int]*fanoutWindowBinAcc
+	windowByKnownFanoutCount               map[int]*fanoutWindowBinAcc
+	windowByTruthFanoutCount               map[int]*fanoutWindowBinAcc
+	windowsWithFanouts                     int64
+	correctWindowsWithFanouts              int64
+	sumWindowHA, sumWindowHASq             float64
+	sumWindowHACorrect                     float64
+	sumWindowKnown, sumWindowKnownSq       float64
+	sumWindowKnownCorrect                  float64
+	sumWindowFanouts, sumWindowFanoutsSq   float64
+	sumWindowFanoutsCorrect                float64
+	sumCoverage, sumCoverageSq             float64
+	sumCoverageCorrect                     float64
+	sumKnownCoverage, sumKnownCoverageSq   float64
+	sumKnownCoverageCorrect                float64
+	coverageByBucket                       map[int]*fanoutWindowBinAcc
+	knownCoverageByBucket                  map[int]*fanoutWindowBinAcc
+	tracesWithWindows                      int64
+	cleanTracesWithWindows                 int64
+	sumTraceMeanHA, sumTraceMeanHASq       float64
+	sumTraceMeanHAClean                    float64
+	sumTraceMeanKnown, sumTraceMeanKnownSq float64
+	sumTraceMeanKnownClean                 float64
+	tracesWithFanoutOpportunities          int64
+	cleanTracesWithFanoutOpportunities     int64
+	sumTraceCoverage, sumTraceCoverageSq   float64
+	sumTraceCoverageClean                  float64
+	sumTraceKnownCoverage                  float64
+	sumTraceKnownCoverageSq                float64
+	sumTraceKnownCoverageClean             float64
+	routedUnits, correctAnchorRoutes       int64
+	correctTopologyRoutes                  int64
+	sumRouteRequiredHA                     float64
+	sumRouteRequiredHASq                   float64
+	sumRouteRequiredHACorrect              float64
+	sumRouteFanoutGroups                   float64
+	sumRouteFanoutGroupsSq                 float64
+	sumRouteFanoutGroupsCorrect            float64
+	sumRouteMultiBloomGroups               float64
+	sumRouteMultiBloomGroupsSq             float64
+	sumRouteMultiBloomGroupsCorrect        float64
+	sumRouteFanoutTests                    float64
+	sumRouteFanoutTestsSq                  float64
+	sumRouteFanoutTestsCorrect             float64
+	routeByRequiredHA                      map[int]*fanoutWindowBinAcc
+	routeByFanoutGroups                    map[int]*fanoutWindowBinAcc
+	routeByMultiBloomGroups                map[int]*fanoutWindowBinAcc
+	routeByFanoutTests                     map[int]*fanoutWindowBinAcc
+}
+
+func fanoutBucket(n int) int {
+	switch {
+	case n == 0:
+		return 0
+	case n == 1:
+		return 1
+	case n == 2:
+		return 2
+	case n <= 4:
+		return 3
+	case n <= 8:
+		return 4
+	case n <= 16:
+		return 5
+	case n <= 32:
+		return 6
+	default:
+		return 7
+	}
+}
+
+func windowHABucket(n int) int {
+	if n >= 5 {
+		return 5
+	}
+	return n
+}
+
+func coverageBucket(x float64) int {
+	switch {
+	case x == 0:
+		return 0
+	case x <= 0.25:
+		return 1
+	case x <= 0.50:
+		return 2
+	case x <= 0.75:
+		return 3
+	case x < 1:
+		return 4
+	default:
+		return 5
+	}
+}
+
+func (a *fanoutEvidenceAcc) add(s recon.GreedyFanoutStats, res recon.Result, survivors []recon.Span, truth []recon.TruthSpan, cpd int, clean bool) {
+	a.traces++
+	if clean {
+		a.clean++
+	}
+	if s.HAEnabled {
+		a.haEnabled++
+	}
+	if s.DistinctHAFanoutsAvailable > 0 {
+		a.tracesWithHA++
+	}
+	a.haEntries += int64(s.HAEntriesAvailable)
+	a.haCarriers += int64(s.HACarriersAvailable)
+	a.distinctHA += int64(s.DistinctHAFanoutsAvailable)
+	a.recoveredHA += int64(s.RecoveredHAFanoutsUsed)
+	a.routeUnits += int64(s.RouteUnits)
+	a.unitsWithRequiredHA += int64(s.RouteUnitsWithRequiredHA)
+	a.requiredHA += int64(s.RequiredHAConstraints)
+	a.evidenceGroups += int64(s.EvidenceGroups)
+	a.witnessedGroups += int64(s.WitnessedFanoutGroups)
+	a.multiBloomGroups += int64(s.MultiBloomEvidenceGroups)
+	a.groupedAnchorsPruned += int64(s.GroupedAnchorCandidatesPruned)
+	a.groupedFanoutsPruned += int64(s.GroupedFanoutCandidatesPruned)
+	a.hardRoutesRejected += int64(s.HardRouteCandidatesRejected)
+	x := float64(s.DistinctHAFanoutsAvailable)
+	a.sumDistinct += x
+	a.sumDistinctSq += x * x
+	if clean {
+		a.sumDistinctClean += x
+	}
+	if a.byDistinctBucket == nil {
+		a.byDistinctBucket = make(map[int]*fanoutTraceBinAcc)
+		a.windowByHACount = make(map[int]*fanoutWindowBinAcc)
+		a.windowByKnownFanoutCount = make(map[int]*fanoutWindowBinAcc)
+		a.windowByTruthFanoutCount = make(map[int]*fanoutWindowBinAcc)
+		a.coverageByBucket = make(map[int]*fanoutWindowBinAcc)
+		a.knownCoverageByBucket = make(map[int]*fanoutWindowBinAcc)
+		a.routeByRequiredHA = make(map[int]*fanoutWindowBinAcc)
+		a.routeByFanoutGroups = make(map[int]*fanoutWindowBinAcc)
+		a.routeByMultiBloomGroups = make(map[int]*fanoutWindowBinAcc)
+		a.routeByFanoutTests = make(map[int]*fanoutWindowBinAcc)
+	}
+	bucket := fanoutBucket(s.DistinctHAFanoutsAvailable)
+	b := a.byDistinctBucket[bucket]
+	if b == nil {
+		b = &fanoutTraceBinAcc{}
+		a.byDistinctBucket[bucket] = b
+	}
+	b.traces++
+	if clean {
+		b.clean++
+	}
+
+	trueParent := make(map[uint64]uint64, len(truth))
+	trueDepth := make(map[uint64]int, len(truth))
+	trueChildren := make(map[uint64]int, len(truth))
+	for _, span := range truth {
+		trueParent[span.SpanID] = span.ParentID
+		trueDepth[span.SpanID] = span.Depth
+		if span.ParentID != 0 {
+			trueChildren[span.ParentID]++
+		}
+	}
+	nameable := make(map[uint64]bool, len(survivors)*2)
+	survived := make(map[uint64]bool, len(survivors))
+	missingParentReferences := make(map[uint64]int)
+	knownFanouts := make(map[uint64]bool)
+	for _, span := range survivors {
+		survived[span.SpanID] = true
+		nameable[span.SpanID] = true
+		if span.ParentID != 0 {
+			nameable[span.ParentID] = true
+		}
+		for _, entry := range span.HA {
+			nameable[entry.ParentID] = true
+			knownFanouts[entry.ParentID] = true
+		}
+	}
+	for _, span := range survivors {
+		if span.ParentID != 0 && !survived[span.ParentID] {
+			missingParentReferences[span.ParentID]++
+		}
+	}
+	for parentID, references := range missingParentReferences {
+		if references >= 2 {
+			knownFanouts[parentID] = true
+		}
+	}
+	trueAnchor := func(id uint64) uint64 {
+		seen := make(map[uint64]bool)
+		for parent := trueParent[id]; parent != 0 && !seen[parent]; parent = trueParent[parent] {
+			seen[parent] = true
+			if survived[parent] {
+				return parent
+			}
+		}
+		return 0
+	}
+	routeTopologyCorrect := func(orphanID, anchorID uint64) bool {
+		truthNode, reconNode := orphanID, orphanID
+		seenTruth := make(map[uint64]bool)
+		for truthNode != anchorID && !seenTruth[truthNode] {
+			seenTruth[truthNode] = true
+			truthNext := trueParent[truthNode]
+			reconNext, exists := res.ReconParent[reconNode]
+			if truthNext == 0 || !exists {
+				return false
+			}
+			if nameable[truthNext] {
+				if reconNext != truthNext || res.ReconAnon[reconNext] {
+					return false
+				}
+			} else if !res.ReconAnon[reconNext] {
+				return false
+			}
+			truthNode, reconNode = truthNext, reconNext
+		}
+		return truthNode == anchorID && reconNode == anchorID
+	}
+	for _, route := range res.GreedyChain.Routes {
+		if !route.Routed {
+			continue
+		}
+		anchorCorrect := len(route.OrphanIDs) > 0
+		topologyCorrect := len(route.OrphanIDs) > 0
+		for _, orphanID := range route.OrphanIDs {
+			if route.AnchorID != trueAnchor(orphanID) {
+				anchorCorrect = false
+			}
+			if !routeTopologyCorrect(orphanID, trueAnchor(orphanID)) {
+				topologyCorrect = false
+			}
+		}
+		a.routedUnits++
+		if anchorCorrect {
+			a.correctAnchorRoutes++
+		}
+		if topologyCorrect {
+			a.correctTopologyRoutes++
+		}
+		addRouteMetric := func(x int, sum, sumSq, sumCorrect *float64, bins map[int]*fanoutWindowBinAcc) {
+			xf := float64(x)
+			*sum += xf
+			*sumSq += xf * xf
+			if topologyCorrect {
+				*sumCorrect += xf
+			}
+			bucket := windowHABucket(x)
+			b := bins[bucket]
+			if b == nil {
+				b = &fanoutWindowBinAcc{}
+				bins[bucket] = b
+			}
+			b.windows++
+			if topologyCorrect {
+				b.correct++
+			}
+		}
+		addRouteMetric(route.RequiredHAFanouts, &a.sumRouteRequiredHA, &a.sumRouteRequiredHASq, &a.sumRouteRequiredHACorrect, a.routeByRequiredHA)
+		addRouteMetric(route.ApplicableFanoutGroups, &a.sumRouteFanoutGroups, &a.sumRouteFanoutGroupsSq, &a.sumRouteFanoutGroupsCorrect, a.routeByFanoutGroups)
+		addRouteMetric(route.ApplicableMultiBloomGroups, &a.sumRouteMultiBloomGroups, &a.sumRouteMultiBloomGroupsSq, &a.sumRouteMultiBloomGroupsCorrect, a.routeByMultiBloomGroups)
+		addRouteMetric(route.FanoutCandidateTests, &a.sumRouteFanoutTests, &a.sumRouteFanoutTestsSq, &a.sumRouteFanoutTestsCorrect, a.routeByFanoutTests)
+	}
+	if cpd < 1 {
+		cpd = 1
+	}
+	traceWindows, traceHA, traceKnown, traceFanouts := 0, 0, 0, 0
+	for _, carrier := range survivors {
+		if carrier.Depth == 0 || carrier.BloomBits == nil {
+			continue
+		}
+		windowTop := (carrier.Depth / cpd) * cpd
+		if carrier.Depth%cpd == 0 {
+			// A periodic checkpoint closes the preceding full window. A leaf
+			// checkpoint closes the partial window below its periodic checkpoint.
+			windowTop -= cpd
+		}
+		steps := carrier.Depth - windowTop
+		pathIDs := make(map[uint64]bool, cpd)
+		fanouts := 0
+		known := 0
+		cur := carrier.SpanID
+		for {
+			parent := trueParent[cur]
+			if parent == 0 || trueDepth[parent] < windowTop {
+				break
+			}
+			pathIDs[parent] = true
+			if trueChildren[parent] >= 2 {
+				fanouts++
+				if knownFanouts[parent] {
+					known++
+				}
+			}
+			if trueDepth[parent] == windowTop {
+				break
+			}
+			cur = parent
+		}
+		haOnPath := make(map[uint64]bool)
+		for _, entry := range carrier.HA {
+			if pathIDs[entry.ParentID] {
+				haOnPath[entry.ParentID] = true
+			} else {
+				a.haEntriesOffWindowPaths++
+			}
+		}
+		nha := len(haOnPath)
+		localCorrect := true
+		truthNode, reconNode := carrier.SpanID, carrier.SpanID
+		for step := 0; step < steps; step++ {
+			truthNext := trueParent[truthNode]
+			reconNext, exists := res.ReconParent[reconNode]
+			if truthNext == 0 || !exists {
+				localCorrect = false
+				break
+			}
+			if nameable[truthNext] {
+				if reconNext != truthNext || res.ReconAnon[reconNext] {
+					localCorrect = false
+					break
+				}
+			} else if !res.ReconAnon[reconNext] {
+				localCorrect = false
+				break
+			}
+			truthNode, reconNode = truthNext, reconNext
+		}
+
+		a.windows++
+		a.haEntriesOnWindowPaths += int64(nha)
+		a.truthFanoutOccurrences += int64(fanouts)
+		a.knownFanoutOccurrences += int64(known)
+		traceWindows++
+		traceHA += nha
+		traceKnown += known
+		traceFanouts += fanouts
+		if localCorrect {
+			a.correctWindows++
+		}
+		xHA := float64(nha)
+		a.sumWindowHA += xHA
+		a.sumWindowHASq += xHA * xHA
+		if localCorrect {
+			a.sumWindowHACorrect += xHA
+		}
+		xKnown := float64(known)
+		a.sumWindowKnown += xKnown
+		a.sumWindowKnownSq += xKnown * xKnown
+		if localCorrect {
+			a.sumWindowKnownCorrect += xKnown
+		}
+		xFanouts := float64(fanouts)
+		a.sumWindowFanouts += xFanouts
+		a.sumWindowFanoutsSq += xFanouts * xFanouts
+		if localCorrect {
+			a.sumWindowFanoutsCorrect += xFanouts
+		}
+		hb := a.windowByHACount[windowHABucket(nha)]
+		if hb == nil {
+			hb = &fanoutWindowBinAcc{}
+			a.windowByHACount[windowHABucket(nha)] = hb
+		}
+		hb.windows++
+		if localCorrect {
+			hb.correct++
+		}
+		kb := a.windowByKnownFanoutCount[windowHABucket(known)]
+		if kb == nil {
+			kb = &fanoutWindowBinAcc{}
+			a.windowByKnownFanoutCount[windowHABucket(known)] = kb
+		}
+		kb.windows++
+		if localCorrect {
+			kb.correct++
+		}
+		fb := a.windowByTruthFanoutCount[windowHABucket(fanouts)]
+		if fb == nil {
+			fb = &fanoutWindowBinAcc{}
+			a.windowByTruthFanoutCount[windowHABucket(fanouts)] = fb
+		}
+		fb.windows++
+		if localCorrect {
+			fb.correct++
+		}
+		if fanouts > 0 {
+			a.windowsWithFanouts++
+			if localCorrect {
+				a.correctWindowsWithFanouts++
+			}
+			coverage := float64(nha) / float64(fanouts)
+			a.sumCoverage += coverage
+			a.sumCoverageSq += coverage * coverage
+			if localCorrect {
+				a.sumCoverageCorrect += coverage
+			}
+			knownCoverage := float64(known) / float64(fanouts)
+			a.sumKnownCoverage += knownCoverage
+			a.sumKnownCoverageSq += knownCoverage * knownCoverage
+			if localCorrect {
+				a.sumKnownCoverageCorrect += knownCoverage
+			}
+			cb := a.coverageByBucket[coverageBucket(coverage)]
+			if cb == nil {
+				cb = &fanoutWindowBinAcc{}
+				a.coverageByBucket[coverageBucket(coverage)] = cb
+			}
+			cb.windows++
+			if localCorrect {
+				cb.correct++
+			}
+			kcb := a.knownCoverageByBucket[coverageBucket(knownCoverage)]
+			if kcb == nil {
+				kcb = &fanoutWindowBinAcc{}
+				a.knownCoverageByBucket[coverageBucket(knownCoverage)] = kcb
+			}
+			kcb.windows++
+			if localCorrect {
+				kcb.correct++
+			}
+		}
+	}
+	if traceWindows > 0 {
+		a.tracesWithWindows++
+		if clean {
+			a.cleanTracesWithWindows++
+		}
+		meanHA := float64(traceHA) / float64(traceWindows)
+		a.sumTraceMeanHA += meanHA
+		a.sumTraceMeanHASq += meanHA * meanHA
+		if clean {
+			a.sumTraceMeanHAClean += meanHA
+		}
+		meanKnown := float64(traceKnown) / float64(traceWindows)
+		a.sumTraceMeanKnown += meanKnown
+		a.sumTraceMeanKnownSq += meanKnown * meanKnown
+		if clean {
+			a.sumTraceMeanKnownClean += meanKnown
+		}
+	}
+	if traceFanouts > 0 {
+		a.tracesWithFanoutOpportunities++
+		if clean {
+			a.cleanTracesWithFanoutOpportunities++
+		}
+		coverage := float64(traceHA) / float64(traceFanouts)
+		a.sumTraceCoverage += coverage
+		a.sumTraceCoverageSq += coverage * coverage
+		if clean {
+			a.sumTraceCoverageClean += coverage
+		}
+		knownCoverage := float64(traceKnown) / float64(traceFanouts)
+		a.sumTraceKnownCoverage += knownCoverage
+		a.sumTraceKnownCoverageSq += knownCoverage * knownCoverage
+		if clean {
+			a.sumTraceKnownCoverageClean += knownCoverage
+		}
+	}
+}
+
+type chainLengthAcc struct {
+	units, correctUnits, wrongUnits       int64
+	orphans, correctOrphans, wrongOrphans int64
+}
+
+type chainTraceAcc struct {
+	traces, clean int64
+}
+
+// chainEvidenceAcc correlates reconstructor-side chain evidence with
+// evaluator-side outcomes.  Route correctness is nearest-surviving-anchor
+// correctness; trace correctness is the canonical topology score.
+type chainEvidenceAcc struct {
+	candidateInitialHits, candidateAccepted, candidateRejected int64
+	candidatePositiveBloomChecks                               int64
+	acceptedByLevels, rejectedAfterLevels                      map[int]int64
+	routedUnits, unroutedUnits                                 int64
+	routedOrphans, unroutedOrphans                             int64
+	correctUnits, wrongUnits                                   int64
+	correctOrphans, wrongOrphans                               int64
+	sumMatchedLevels, sumPositiveChecks                        int64
+	byLevels                                                   map[int]*chainLengthAcc
+	allRoutedTraces, allRoutedClean                            int64
+	tracesWithUnrouted                                         int64
+	traceByMin                                                 map[int]*chainTraceAcc
+	sumMean, sumMeanSq, sumMeanClean                           float64
+	sumMin, sumMinSq, sumMinClean                              float64
+	sumChecks, sumChecksSq, sumChecksClean                     float64
+}
+
+func (a *chainEvidenceAcc) add(chain recon.GreedyChainStats, truth []recon.TruthSpan, dropped map[uint64]struct{}, traceClean bool) {
+	a.candidateInitialHits += int64(chain.CandidateInitialHits)
+	a.candidateAccepted += int64(chain.CandidateAccepted)
+	a.candidateRejected += int64(chain.CandidateRejected)
+	a.candidatePositiveBloomChecks += int64(chain.CandidatePositiveBloomChecks)
+	if a.acceptedByLevels == nil {
+		a.acceptedByLevels = make(map[int]int64)
+		a.rejectedAfterLevels = make(map[int]int64)
+		a.byLevels = make(map[int]*chainLengthAcc)
+		a.traceByMin = make(map[int]*chainTraceAcc)
+	}
+	for levels, count := range chain.AcceptedByMatchedLevels {
+		a.acceptedByLevels[levels] += int64(count)
+	}
+	for levels, count := range chain.RejectedAfterMatchedLevels {
+		a.rejectedAfterLevels[levels] += int64(count)
+	}
+
+	trueParent := make(map[uint64]uint64, len(truth))
+	for _, s := range truth {
+		trueParent[s.SpanID] = s.ParentID
+	}
+	trueAnchor := func(id uint64) uint64 {
+		seen := make(map[uint64]bool)
+		for p := trueParent[id]; p != 0 && !seen[p]; p = trueParent[p] {
+			seen[p] = true
+			if _, gone := dropped[p]; !gone {
+				return p
+			}
+		}
+		return 0
+	}
+
+	routed, unrouted := 0, 0
+	minLevels, sumLevels, sumChecks := 0, 0, 0
+	for _, route := range chain.Routes {
+		if !route.Routed {
+			a.unroutedUnits++
+			a.unroutedOrphans += int64(len(route.OrphanIDs))
+			unrouted++
+			continue
+		}
+		a.routedUnits++
+		a.routedOrphans += int64(len(route.OrphanIDs))
+		a.sumMatchedLevels += int64(route.MatchedLevels)
+		a.sumPositiveChecks += int64(route.PositiveBloomChecks)
+		routed++
+		sumLevels += route.MatchedLevels
+		sumChecks += route.PositiveBloomChecks
+		if routed == 1 || route.MatchedLevels < minLevels {
+			minLevels = route.MatchedLevels
+		}
+		bin := a.byLevels[route.MatchedLevels]
+		if bin == nil {
+			bin = &chainLengthAcc{}
+			a.byLevels[route.MatchedLevels] = bin
+		}
+		bin.units++
+		bin.orphans += int64(len(route.OrphanIDs))
+		unitCorrect := len(route.OrphanIDs) > 0
+		for _, orphan := range route.OrphanIDs {
+			if route.AnchorID == trueAnchor(orphan) {
+				a.correctOrphans++
+				bin.correctOrphans++
+			} else {
+				a.wrongOrphans++
+				bin.wrongOrphans++
+				unitCorrect = false
+			}
+		}
+		if unitCorrect {
+			a.correctUnits++
+			bin.correctUnits++
+		} else {
+			a.wrongUnits++
+			bin.wrongUnits++
+		}
+	}
+	if unrouted > 0 {
+		a.tracesWithUnrouted++
+	}
+	if routed == 0 || unrouted != 0 {
+		return
+	}
+	a.allRoutedTraces++
+	y := 0.0
+	if traceClean {
+		a.allRoutedClean++
+		y = 1
+	}
+	mean := float64(sumLevels) / float64(routed)
+	meanChecks := float64(sumChecks) / float64(routed)
+	a.sumMean += mean
+	a.sumMeanSq += mean * mean
+	a.sumMeanClean += mean * y
+	a.sumMin += float64(minLevels)
+	a.sumMinSq += float64(minLevels * minLevels)
+	a.sumMinClean += float64(minLevels) * y
+	a.sumChecks += meanChecks
+	a.sumChecksSq += meanChecks * meanChecks
+	a.sumChecksClean += meanChecks * y
+	tb := a.traceByMin[minLevels]
+	if tb == nil {
+		tb = &chainTraceAcc{}
+		a.traceByMin[minLevels] = tb
+	}
+	tb.traces++
+	if traceClean {
+		tb.clean++
+	}
+}
+
+// scorerComparisonAcc records the two independent changes between the old and
+// canonical CGP0 evaluation contracts: the scorer and the trace denominator.
+// "obligation" is determined solely from surviving records; "emitted" is the
+// historical res.Reconnected > 0 inclusion rule and therefore depends on the
+// algorithm's output.
+type scorerComparisonAcc struct {
+	traces, obligations, emitted, obligationAndEmitted, obligationNoEmission, emissionNoObligation int
+	canonicalCleanObligations, historicalCleanObligations                                          int
+	canonicalCleanEmitted, historicalCleanEmitted                                                  int
+	bothCleanObligations, canonicalOnlyCleanObligations                                            int
+	historicalOnlyCleanObligations, bothWrongObligations                                           int
+	canonicalWrongSegments, historicalWrongUnits                                                   int
+}
+
+func (a *scorerComparisonAcc) add(obligation, emitted bool, canonical, historical recon.CGP2Iso) {
+	a.traces++
+	if obligation {
+		a.obligations++
+		a.canonicalWrongSegments += canonical.Wrong()
+		a.historicalWrongUnits += historical.Wrong()
+		cc, hc := canonical.Clean(), historical.Clean()
+		if cc {
+			a.canonicalCleanObligations++
+		}
+		if hc {
+			a.historicalCleanObligations++
+		}
+		switch {
+		case cc && hc:
+			a.bothCleanObligations++
+		case cc:
+			a.canonicalOnlyCleanObligations++
+		case hc:
+			a.historicalOnlyCleanObligations++
+		default:
+			a.bothWrongObligations++
+		}
+	}
+	if emitted {
+		a.emitted++
+		if canonical.Clean() {
+			a.canonicalCleanEmitted++
+		}
+		if historical.Clean() {
+			a.historicalCleanEmitted++
+		}
+	}
+	if obligation && emitted {
+		a.obligationAndEmitted++
+	} else if obligation {
+		a.obligationNoEmission++
+	} else if emitted {
+		a.emissionNoObligation++
+	}
 }
 
 // sb3acc preserves the evidence-specific telemetry returned by the dedicated
@@ -555,24 +1245,25 @@ func newHarness(c config) *harness {
 		workers = runtime.NumCPU()
 	}
 	ha := &harness{
-		h:             h,
-		mode:          c.mode,
-		topoOn:        os.Getenv("TRACE_RECON_TOPO") == "1",
-		cpd:           c.checkpointDistance,
-		wrongLog:      wlog,
-		cfg:           cfg,
-		rng:           rand.New(rand.NewSource(c.seed)),
-		dropAll:       c.dropRate >= 1.0,
-		rate:          c.dropRate,
-		seed:          c.seed,
-		perTraceSeed:  c.perTraceDropSeed,
-		spansByTID:    make(map[uint64][]collSpan),
-		idxByKey:      make(map[spanKey]int),
-		openByTID:     make(map[uint64]int),
-		nextSeq:       make(map[uint64]map[uint64]int),
-		eventPosByTID: make(map[uint64]int64),
-		deesByTID:     make(map[uint64][]bridge.DEEQuad),
-		jobs:          make(chan finishJob, workers*2),
+		h:              h,
+		mode:           c.mode,
+		topoOn:         os.Getenv("TRACE_RECON_TOPO") == "1",
+		cpd:            c.checkpointDistance,
+		wrongLog:       wlog,
+		cfg:            cfg,
+		rng:            rand.New(rand.NewSource(c.seed)),
+		dropAll:        c.dropRate >= 1.0,
+		rate:           c.dropRate,
+		seed:           c.seed,
+		perTraceSeed:   c.perTraceDropSeed,
+		compareScorers: c.compareScorers,
+		spansByTID:     make(map[uint64][]collSpan),
+		idxByKey:       make(map[spanKey]int),
+		openByTID:      make(map[uint64]int),
+		nextSeq:        make(map[uint64]map[uint64]int),
+		eventPosByTID:  make(map[uint64]int64),
+		deesByTID:      make(map[uint64][]bridge.DEEQuad),
+		jobs:           make(chan finishJob, workers*2),
 	}
 	if sh, ok := h.(*bridge.SB3Handler); ok {
 		sh.DEESink = func(tid uint64, raw []byte) {
@@ -861,8 +1552,8 @@ func mixSeed(tid uint64, base int64) int64 {
 	return int64(x)
 }
 
-// computeDropped applies the drop policy to a trace's spans. Only non-checkpoint
-// spans (no _br) are candidates; _br carriers are never dropped. With
+// computeDropped applies the drop policy to a trace's spans. Only spans without
+// _br are candidates; every _br emitter is a checkpoint and is never dropped. With
 // perTraceSeed, draws come from a per-trace RNG over spans in spanID order, so
 // the result is independent of processing order / corpus partitioning;
 // otherwise it advances the single global RNG stream (legacy, order-dependent).
@@ -964,8 +1655,8 @@ func (ha *harness) finishTrace(tid uint64) {
 		delete(ha.idxByKey, spanKey{tid, s.spanID})
 	}
 
-	// Drop policy: only non-checkpoint spans (no _br) are candidates;
-	// _br carriers ride the high-priority queue and are never dropped.
+	// Drop policy: only spans without _br are candidates. Every _br emitter is
+	// a checkpoint; checkpoints ride the high-priority queue and are never dropped.
 	if len(ha.mdRates) > 0 {
 		dm := ha.computeDroppedMulti(tid, spans)
 		dees := append([]bridge.DEEQuad(nil), ha.deesByTID[tid]...)
@@ -1116,6 +1807,10 @@ func (ha *harness) process(j finishJob) {
 		ha.recRecon(tid, len(survivors), len(truth), len(dropped), !empty, d)
 		scoreStart := time.Now()
 		iso := ha.cg2ScoreOf(res, survivors, truth, dropped)
+		var historical recon.CGP2Iso
+		if ha.compareScorers {
+			historical = recon.ScoreCGP2HistoricalStrict(res, truth, dropped)
+		}
 		var structure *recon.StructureResult
 		if sb3 != nil && iso.Clean() && sb3.Compatible && !ha.cfg.SB3TopoOnly {
 			stTruth, endPos := sb3StructureTruth(spans)
@@ -1135,7 +1830,14 @@ func (ha *harness) process(j finishJob) {
 		}
 		ha.mu.Lock()
 		ha.cg2.nt++
+		if ha.compareScorers {
+			ha.cg2.scoreComparison.add(!empty, res.Reconnected > 0, iso, historical)
+		}
 		ha.cg2.sb3.add(sb3)
+		ha.cg2.chainEvidence.add(res.GreedyChain, truth, dropped, iso.Clean())
+		if res.GreedyMode == "full-evidence" {
+			ha.cg2.fanoutEvidence.add(res.GreedyFanout, res, survivors, truth, ha.cpd, iso.Clean())
+		}
 		if structure != nil {
 			ha.cg2.sb3.addStructure(*structure, sb3.StructureStatus)
 		}
@@ -1352,7 +2054,9 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 	}
 	type cell struct {
 		empty                 bool
+		emitted               bool
 		iso                   recon.CGP2Iso
+		historical            recon.CGP2Iso
 		sb3                   *recon.SB3Result
 		structure             *recon.StructureResult
 		nsurv, ndrop          int
@@ -1363,6 +2067,10 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 		greedyHardConflicts   int
 		greedyParentConflicts int
 		greedyHAConflicts     int
+		greedyChain           recon.GreedyChainStats
+		greedyFanout          recon.GreedyFanoutStats
+		result                recon.Result
+		survivors             []recon.Span
 	}
 	cells := make([]cell, len(ha.mdRates))
 	for r := range ha.mdRates {
@@ -1379,6 +2087,10 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 		ns := time.Since(t0).Nanoseconds()
 		empty := !hasReconstructionObligation(survivors)
 		iso := ha.cg2ScoreOf(res, survivors, truth, dropped)
+		var historical recon.CGP2Iso
+		if ha.compareScorers {
+			historical = recon.ScoreCGP2HistoricalStrict(res, truth, dropped)
+		}
 		var structure *recon.StructureResult
 		if sb3 != nil && iso.Clean() && sb3.Compatible && !ha.cfg.SB3TopoOnly {
 			stTruth, endPos := sb3StructureTruth(spans)
@@ -1386,10 +2098,14 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			structure = &sr
 		}
 		cells[r] = cell{
-			empty: empty, iso: iso, nsurv: len(survivors), ndrop: len(dropped), ns: ns, sb3: sb3, structure: structure,
+			empty: empty, emitted: res.Reconnected > 0, iso: iso, historical: historical,
+			nsurv: len(survivors), ndrop: len(dropped), ns: ns, sb3: sb3, structure: structure,
 			greedyMode: res.GreedyMode, greedyCandidates: res.GreedyCandidateEvaluations,
 			greedyHardOverrides: res.GreedyHardOverrides, greedyHardConflicts: res.GreedyHardConflicts,
 			greedyParentConflicts: res.GreedyParentConflicts, greedyHAConflicts: res.GreedyHAConflicts,
+			greedyChain:  res.GreedyChain,
+			greedyFanout: res.GreedyFanout,
+			result:       res, survivors: survivors,
 		}
 	}
 	for r, c := range cells {
@@ -1407,7 +2123,14 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 		c := cells[r]
 		a := &ha.mdAcc[r]
 		a.nt++
+		if ha.compareScorers {
+			a.scoreComparison.add(!c.empty, c.emitted, c.iso, c.historical)
+		}
 		a.sb3.add(c.sb3)
+		a.chainEvidence.add(c.greedyChain, truth, j.droppedMulti[r], c.iso.Clean())
+		if c.greedyMode == "full-evidence" {
+			a.fanoutEvidence.add(c.greedyFanout, c.result, c.survivors, truth, ha.cpd, c.iso.Clean())
+		}
 		if c.structure != nil {
 			a.sb3.addStructure(*c.structure, c.sb3.StructureStatus)
 		}
@@ -1677,21 +2400,434 @@ type sb3Summary struct {
 }
 
 type greedySummary struct {
-	Mode                 string `json:"mode"`
-	Checked              int64  `json:"checked"`
-	CandidateEvaluations int64  `json:"candidate_evaluations"`
-	HardOverrides        int64  `json:"hard_overrides"`
-	HardConflicts        int64  `json:"hard_conflicts"`
-	ParentConflicts      int64  `json:"parent_conflicts"`
-	HAConflicts          int64  `json:"ha_conflicts"`
+	Mode                 string                 `json:"mode"`
+	Checked              int64                  `json:"checked"`
+	CandidateEvaluations int64                  `json:"candidate_evaluations"`
+	HardOverrides        int64                  `json:"hard_overrides"`
+	HardConflicts        int64                  `json:"hard_conflicts"`
+	ParentConflicts      int64                  `json:"parent_conflicts"`
+	HAConflicts          int64                  `json:"ha_conflicts"`
+	FanoutEvidence       *fanoutEvidenceSummary `json:"fanout_evidence,omitempty"`
+}
+
+type fanoutTraceBin struct {
+	DistinctHAFanouts string  `json:"distinct_ha_fanouts"`
+	Traces            int64   `json:"traces"`
+	CanonicalClean    int64   `json:"canonical_clean"`
+	CleanRate         float64 `json:"canonical_clean_rate"`
+}
+
+type fanoutWindowBin struct {
+	Bucket      string  `json:"bucket"`
+	Windows     int64   `json:"windows"`
+	Correct     int64   `json:"locally_correct"`
+	CorrectRate float64 `json:"local_correct_rate"`
+}
+
+type fanoutRouteBin struct {
+	Bucket     string  `json:"bucket"`
+	RouteUnits int64   `json:"route_units"`
+	Correct    int64   `json:"topology_correct"`
+	Accuracy   float64 `json:"topology_accuracy"`
+}
+
+type fanoutEvidenceSummary struct {
+	Traces                               int64             `json:"traces"`
+	CanonicalClean                       int64             `json:"canonical_clean"`
+	HAEnabled                            bool              `json:"ha_enabled"`
+	TracesWithHA                         int64             `json:"traces_with_ha"`
+	HAEntriesAvailable                   int64             `json:"ha_entries_available"`
+	HACarriersAvailable                  int64             `json:"ha_carriers_available"`
+	DistinctHAFanoutsAvailable           int64             `json:"distinct_ha_fanouts_available"`
+	MeanHAEntriesPerTrace                float64           `json:"mean_ha_entries_per_trace"`
+	MeanDistinctHAFanoutsPerTrace        float64           `json:"mean_distinct_ha_fanouts_per_trace"`
+	RecoveredHAFanoutsUsed               int64             `json:"recovered_ha_fanouts_used"`
+	RouteUnits                           int64             `json:"route_units"`
+	RouteUnitsWithRequiredHA             int64             `json:"route_units_with_required_ha"`
+	RequiredHAConstraints                int64             `json:"required_ha_constraints"`
+	EvidenceGroups                       int64             `json:"exact_parent_or_ha_evidence_groups"`
+	WitnessedFanoutGroups                int64             `json:"witnessed_fanout_groups"`
+	MultiBloomEvidenceGroups             int64             `json:"multi_bloom_evidence_groups"`
+	GroupedAnchorCandidatesPruned        int64             `json:"grouped_anchor_candidates_pruned"`
+	GroupedFanoutCandidatesPruned        int64             `json:"grouped_fanout_candidates_pruned"`
+	HardRouteCandidatesRejected          int64             `json:"hard_route_candidates_rejected"`
+	PearsonDistinctHAVsCanonicalClean    *float64          `json:"pearson_distinct_ha_fanouts_vs_canonical_clean"`
+	TracePerformanceByDistinctHA         []fanoutTraceBin  `json:"trace_performance_by_distinct_ha_fanouts"`
+	CarrierWindows                       int64             `json:"carrier_windows"`
+	LocallyCorrectWindows                int64             `json:"locally_correct_carrier_windows"`
+	HAEntriesOnWindowPaths               int64             `json:"ha_entries_on_window_paths"`
+	HAEntriesOffWindowPaths              int64             `json:"ha_entries_off_window_paths"`
+	TruthFanoutOccurrences               int64             `json:"truth_fanout_occurrences_on_window_paths"`
+	KnownFanoutOccurrences               int64             `json:"known_fanout_occurrences_on_window_paths"`
+	MeanHAEntriesPerWindow               float64           `json:"mean_ha_entries_per_carrier_window"`
+	WeightedHAPathCoverage               float64           `json:"weighted_ha_path_coverage"`
+	WeightedKnownFanoutPathCoverage      float64           `json:"weighted_known_fanout_path_coverage"`
+	PearsonWindowHAVsLocalCorrect        *float64          `json:"pearson_window_ha_count_vs_local_path_correct"`
+	PearsonWindowKnownVsLocalCorrect     *float64          `json:"pearson_window_known_fanout_count_vs_local_path_correct"`
+	PearsonWindowFanoutsVsLocalCorrect   *float64          `json:"pearson_window_truth_fanout_count_vs_local_path_correct"`
+	PearsonWindowCoverageVsLocalCorrect  *float64          `json:"pearson_window_ha_coverage_vs_local_path_correct"`
+	PearsonKnownCoverageVsLocalCorrect   *float64          `json:"pearson_window_known_fanout_coverage_vs_local_path_correct"`
+	PearsonTraceMeanHAVsClean            *float64          `json:"pearson_trace_mean_window_ha_vs_canonical_clean"`
+	PearsonTraceMeanKnownVsClean         *float64          `json:"pearson_trace_mean_known_fanouts_vs_canonical_clean"`
+	PearsonTraceCoverageVsClean          *float64          `json:"pearson_trace_ha_coverage_vs_canonical_clean"`
+	PearsonTraceKnownCoverageVsClean     *float64          `json:"pearson_trace_known_fanout_coverage_vs_canonical_clean"`
+	WindowPerformanceByHACount           []fanoutWindowBin `json:"window_performance_by_ha_count"`
+	WindowPerformanceByKnownCount        []fanoutWindowBin `json:"window_performance_by_known_fanout_count"`
+	WindowPerformanceByTruthFanoutCount  []fanoutWindowBin `json:"window_performance_by_truth_fanout_count"`
+	WindowPerformanceByHACoverage        []fanoutWindowBin `json:"window_performance_by_ha_coverage"`
+	WindowPerformanceByKnownCoverage     []fanoutWindowBin `json:"window_performance_by_known_fanout_coverage"`
+	RoutedUnitsMeasured                  int64             `json:"routed_units_measured"`
+	CorrectAnchorRoutes                  int64             `json:"correct_anchor_routes"`
+	CorrectTopologyRoutes                int64             `json:"correct_topology_routes"`
+	MeanRequiredHAFanoutsPerRoute        float64           `json:"mean_required_ha_fanouts_per_route"`
+	MeanApplicableFanoutGroupsPerRoute   float64           `json:"mean_applicable_fanout_groups_per_route"`
+	MeanMultiBloomFanoutGroupsPerRoute   float64           `json:"mean_multi_bloom_fanout_groups_per_route"`
+	MeanFanoutCandidateTestsPerRoute     float64           `json:"mean_fanout_candidate_tests_per_route"`
+	PearsonRequiredHAVsTopologyCorrect   *float64          `json:"pearson_required_ha_fanouts_vs_route_topology_correct"`
+	PearsonFanoutGroupsVsTopologyCorrect *float64          `json:"pearson_applicable_fanout_groups_vs_route_topology_correct"`
+	PearsonMultiBloomVsTopologyCorrect   *float64          `json:"pearson_multi_bloom_fanout_groups_vs_route_topology_correct"`
+	PearsonFanoutTestsVsTopologyCorrect  *float64          `json:"pearson_fanout_candidate_tests_vs_route_topology_correct"`
+	RoutePerformanceByRequiredHA         []fanoutRouteBin  `json:"route_performance_by_required_ha_fanouts"`
+	RoutePerformanceByFanoutGroups       []fanoutRouteBin  `json:"route_performance_by_applicable_fanout_groups"`
+	RoutePerformanceByMultiBloomGroups   []fanoutRouteBin  `json:"route_performance_by_multi_bloom_fanout_groups"`
+	RoutePerformanceByFanoutTests        []fanoutRouteBin  `json:"route_performance_by_fanout_candidate_tests"`
+}
+
+func summarizeFanoutEvidence(a fanoutEvidenceAcc) *fanoutEvidenceSummary {
+	if a.traces == 0 {
+		return nil
+	}
+	s := &fanoutEvidenceSummary{
+		Traces: a.traces, CanonicalClean: a.clean, HAEnabled: a.haEnabled == a.traces,
+		TracesWithHA: a.tracesWithHA, HAEntriesAvailable: a.haEntries,
+		HACarriersAvailable: a.haCarriers, DistinctHAFanoutsAvailable: a.distinctHA,
+		MeanHAEntriesPerTrace:         float64(a.haEntries) / float64(a.traces),
+		MeanDistinctHAFanoutsPerTrace: float64(a.distinctHA) / float64(a.traces),
+		RecoveredHAFanoutsUsed:        a.recoveredHA, RouteUnits: a.routeUnits,
+		RouteUnitsWithRequiredHA: a.unitsWithRequiredHA, RequiredHAConstraints: a.requiredHA,
+		EvidenceGroups: a.evidenceGroups, WitnessedFanoutGroups: a.witnessedGroups,
+		MultiBloomEvidenceGroups:      a.multiBloomGroups,
+		GroupedAnchorCandidatesPruned: a.groupedAnchorsPruned,
+		GroupedFanoutCandidatesPruned: a.groupedFanoutsPruned,
+		HardRouteCandidatesRejected:   a.hardRoutesRejected,
+		CarrierWindows:                a.windows, LocallyCorrectWindows: a.correctWindows,
+		HAEntriesOnWindowPaths:  a.haEntriesOnWindowPaths,
+		HAEntriesOffWindowPaths: a.haEntriesOffWindowPaths,
+		TruthFanoutOccurrences:  a.truthFanoutOccurrences,
+		KnownFanoutOccurrences:  a.knownFanoutOccurrences,
+	}
+	if a.windows > 0 {
+		s.MeanHAEntriesPerWindow = float64(a.haEntriesOnWindowPaths) / float64(a.windows)
+	}
+	if a.truthFanoutOccurrences > 0 {
+		s.WeightedHAPathCoverage = float64(a.haEntriesOnWindowPaths) / float64(a.truthFanoutOccurrences)
+		s.WeightedKnownFanoutPathCoverage = float64(a.knownFanoutOccurrences) / float64(a.truthFanoutOccurrences)
+	}
+	s.PearsonDistinctHAVsCanonicalClean = pointBiserial(
+		a.traces, a.sumDistinct, a.sumDistinctSq, float64(a.clean), a.sumDistinctClean,
+	)
+	s.PearsonWindowHAVsLocalCorrect = pointBiserial(
+		a.windows, a.sumWindowHA, a.sumWindowHASq, float64(a.correctWindows), a.sumWindowHACorrect,
+	)
+	s.PearsonWindowKnownVsLocalCorrect = pointBiserial(
+		a.windows, a.sumWindowKnown, a.sumWindowKnownSq, float64(a.correctWindows), a.sumWindowKnownCorrect,
+	)
+	s.PearsonWindowFanoutsVsLocalCorrect = pointBiserial(
+		a.windows, a.sumWindowFanouts, a.sumWindowFanoutsSq, float64(a.correctWindows), a.sumWindowFanoutsCorrect,
+	)
+	s.PearsonWindowCoverageVsLocalCorrect = pointBiserial(
+		a.windowsWithFanouts, a.sumCoverage, a.sumCoverageSq, float64(a.correctWindowsWithFanouts), a.sumCoverageCorrect,
+	)
+	s.PearsonKnownCoverageVsLocalCorrect = pointBiserial(
+		a.windowsWithFanouts, a.sumKnownCoverage, a.sumKnownCoverageSq, float64(a.correctWindowsWithFanouts), a.sumKnownCoverageCorrect,
+	)
+	s.PearsonTraceMeanHAVsClean = pointBiserial(
+		a.tracesWithWindows, a.sumTraceMeanHA, a.sumTraceMeanHASq, float64(a.cleanTracesWithWindows), a.sumTraceMeanHAClean,
+	)
+	s.PearsonTraceMeanKnownVsClean = pointBiserial(
+		a.tracesWithWindows, a.sumTraceMeanKnown, a.sumTraceMeanKnownSq, float64(a.cleanTracesWithWindows), a.sumTraceMeanKnownClean,
+	)
+	s.PearsonTraceCoverageVsClean = pointBiserial(
+		a.tracesWithFanoutOpportunities, a.sumTraceCoverage, a.sumTraceCoverageSq, float64(a.cleanTracesWithFanoutOpportunities), a.sumTraceCoverageClean,
+	)
+	s.PearsonTraceKnownCoverageVsClean = pointBiserial(
+		a.tracesWithFanoutOpportunities, a.sumTraceKnownCoverage, a.sumTraceKnownCoverageSq, float64(a.cleanTracesWithFanoutOpportunities), a.sumTraceKnownCoverageClean,
+	)
+	if a.routedUnits > 0 {
+		s.RoutedUnitsMeasured = a.routedUnits
+		s.CorrectAnchorRoutes = a.correctAnchorRoutes
+		s.CorrectTopologyRoutes = a.correctTopologyRoutes
+		s.MeanRequiredHAFanoutsPerRoute = a.sumRouteRequiredHA / float64(a.routedUnits)
+		s.MeanApplicableFanoutGroupsPerRoute = a.sumRouteFanoutGroups / float64(a.routedUnits)
+		s.MeanMultiBloomFanoutGroupsPerRoute = a.sumRouteMultiBloomGroups / float64(a.routedUnits)
+		s.MeanFanoutCandidateTestsPerRoute = a.sumRouteFanoutTests / float64(a.routedUnits)
+	}
+	s.PearsonRequiredHAVsTopologyCorrect = pointBiserial(
+		a.routedUnits, a.sumRouteRequiredHA, a.sumRouteRequiredHASq, float64(a.correctTopologyRoutes), a.sumRouteRequiredHACorrect,
+	)
+	s.PearsonFanoutGroupsVsTopologyCorrect = pointBiserial(
+		a.routedUnits, a.sumRouteFanoutGroups, a.sumRouteFanoutGroupsSq, float64(a.correctTopologyRoutes), a.sumRouteFanoutGroupsCorrect,
+	)
+	s.PearsonMultiBloomVsTopologyCorrect = pointBiserial(
+		a.routedUnits, a.sumRouteMultiBloomGroups, a.sumRouteMultiBloomGroupsSq, float64(a.correctTopologyRoutes), a.sumRouteMultiBloomGroupsCorrect,
+	)
+	s.PearsonFanoutTestsVsTopologyCorrect = pointBiserial(
+		a.routedUnits, a.sumRouteFanoutTests, a.sumRouteFanoutTestsSq, float64(a.correctTopologyRoutes), a.sumRouteFanoutTestsCorrect,
+	)
+	labels := []string{"0", "1", "2", "3-4", "5-8", "9-16", "17-32", "33+"}
+	for bucket, label := range labels {
+		b := a.byDistinctBucket[bucket]
+		if b == nil {
+			continue
+		}
+		s.TracePerformanceByDistinctHA = append(s.TracePerformanceByDistinctHA, fanoutTraceBin{
+			DistinctHAFanouts: label, Traces: b.traces, CanonicalClean: b.clean,
+			CleanRate: float64(b.clean) / float64(b.traces),
+		})
+	}
+	haLabels := []string{"0", "1", "2", "3", "4", "5+"}
+	for bucket, label := range haLabels {
+		b := a.windowByHACount[bucket]
+		if b == nil {
+			continue
+		}
+		s.WindowPerformanceByHACount = append(s.WindowPerformanceByHACount, fanoutWindowBin{
+			Bucket: label, Windows: b.windows, Correct: b.correct,
+			CorrectRate: float64(b.correct) / float64(b.windows),
+		})
+	}
+	for bucket, label := range haLabels {
+		b := a.windowByKnownFanoutCount[bucket]
+		if b == nil {
+			continue
+		}
+		s.WindowPerformanceByKnownCount = append(s.WindowPerformanceByKnownCount, fanoutWindowBin{
+			Bucket: label, Windows: b.windows, Correct: b.correct,
+			CorrectRate: float64(b.correct) / float64(b.windows),
+		})
+	}
+	for bucket, label := range haLabels {
+		b := a.windowByTruthFanoutCount[bucket]
+		if b == nil {
+			continue
+		}
+		s.WindowPerformanceByTruthFanoutCount = append(s.WindowPerformanceByTruthFanoutCount, fanoutWindowBin{
+			Bucket: label, Windows: b.windows, Correct: b.correct,
+			CorrectRate: float64(b.correct) / float64(b.windows),
+		})
+	}
+	coverageLabels := []string{"0", "(0,.25]", "(.25,.50]", "(.50,.75]", "(.75,1)", "1"}
+	for bucket, label := range coverageLabels {
+		b := a.coverageByBucket[bucket]
+		if b == nil {
+			continue
+		}
+		s.WindowPerformanceByHACoverage = append(s.WindowPerformanceByHACoverage, fanoutWindowBin{
+			Bucket: label, Windows: b.windows, Correct: b.correct,
+			CorrectRate: float64(b.correct) / float64(b.windows),
+		})
+	}
+	for bucket, label := range coverageLabels {
+		b := a.knownCoverageByBucket[bucket]
+		if b == nil {
+			continue
+		}
+		s.WindowPerformanceByKnownCoverage = append(s.WindowPerformanceByKnownCoverage, fanoutWindowBin{
+			Bucket: label, Windows: b.windows, Correct: b.correct,
+			CorrectRate: float64(b.correct) / float64(b.windows),
+		})
+	}
+	appendRouteBins := func(dst *[]fanoutRouteBin, bins map[int]*fanoutWindowBinAcc) {
+		for bucket, label := range haLabels {
+			b := bins[bucket]
+			if b == nil {
+				continue
+			}
+			*dst = append(*dst, fanoutRouteBin{
+				Bucket: label, RouteUnits: b.windows, Correct: b.correct,
+				Accuracy: float64(b.correct) / float64(b.windows),
+			})
+		}
+	}
+	appendRouteBins(&s.RoutePerformanceByRequiredHA, a.routeByRequiredHA)
+	appendRouteBins(&s.RoutePerformanceByFanoutGroups, a.routeByFanoutGroups)
+	appendRouteBins(&s.RoutePerformanceByMultiBloomGroups, a.routeByMultiBloomGroups)
+	appendRouteBins(&s.RoutePerformanceByFanoutTests, a.routeByFanoutTests)
+	return s
+}
+
+type chainCountSummary struct {
+	MatchedLevels int   `json:"matched_levels"`
+	Count         int64 `json:"count"`
+}
+
+type chainPerformanceBin struct {
+	MatchedLevels  int     `json:"matched_levels"`
+	RouteUnits     int64   `json:"route_units"`
+	CorrectUnits   int64   `json:"anchor_correct_units"`
+	WrongUnits     int64   `json:"anchor_wrong_units"`
+	UnitAccuracy   float64 `json:"anchor_unit_accuracy"`
+	Orphans        int64   `json:"orphan_fragments"`
+	CorrectOrphans int64   `json:"anchor_correct_fragments"`
+	WrongOrphans   int64   `json:"anchor_wrong_fragments"`
+	OrphanAccuracy float64 `json:"anchor_fragment_accuracy"`
+}
+
+type chainTraceBin struct {
+	MinimumMatchedLevels int     `json:"minimum_matched_levels"`
+	Traces               int64   `json:"traces"`
+	Clean                int64   `json:"canonical_clean"`
+	CleanRate            float64 `json:"canonical_clean_rate"`
+}
+
+type chainEvidenceSummary struct {
+	MatchedLevelDefinition string `json:"matched_level_definition"`
+	TraceDomainDefinition  string `json:"trace_domain_definition"`
+
+	CandidateInitialHits         int64               `json:"candidate_initial_bloom_hits"`
+	CandidateAccepted            int64               `json:"candidate_chain_accepted"`
+	CandidateRejected            int64               `json:"candidate_chain_rejected"`
+	CandidatePositiveBloomChecks int64               `json:"candidate_positive_bloom_checks"`
+	AcceptedByLevels             []chainCountSummary `json:"accepted_candidates_by_matched_levels"`
+	RejectedAfterLevels          []chainCountSummary `json:"rejected_candidates_after_matched_levels"`
+
+	RoutedUnits     int64                 `json:"routed_units"`
+	UnroutedUnits   int64                 `json:"unrouted_units"`
+	RoutedOrphans   int64                 `json:"routed_orphan_fragments"`
+	UnroutedOrphans int64                 `json:"unrouted_orphan_fragments"`
+	CorrectUnits    int64                 `json:"anchor_correct_units"`
+	WrongUnits      int64                 `json:"anchor_wrong_units"`
+	CorrectOrphans  int64                 `json:"anchor_correct_fragments"`
+	WrongOrphans    int64                 `json:"anchor_wrong_fragments"`
+	ByMatchedLevels []chainPerformanceBin `json:"route_performance_by_matched_levels"`
+
+	AllUnitsRoutedTraces int64           `json:"all_units_routed_traces"`
+	AllUnitsRoutedClean  int64           `json:"all_units_routed_canonical_clean"`
+	TracesWithUnrouted   int64           `json:"traces_with_unrouted_units"`
+	TraceByMinimum       []chainTraceBin `json:"trace_performance_by_minimum_matched_levels"`
+	PearsonMeanVsClean   *float64        `json:"pearson_mean_matched_levels_vs_canonical_clean"`
+	PearsonMinVsClean    *float64        `json:"pearson_minimum_matched_levels_vs_canonical_clean"`
+	PearsonChecksVsClean *float64        `json:"pearson_mean_positive_bloom_checks_vs_canonical_clean"`
+}
+
+func sortedChainCounts(m map[int]int64) []chainCountSummary {
+	keys := make([]int, 0, len(m))
+	for levels := range m {
+		keys = append(keys, levels)
+	}
+	sort.Ints(keys)
+	out := make([]chainCountSummary, 0, len(keys))
+	for _, levels := range keys {
+		out = append(out, chainCountSummary{MatchedLevels: levels, Count: m[levels]})
+	}
+	return out
+}
+
+func pointBiserial(n int64, sumX, sumX2, sumY, sumXY float64) *float64 {
+	if n < 2 {
+		return nil
+	}
+	nf := float64(n)
+	denX := nf*sumX2 - sumX*sumX
+	denY := nf*sumY - sumY*sumY // y is binary, so sum(y^2) == sum(y)
+	if denX <= 0 || denY <= 0 {
+		return nil
+	}
+	r := (nf*sumXY - sumX*sumY) / math.Sqrt(denX*denY)
+	return &r
+}
+
+func summarizeChainEvidence(a chainEvidenceAcc) *chainEvidenceSummary {
+	if a.candidateInitialHits == 0 && a.routedUnits == 0 && a.unroutedUnits == 0 {
+		return nil
+	}
+	s := &chainEvidenceSummary{
+		MatchedLevelDefinition: "one non-checkpoint ancestor ID on the selected anchor-to-checkpoint chain that passed every applicable carrier Bloom; the minimum across exact-parent sibling fragments is reported per route",
+		TraceDomainDefinition:  "correlations include only nonempty traces whose exact-parent route units all selected an anchor; correctness is the canonical evidence-bounded topology verdict",
+		CandidateInitialHits:   a.candidateInitialHits, CandidateAccepted: a.candidateAccepted,
+		CandidateRejected: a.candidateRejected, CandidatePositiveBloomChecks: a.candidatePositiveBloomChecks,
+		AcceptedByLevels: sortedChainCounts(a.acceptedByLevels), RejectedAfterLevels: sortedChainCounts(a.rejectedAfterLevels),
+		RoutedUnits: a.routedUnits, UnroutedUnits: a.unroutedUnits,
+		RoutedOrphans: a.routedOrphans, UnroutedOrphans: a.unroutedOrphans,
+		CorrectUnits: a.correctUnits, WrongUnits: a.wrongUnits,
+		CorrectOrphans: a.correctOrphans, WrongOrphans: a.wrongOrphans,
+		AllUnitsRoutedTraces: a.allRoutedTraces, AllUnitsRoutedClean: a.allRoutedClean,
+		TracesWithUnrouted: a.tracesWithUnrouted,
+	}
+	keys := make([]int, 0, len(a.byLevels))
+	for levels := range a.byLevels {
+		keys = append(keys, levels)
+	}
+	sort.Ints(keys)
+	for _, levels := range keys {
+		b := a.byLevels[levels]
+		unitAccuracy, orphanAccuracy := 0.0, 0.0
+		if b.units > 0 {
+			unitAccuracy = float64(b.correctUnits) / float64(b.units)
+		}
+		if b.orphans > 0 {
+			orphanAccuracy = float64(b.correctOrphans) / float64(b.orphans)
+		}
+		s.ByMatchedLevels = append(s.ByMatchedLevels, chainPerformanceBin{
+			MatchedLevels: levels, RouteUnits: b.units, CorrectUnits: b.correctUnits,
+			WrongUnits: b.wrongUnits, UnitAccuracy: unitAccuracy, Orphans: b.orphans,
+			CorrectOrphans: b.correctOrphans, WrongOrphans: b.wrongOrphans, OrphanAccuracy: orphanAccuracy,
+		})
+	}
+	keys = keys[:0]
+	for levels := range a.traceByMin {
+		keys = append(keys, levels)
+	}
+	sort.Ints(keys)
+	for _, levels := range keys {
+		b := a.traceByMin[levels]
+		cleanRate := 0.0
+		if b.traces > 0 {
+			cleanRate = float64(b.clean) / float64(b.traces)
+		}
+		s.TraceByMinimum = append(s.TraceByMinimum, chainTraceBin{
+			MinimumMatchedLevels: levels, Traces: b.traces, Clean: b.clean, CleanRate: cleanRate,
+		})
+	}
+	s.PearsonMeanVsClean = pointBiserial(a.allRoutedTraces, a.sumMean, a.sumMeanSq, float64(a.allRoutedClean), a.sumMeanClean)
+	s.PearsonMinVsClean = pointBiserial(a.allRoutedTraces, a.sumMin, a.sumMinSq, float64(a.allRoutedClean), a.sumMinClean)
+	s.PearsonChecksVsClean = pointBiserial(a.allRoutedTraces, a.sumChecks, a.sumChecksSq, float64(a.allRoutedClean), a.sumChecksClean)
+	return s
+}
+
+// scorerComparisonSummary exposes raw counts rather than pre-rounded rates so
+// downstream analysis can reproduce every percentage and denominator exactly.
+type scorerComparisonSummary struct {
+	CanonicalPolicy                string `json:"canonical_policy"`
+	HistoricalPolicy               string `json:"historical_policy"`
+	CanonicalDenominator           string `json:"canonical_denominator"`
+	HistoricalDenominator          string `json:"historical_denominator"`
+	Traces                         int    `json:"traces"`
+	InputObligations               int    `json:"input_obligations"`
+	EmittedReconstructions         int    `json:"emitted_reconstructions"`
+	ObligationAndEmitted           int    `json:"obligation_and_emitted"`
+	ObligationNoEmission           int    `json:"obligation_no_emission"`
+	EmissionNoObligation           int    `json:"emission_no_obligation"`
+	CanonicalCleanObligations      int    `json:"canonical_clean_on_input_obligations"`
+	HistoricalCleanObligations     int    `json:"historical_clean_on_input_obligations"`
+	CanonicalCleanEmitted          int    `json:"canonical_clean_on_emitted_reconstructions"`
+	HistoricalCleanEmitted         int    `json:"historical_clean_on_emitted_reconstructions"`
+	BothCleanObligations           int    `json:"both_clean_on_input_obligations"`
+	CanonicalOnlyCleanObligations  int    `json:"canonical_only_clean_on_input_obligations"`
+	HistoricalOnlyCleanObligations int    `json:"historical_only_clean_on_input_obligations"`
+	BothWrongObligations           int    `json:"both_wrong_on_input_obligations"`
+	CanonicalWrongSegments         int    `json:"canonical_wrong_segments_on_input_obligations"`
+	HistoricalWrongUnits           int    `json:"historical_wrong_units_on_input_obligations"`
 }
 
 type rateSummary struct {
-	DropRate        float64         `json:"drop_rate"`
-	DropCode        string          `json:"drop_code"`
-	TopologySummary topologySummary `json:"topology_summary"`
-	GreedySummary   *greedySummary  `json:"greedy_summary,omitempty"`
-	SB3Summary      *sb3Summary     `json:"sb3_summary,omitempty"`
+	DropRate         float64                  `json:"drop_rate"`
+	DropCode         string                   `json:"drop_code"`
+	TopologySummary  topologySummary          `json:"topology_summary"`
+	GreedySummary    *greedySummary           `json:"greedy_summary,omitempty"`
+	ChainEvidence    *chainEvidenceSummary    `json:"chain_evidence_summary,omitempty"`
+	SB3Summary       *sb3Summary              `json:"sb3_summary,omitempty"`
+	ScorerComparison *scorerComparisonSummary `json:"scorer_comparison,omitempty"`
 }
 
 func evidenceProfile(c config) string {
@@ -1705,7 +2841,7 @@ func evidenceProfile(c config) string {
 	return profile
 }
 
-func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *sb3Summary) {
+func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainEvidenceSummary, *sb3Summary, *scorerComparisonSummary) {
 	scorePolicy := "evidence-bounded-v1"
 	if c.mode == "pb0" || c.mode == "pb1" || c.mode == "pb2" {
 		scorePolicy = "path-evidence-v1"
@@ -1728,6 +2864,7 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *sb3Sum
 			Mode: mode, Checked: a.greedyChecked, CandidateEvaluations: a.greedyCandidates,
 			HardOverrides: a.greedyHardOverrides, HardConflicts: a.greedyHardConflicts,
 			ParentConflicts: a.greedyParentConflicts, HAConflicts: a.greedyHAConflicts,
+			FanoutEvidence: summarizeFanoutEvidence(a.fanoutEvidence),
 		}
 	}
 	var sb3 *sb3Summary
@@ -1746,61 +2883,86 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *sb3Sum
 			StructureParents: s.structureParents, EndOrderOK: s.endOrderOK,
 		}
 	}
-	return topo, greedy, sb3
+	var comparison *scorerComparisonSummary
+	if c.compareScorers {
+		x := a.scoreComparison
+		comparison = &scorerComparisonSummary{
+			CanonicalPolicy: "evidence-bounded-v1", HistoricalPolicy: "legacy-node-plus-anchor-v0",
+			CanonicalDenominator:  "surviving-record input obligations",
+			HistoricalDenominator: "algorithm emitted at least one reconnection",
+			Traces:                x.traces, InputObligations: x.obligations, EmittedReconstructions: x.emitted,
+			ObligationAndEmitted: x.obligationAndEmitted, ObligationNoEmission: x.obligationNoEmission,
+			EmissionNoObligation:           x.emissionNoObligation,
+			CanonicalCleanObligations:      x.canonicalCleanObligations,
+			HistoricalCleanObligations:     x.historicalCleanObligations,
+			CanonicalCleanEmitted:          x.canonicalCleanEmitted,
+			HistoricalCleanEmitted:         x.historicalCleanEmitted,
+			BothCleanObligations:           x.bothCleanObligations,
+			CanonicalOnlyCleanObligations:  x.canonicalOnlyCleanObligations,
+			HistoricalOnlyCleanObligations: x.historicalOnlyCleanObligations,
+			BothWrongObligations:           x.bothWrongObligations,
+			CanonicalWrongSegments:         x.canonicalWrongSegments,
+			HistoricalWrongUnits:           x.historicalWrongUnits,
+		}
+	}
+	return topo, greedy, summarizeChainEvidence(a.chainEvidence), sb3, comparison
 }
 
 // output is the per-trace score arrays, in trace load order.
 type output struct {
-	Mode               string           `json:"mode"`
-	Corpus             string           `json:"corpus,omitempty"`
-	TraceStore         string           `json:"trace_store,omitempty"`
-	CheckpointDistance int              `json:"checkpoint_distance"`
-	DropRate           float64          `json:"drop_rate,omitempty"`
-	DropRates          []float64        `json:"drop_rates,omitempty"`
-	RateSummaries      []rateSummary    `json:"rate_summaries,omitempty"`
-	BloomFP            float64          `json:"bloom_fp,omitempty"`
-	PrimeM             bool             `json:"prime_m,omitempty"`
-	PrimeMByteCap      bool             `json:"prime_m_bytecap,omitempty"`
-	PrefixLen          int              `json:"prefix_len,omitempty"`
-	FPBits             int              `json:"fp_bits,omitempty"`
-	LehmerEE           bool             `json:"lehmer_ee,omitempty"`
-	TopoOnly           bool             `json:"topo_only,omitempty"`
-	SB3IgnoreOrdinals  bool             `json:"sb3_ignore_ordinals,omitempty"`
-	CGP0Legacy         bool             `json:"cgp0_legacy,omitempty"`
-	PB0Legacy          bool             `json:"pb0_legacy,omitempty"`
-	GreedyNoGrouped    bool             `json:"greedy_no_grouped_evidence,omitempty"`
-	GreedyNoHardHA     bool             `json:"greedy_no_hard_ha,omitempty"`
-	GreedyNoFallback   bool             `json:"greedy_no_route_fallback,omitempty"`
-	PerTraceDropSeed   bool             `json:"per_trace_drop_seed,omitempty"`
-	Order              string           `json:"order"`
-	Consistency        string           `json:"consistency"`
-	Seed               int64            `json:"seed"`
-	Sample             int              `json:"sample,omitempty"`
-	SampleSeed         int64            `json:"sample_seed,omitempty"`
-	NumTraces          int              `json:"num_traces"`
-	NumSpans           []int            `json:"num_spans,omitempty"`
-	NumDropped         []int            `json:"num_dropped,omitempty"`
-	NumOrphans         []int            `json:"num_orphans,omitempty"`
-	NumReconnected     []int            `json:"num_reconnected,omitempty"`
-	NumAnchorCorrect   []int            `json:"num_anchor_correct,omitempty"`
-	NumAnchorAncestor  []int            `json:"num_anchor_ancestor,omitempty"`
-	NumGapCorrect      []int            `json:"num_gap_correct,omitempty"`
-	NumMisattached     []int            `json:"num_misattached,omitempty"`
-	NumUnanchored      []int            `json:"num_unanchored,omitempty"`
-	NumSynthetic       []int            `json:"num_synthetic,omitempty"`
-	NumBorrowed        []int            `json:"num_borrowed_bloom,omitempty"`
-	NumFragmentsLost   []int            `json:"num_fragments_lost,omitempty"`    // PCR only
-	NumSpansLost       []int            `json:"num_spans_lost,omitempty"`        // PCR only
-	NumAncestorsSkip   []int            `json:"num_ancestors_skipped,omitempty"` // PCR only
-	NumSpansInSkipped  []int            `json:"num_spans_in_skipped,omitempty"`  // PCR only
-	NumOpenEnds        []int            `json:"num_open_ends,omitempty"`         // PCRB only
-	NumOpenEndsMatched []int            `json:"num_open_ends_matched,omitempty"` // PCRB only
-	NumForcedMatches   []int            `json:"num_forced_matches,omitempty"`    // PCRB only
-	NumOrphansPlaced   []int            `json:"num_orphans_placed,omitempty"`    // PCRB only
-	NumOrphanOpenEnds  []int            `json:"num_orphan_open_ends,omitempty"`  // PCRB only
-	TopologySummary    *topologySummary `json:"topology_summary,omitempty"`
-	GreedySummary      *greedySummary   `json:"greedy_summary,omitempty"`
-	SB3Summary         *sb3Summary      `json:"sb3_summary,omitempty"`
+	Mode               string                   `json:"mode"`
+	Corpus             string                   `json:"corpus,omitempty"`
+	TraceStore         string                   `json:"trace_store,omitempty"`
+	CheckpointDistance int                      `json:"checkpoint_distance"`
+	DropRate           float64                  `json:"drop_rate,omitempty"`
+	DropRates          []float64                `json:"drop_rates,omitempty"`
+	RateSummaries      []rateSummary            `json:"rate_summaries,omitempty"`
+	BloomFP            float64                  `json:"bloom_fp,omitempty"`
+	PrimeM             bool                     `json:"prime_m,omitempty"`
+	PrimeMByteCap      bool                     `json:"prime_m_bytecap,omitempty"`
+	PrefixLen          int                      `json:"prefix_len,omitempty"`
+	FPBits             int                      `json:"fp_bits,omitempty"`
+	LehmerEE           bool                     `json:"lehmer_ee,omitempty"`
+	TopoOnly           bool                     `json:"topo_only,omitempty"`
+	SB3IgnoreOrdinals  bool                     `json:"sb3_ignore_ordinals,omitempty"`
+	CGP0Legacy         bool                     `json:"cgp0_legacy,omitempty"`
+	PB0Legacy          bool                     `json:"pb0_legacy,omitempty"`
+	GreedyNoGrouped    bool                     `json:"greedy_no_grouped_evidence,omitempty"`
+	GreedyNoHardHA     bool                     `json:"greedy_no_hard_ha,omitempty"`
+	GreedyNoFallback   bool                     `json:"greedy_no_route_fallback,omitempty"`
+	PerTraceDropSeed   bool                     `json:"per_trace_drop_seed,omitempty"`
+	Order              string                   `json:"order"`
+	Consistency        string                   `json:"consistency"`
+	Seed               int64                    `json:"seed"`
+	Sample             int                      `json:"sample,omitempty"`
+	SampleSeed         int64                    `json:"sample_seed,omitempty"`
+	NumTraces          int                      `json:"num_traces"`
+	NumSpans           []int                    `json:"num_spans,omitempty"`
+	NumDropped         []int                    `json:"num_dropped,omitempty"`
+	NumOrphans         []int                    `json:"num_orphans,omitempty"`
+	NumReconnected     []int                    `json:"num_reconnected,omitempty"`
+	NumAnchorCorrect   []int                    `json:"num_anchor_correct,omitempty"`
+	NumAnchorAncestor  []int                    `json:"num_anchor_ancestor,omitempty"`
+	NumGapCorrect      []int                    `json:"num_gap_correct,omitempty"`
+	NumMisattached     []int                    `json:"num_misattached,omitempty"`
+	NumUnanchored      []int                    `json:"num_unanchored,omitempty"`
+	NumSynthetic       []int                    `json:"num_synthetic,omitempty"`
+	NumBorrowed        []int                    `json:"num_borrowed_bloom,omitempty"`
+	NumFragmentsLost   []int                    `json:"num_fragments_lost,omitempty"`    // PCR only
+	NumSpansLost       []int                    `json:"num_spans_lost,omitempty"`        // PCR only
+	NumAncestorsSkip   []int                    `json:"num_ancestors_skipped,omitempty"` // PCR only
+	NumSpansInSkipped  []int                    `json:"num_spans_in_skipped,omitempty"`  // PCR only
+	NumOpenEnds        []int                    `json:"num_open_ends,omitempty"`         // PCRB only
+	NumOpenEndsMatched []int                    `json:"num_open_ends_matched,omitempty"` // PCRB only
+	NumForcedMatches   []int                    `json:"num_forced_matches,omitempty"`    // PCRB only
+	NumOrphansPlaced   []int                    `json:"num_orphans_placed,omitempty"`    // PCRB only
+	NumOrphanOpenEnds  []int                    `json:"num_orphan_open_ends,omitempty"`  // PCRB only
+	TopologySummary    *topologySummary         `json:"topology_summary,omitempty"`
+	GreedySummary      *greedySummary           `json:"greedy_summary,omitempty"`
+	ChainEvidence      *chainEvidenceSummary    `json:"chain_evidence_summary,omitempty"`
+	SB3Summary         *sb3Summary              `json:"sb3_summary,omitempty"`
+	ScorerComparison   *scorerComparisonSummary `json:"scorer_comparison,omitempty"`
+	CompareScorers     bool                     `json:"compare_scorers,omitempty"`
 }
 
 // slowReconMS: if >0 (set via TRACE_RECON_SLOW=<ms>), log any single cgprb
@@ -1893,6 +3055,7 @@ func main() {
 		GreedyNoGrouped:    c.greedyNoGrouped,
 		GreedyNoHardHA:     c.greedyNoHardHA,
 		GreedyNoFallback:   c.greedyNoFallback,
+		CompareScorers:     c.compareScorers,
 		Order:              orderName,
 		Consistency:        map[bool]string{true: "chain", false: "none"}[c.chainCheck],
 		Seed:               c.seed,
@@ -1904,16 +3067,16 @@ func main() {
 	}
 	if cg2Family(c.mode) {
 		if len(ha.mdRates) == 0 {
-			topo, greedy, sb3 := summariesFor(c, ha.cg2)
-			out.TopologySummary, out.GreedySummary, out.SB3Summary = &topo, greedy, sb3
+			topo, greedy, chain, sb3, comparison := summariesFor(c, ha.cg2)
+			out.TopologySummary, out.GreedySummary, out.ChainEvidence, out.SB3Summary, out.ScorerComparison = &topo, greedy, chain, sb3, comparison
 		} else {
 			out.DropRate = 0
 			out.DropRates = append([]float64(nil), ha.mdRates...)
 			for r, rate := range ha.mdRates {
-				topo, greedy, sb3 := summariesFor(c, ha.mdAcc[r])
+				topo, greedy, chain, sb3, comparison := summariesFor(c, ha.mdAcc[r])
 				out.RateSummaries = append(out.RateSummaries, rateSummary{
 					DropRate: rate, DropCode: ha.mdDC[r], TopologySummary: topo,
-					GreedySummary: greedy, SB3Summary: sb3,
+					GreedySummary: greedy, ChainEvidence: chain, SB3Summary: sb3, ScorerComparison: comparison,
 				})
 			}
 		}

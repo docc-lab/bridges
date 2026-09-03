@@ -22,6 +22,8 @@ type sb3GreedyStats struct {
 	HardConflicts        int
 	ParentConflicts      int
 	HAConflicts          int
+	Chain                GreedyChainStats
+	Fanout               GreedyFanoutStats
 }
 
 // sb3WinBloom is one surviving carrier's window-local ancestry evidence.
@@ -189,6 +191,85 @@ type sb3RouteUnit struct {
 	requiredFanout map[int]uint64
 	nodeChoice     map[int]uint64
 	anonAtDepth    map[int]uint64
+
+	applicableFanoutGroups      int
+	applicableMultiBloomGroups  int
+	fanoutCandidateTests        int
+	fanoutBloomTests            int
+	fanoutCandidatesPruned      int
+	hardRouteCandidatesRejected int
+}
+
+type sb3ChainMatch struct {
+	ok                  bool
+	matchedLevels       int
+	positiveBloomChecks int
+	carriers            map[uint64]bool
+}
+
+// sb3ConfirmAnchorChain is the measured form of the anchor-chain predicate.
+// It walks from a surviving candidate toward the exact checkpoint and tests
+// every nameable non-checkpoint ID against every applicable carrier Bloom.
+// A missing parent ends the walk after its literal ID is tested because no
+// surviving record exposes the rest of that parent chain.
+func sb3ConfirmAnchorChain(sk *cgpSkeleton, e *sb3FragmentEvidence, start *Span) sb3ChainMatch {
+	m := sb3ChainMatch{carriers: make(map[uint64]bool)}
+	if e == nil || e.frag == nil || e.frag.anchorCkpt == nil || start == nil {
+		return m
+	}
+	lo := e.frag.anchorCkpt.Depth
+	checkpointIDs := make(map[uint64]bool, len(e.checkpoints))
+	for _, ckpt := range e.checkpoints {
+		checkpointIDs[ckpt.SpanID] = true
+	}
+	confirmLevel := func(id uint64, depth int) bool {
+		key := bridge.HexOf(id)
+		applicable := 0
+		for _, wb := range e.blooms {
+			if wb.depth <= depth {
+				continue
+			}
+			applicable++
+			if !wb.bf.Test(key[:]) {
+				return false
+			}
+			m.positiveBloomChecks++
+			m.carriers[wb.carrier] = true
+		}
+		if applicable > 0 {
+			m.matchedLevels++
+		}
+		return true
+	}
+
+	seen := make(map[uint64]bool)
+	for cur := start; cur != nil && !seen[cur.SpanID]; {
+		seen[cur.SpanID] = true
+		if cur.Depth <= lo {
+			m.ok = cur.Depth == lo && checkpointIDs[cur.SpanID]
+			return m
+		}
+		if !confirmLevel(cur.SpanID, cur.Depth) {
+			return m
+		}
+		parentDepth := cur.Depth - 1
+		if parentDepth == lo {
+			m.ok = checkpointIDs[cur.ParentID]
+			return m
+		}
+		parent := sk.byID[cur.ParentID]
+		if parent == nil {
+			if cur.ParentID != 0 && confirmLevel(cur.ParentID, parentDepth) {
+				m.ok = true
+			}
+			return m
+		}
+		if parent.Depth != parentDepth {
+			return m
+		}
+		cur = parent
+	}
+	return m
 }
 
 // sb3CollectFragmentEvidence copies the useful candidate-generation rules from
@@ -196,6 +277,10 @@ type sb3RouteUnit struct {
 // admissible surviving ancestors and HA fanouts in the fragment's checkpoint
 // window. Sparse ordinals will decide among these candidates later.
 func sb3CollectFragmentEvidence(sk *cgpSkeleton, cfg Config) map[uint64]*sb3FragmentEvidence {
+	return sb3CollectFragmentEvidenceWithStats(sk, cfg, nil)
+}
+
+func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *GreedyChainStats) map[uint64]*sb3FragmentEvidence {
 	cpd := cfg.CPD
 	if cpd < 1 {
 		cpd = 1
@@ -307,38 +392,6 @@ func sb3CollectFragmentEvidence(sk *cgpSkeleton, cfg Config) map[uint64]*sb3Frag
 				queryBloom = wb.bf
 			}
 		}
-		checkpointIDs := make(map[uint64]bool, len(e.checkpoints))
-		for _, ckpt := range e.checkpoints {
-			checkpointIDs[ckpt.SpanID] = true
-		}
-		chainConfirmed := func(start *Span) bool {
-			seen := make(map[uint64]bool)
-			for cur := start; cur != nil && !seen[cur.SpanID]; {
-				seen[cur.SpanID] = true
-				if cur.Depth <= lo {
-					return cur.Depth == lo && checkpointIDs[cur.SpanID]
-				}
-				key := bridge.HexOf(cur.SpanID)
-				if !confirmedByAll(key[:], cur.Depth) {
-					return false
-				}
-				parentDepth := cur.Depth - 1
-				if parentDepth == lo {
-					return checkpointIDs[cur.ParentID]
-				}
-				parent := sk.byID[cur.ParentID]
-				if parent == nil {
-					parentKey := bridge.HexOf(cur.ParentID)
-					return cur.ParentID != 0 && confirmedByAll(parentKey[:], parentDepth)
-				}
-				if parent.Depth != parentDepth {
-					return false
-				}
-				cur = parent
-			}
-			return false
-		}
-
 		// root.Depth-1 is the exact named parent, not a routing choice.
 		for d := hi - 2; d > lo; d-- {
 			for _, candidate := range haIndex[d].query(queryBloom) {
@@ -350,7 +403,27 @@ func sb3CollectFragmentEvidence(sk *cgpSkeleton, cfg Config) map[uint64]*sb3Frag
 		}
 		for d := hi - 2; d > lo; d-- {
 			for _, candidate := range survIndex[d].query(queryBloom) {
-				if !chainConfirmed(candidate.span) {
+				if chain != nil {
+					chain.CandidateInitialHits++
+				}
+				match := sb3ConfirmAnchorChain(sk, e, candidate.span)
+				if chain != nil {
+					chain.CandidatePositiveBloomChecks += match.positiveBloomChecks
+					if match.ok {
+						chain.CandidateAccepted++
+						if chain.AcceptedByMatchedLevels == nil {
+							chain.AcceptedByMatchedLevels = make(map[int]int)
+						}
+						chain.AcceptedByMatchedLevels[match.matchedLevels]++
+					} else {
+						chain.CandidateRejected++
+						if chain.RejectedAfterMatchedLevels == nil {
+							chain.RejectedAfterMatchedLevels = make(map[int]int)
+						}
+						chain.RejectedAfterMatchedLevels[match.matchedLevels]++
+					}
+				}
+				if !match.ok {
 					continue
 				}
 				e.anchors = append(e.anchors, candidate.span)
@@ -365,6 +438,10 @@ func sb3IntersectRouteUnits(sk *cgpSkeleton, evidence map[uint64]*sb3FragmentEvi
 }
 
 func sb3IntersectRouteUnitsWithConfig(sk *cgpSkeleton, evidence map[uint64]*sb3FragmentEvidence, cfg Config) []*sb3RouteUnit {
+	return sb3IntersectRouteUnitsWithStats(sk, evidence, cfg, nil)
+}
+
+func sb3IntersectRouteUnitsWithStats(sk *cgpSkeleton, evidence map[uint64]*sb3FragmentEvidence, cfg Config, fanout *GreedyFanoutStats) []*sb3RouteUnit {
 	byParent := make(map[uint64][]*sb3FragmentEvidence)
 	for _, f := range sk.frags {
 		if f.root.ParentID == 0 {
@@ -473,7 +550,7 @@ func sb3IntersectRouteUnitsWithConfig(sk *cgpSkeleton, evidence map[uint64]*sb3F
 		}
 		units = append(units, u)
 	}
-	sb3ApplyFreeFanoutEvidence(sk, units, !cfg.GreedyNoGroupedEvidence)
+	sb3ApplyFreeFanoutEvidence(sk, units, !cfg.GreedyNoGroupedEvidence, fanout)
 	sort.Slice(units, func(i, j int) bool {
 		hi, hj := len(units[i].requiredFanout) > 0, len(units[j].requiredFanout) > 0
 		if hi != hj {
@@ -512,7 +589,7 @@ func sb3AppendUniqueID(ids []uint64, id uint64) []uint64 {
 // records: fragment roots that literally name the same ParentID, and carriers
 // whose HA entry explicitly says they descend through a fanout. A candidate at
 // or above such a point must survive every applicable branch Bloom.
-func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroupedEvidence bool) {
+func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroupedEvidence bool, stats *GreedyFanoutStats) {
 	groups := make(map[uint64]*sb3FanoutEvidenceGroup)
 	group := func(id uint64, depth int) *sb3FanoutEvidenceGroup {
 		g := groups[id]
@@ -547,15 +624,16 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 			}
 		}
 	}
-
-	groupConfirms := func(g *sb3FanoutEvidenceGroup, id uint64, depth int) bool {
-		key := bridge.HexOf(id)
-		for _, wb := range g.blooms {
-			if wb.depth > depth && !wb.bf.Test(key[:]) {
-				return false
+	if stats != nil {
+		stats.EvidenceGroups += len(groups)
+		for _, g := range groups {
+			if g.witness {
+				stats.WitnessedFanoutGroups++
+			}
+			if len(g.blooms) >= 2 {
+				stats.MultiBloomEvidenceGroups++
 			}
 		}
-		return true
 	}
 
 	for _, u := range units {
@@ -577,6 +655,32 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 				u.fanoutsByDepth[d] = sb3AppendUniqueID(u.fanoutsByDepth[d], id)
 			}
 		}
+		for _, g := range applicable {
+			if !g.witness {
+				continue
+			}
+			u.applicableFanoutGroups++
+			if len(g.blooms) >= 2 {
+				u.applicableMultiBloomGroups++
+			}
+		}
+		confirms := func(g *sb3FanoutEvidenceGroup, id uint64, depth int) bool {
+			if g.witness {
+				u.fanoutCandidateTests++
+			}
+			key := bridge.HexOf(id)
+			for _, wb := range g.blooms {
+				if wb.depth > depth {
+					if g.witness {
+						u.fanoutBloomTests++
+					}
+					if !wb.bf.Test(key[:]) {
+						return false
+					}
+				}
+			}
+			return true
+		}
 
 		anchorOut := make([]*Span, 0, len(u.anchors))
 		for _, a := range u.anchors {
@@ -593,11 +697,13 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 				}
 			}
 			ok := true
+			prunedByFanout := false
 			for _, g := range applicable {
-				if !checkpointCeiling && a.Depth <= g.depth && !groupConfirms(g, a.SpanID, a.Depth) {
+				if !checkpointCeiling && a.Depth <= g.depth && !confirms(g, a.SpanID, a.Depth) {
 					// An explicit surviving HA point is hard evidence and need not
 					// pass its own probabilistic encoding.
 					if a.SpanID != g.id {
+						prunedByFanout = g.witness
 						ok = false
 						break
 					}
@@ -614,6 +720,11 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 				if !duplicate {
 					anchorOut = append(anchorOut, a)
 				}
+			} else if stats != nil {
+				stats.GroupedAnchorCandidatesPruned++
+				if prunedByFanout {
+					u.fanoutCandidatesPruned++
+				}
 			}
 		}
 		u.anchors = anchorOut
@@ -623,10 +734,12 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 			for _, id := range ids {
 				hard := u.requiredFanout[d] == id
 				ok := hard
+				prunedByFanout := false
 				if !hard {
 					ok = true
 					for _, g := range applicable {
-						if d <= g.depth && !groupConfirms(g, id, d) {
+						if d <= g.depth && !confirms(g, id, d) {
+							prunedByFanout = g.witness
 							ok = false
 							break
 						}
@@ -634,6 +747,11 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 				}
 				if ok {
 					out = sb3AppendUniqueID(out, id)
+				} else if stats != nil {
+					stats.GroupedFanoutCandidatesPruned++
+					if prunedByFanout {
+						u.fanoutCandidatesPruned++
+					}
 				}
 			}
 			u.fanoutsByDepth[d] = out
@@ -694,6 +812,66 @@ func sb3AssignAnonymousIDs(sk *cgpSkeleton, units []*sb3RouteUnit) {
 			u.anonAtDepth[d] = alloc()
 		}
 	}
+}
+
+func sb3CollectSelectedRouteEvidence(sk *cgpSkeleton, units []*sb3RouteUnit) []GreedyRouteEvidence {
+	out := make([]GreedyRouteEvidence, 0, len(units))
+	for _, u := range units {
+		r := GreedyRouteEvidence{
+			ParentID: u.parentID, Routed: u.anchor != nil,
+			RequiredHAFanouts:           len(u.requiredFanout),
+			ApplicableFanoutGroups:      u.applicableFanoutGroups,
+			ApplicableMultiBloomGroups:  u.applicableMultiBloomGroups,
+			FanoutCandidateTests:        u.fanoutCandidateTests,
+			FanoutBloomTests:            u.fanoutBloomTests,
+			FanoutCandidatesPruned:      u.fanoutCandidatesPruned,
+			HardRouteCandidatesRejected: u.hardRouteCandidatesRejected,
+		}
+		for _, e := range u.members {
+			if e != nil && e.frag != nil && e.frag.root != nil {
+				r.OrphanIDs = append(r.OrphanIDs, e.frag.root.SpanID)
+			}
+		}
+		if u.anchor == nil {
+			out = append(out, r)
+			continue
+		}
+		r.AnchorID = u.anchor.SpanID
+		r.AnchorDepth = u.anchor.Depth
+		minLevels := -1
+		haveCheckpointDepth := false
+		carriers := make(map[uint64]bool)
+		for _, e := range u.members {
+			if e == nil || !e.resolved || e.frag == nil || e.frag.anchorCkpt == nil {
+				continue
+			}
+			if !haveCheckpointDepth || e.frag.anchorCkpt.Depth < r.CheckpointDepth {
+				r.CheckpointDepth = e.frag.anchorCkpt.Depth
+				haveCheckpointDepth = true
+			}
+			match := sb3ConfirmAnchorChain(sk, e, u.anchor)
+			if !match.ok {
+				// This should be unreachable: u.anchors is the intersection of
+				// member-admissible anchors.  Record the weakest possible value
+				// rather than overstating support if an invariant is violated.
+				minLevels = 0
+				continue
+			}
+			if minLevels < 0 || match.matchedLevels < minLevels {
+				minLevels = match.matchedLevels
+			}
+			r.PositiveBloomChecks += match.positiveBloomChecks
+			for carrier := range match.carriers {
+				carriers[carrier] = true
+			}
+		}
+		if minLevels > 0 {
+			r.MatchedLevels = minLevels
+		}
+		r.SupportingCarriers = len(carriers)
+		out = append(out, r)
+	}
+	return out
 }
 
 func sb3EmitGreedyTopology(sk *cgpSkeleton, units []*sb3RouteUnit, accepted map[uint64]uint64) Result {
@@ -1916,6 +2094,8 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 			}
 			if !hardOK {
 				rejectedHard = true
+				stats.Fanout.HardRouteCandidatesRejected++
+				u.hardRouteCandidatesRejected++
 			} else if !ordinalOK {
 				rejectedOrdinal = true
 			}
@@ -1936,6 +2116,8 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 		}
 		inserted := sb3ApplyUnitRoute(parent, u)
 		if _, ok := ha.tryEdges(inserted, parent); !ok {
+			stats.Fanout.HardRouteCandidatesRejected++
+			u.hardRouteCandidatesRejected++
 			sb3RollbackRoute(parent, inserted)
 			u.anchor = nil
 			return false
@@ -1957,9 +2139,23 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 	if cfg.CPD < 1 {
 		cfg.CPD = 1
 	}
+	var stats sb3GreedyStats
+	stats.Fanout.HAEnabled = !cfg.NoFanout
+	distinctHA := make(map[uint64]bool)
+	for i := range survivors {
+		if len(survivors[i].HA) > 0 {
+			stats.Fanout.HACarriersAvailable++
+		}
+		stats.Fanout.HAEntriesAvailable += len(survivors[i].HA)
+		for _, entry := range survivors[i].HA {
+			distinctHA[entry.ParentID] = true
+		}
+	}
+	stats.Fanout.DistinctHAFanoutsAvailable = len(distinctHA)
 	diag := os.Getenv("TRACE_RECON_SB3DIAG") != ""
 	stage := time.Now()
 	sk := cgpParse(survivors, cfg)
+	stats.Fanout.RecoveredHAFanoutsUsed = len(sk.fanouts)
 	if diag {
 		fmt.Fprintf(os.Stderr, "SB3STAGE parse survivors=%d frags=%d elapsed=%s\n", len(survivors), len(sk.frags), time.Since(stage))
 	}
@@ -1970,19 +2166,25 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 		fmt.Fprintf(os.Stderr, "SB3STAGE base_evidence elapsed=%s\n", time.Since(stage))
 	}
 	stage = time.Now()
-	evidence := sb3CollectFragmentEvidence(sk, cfg)
+	evidence := sb3CollectFragmentEvidenceWithStats(sk, cfg, &stats.Chain)
 	if diag {
 		fmt.Fprintf(os.Stderr, "SB3STAGE candidates elapsed=%s\n", time.Since(stage))
 	}
 	stage = time.Now()
-	units := sb3IntersectRouteUnitsWithConfig(sk, evidence, cfg)
+	units := sb3IntersectRouteUnitsWithStats(sk, evidence, cfg, &stats.Fanout)
+	stats.Fanout.RouteUnits = len(units)
+	for _, u := range units {
+		if len(u.requiredFanout) > 0 {
+			stats.Fanout.RouteUnitsWithRequiredHA++
+			stats.Fanout.RequiredHAConstraints += len(u.requiredFanout)
+		}
+	}
 	sb3AssignAnonymousIDs(sk, units)
 	nodeDepth := sb3BuildNodeDepth(sk, units)
 	if diag {
 		fmt.Fprintf(os.Stderr, "SB3STAGE fanout_groups units=%d elapsed=%s\n", len(units), time.Since(stage))
 	}
 
-	var stats sb3GreedyStats
 	parent := sb3SeedGreedyParent(sk, units)
 	var haTracker *sb3HATracker
 	initialHAConflicts := 0
@@ -2015,6 +2217,7 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 		sb3SelectGreedyRoute(cfg, sk, u, ordinalAssignments, haTracker, parent, &stats)
 	}
 	sb3ResolvePendingHA(cfg, sk, units, ordinalAssignments, haTracker, parent, &stats)
+	stats.Chain.Routes = sb3CollectSelectedRouteEvidence(sk, units)
 	if diag {
 		fmt.Fprintf(os.Stderr, "SB3STAGE ordinal_prune candidates=%d elapsed=%s\n", stats.CandidateEvaluations, time.Since(stage))
 		fmt.Fprintf(os.Stderr, "SB3HASTATE pending=%d initial_conflicts=%d\n", haTracker.pending(), initialHAConflicts)
@@ -2033,6 +2236,8 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 	topo.GreedyHardConflicts = stats.HardConflicts
 	topo.GreedyParentConflicts = stats.ParentConflicts
 	topo.GreedyHAConflicts = stats.HAConflicts
+	topo.GreedyChain = stats.Chain
+	topo.GreedyFanout = stats.Fanout
 	if stats.HardConflicts > 0 {
 		sb3DiagHardRoutes(units, survivors, topo)
 	}

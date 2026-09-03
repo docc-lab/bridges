@@ -743,6 +743,44 @@ func TestSB3EmissionUsesAcceptedParentMap(t *testing.T) {
 	}
 }
 
+func TestCGP0ReportsSelectedAnchorChainEvidence(t *testing.T) {
+	const (
+		root = uint64(0x01)
+		a    = uint64(0x02)
+		b    = uint64(0x03)
+		m    = uint64(0x04)
+		c    = uint64(0x05)
+	)
+	cfg := NewPCRBConfig(5, 8, bridge.DefaultBloomFPRate)
+	survivors := []Span{
+		{SpanID: root, Depth: 0, BloomBits: sb3TestBloom(t, cfg), CkptPrefix: sb3TestPrefix(root, 8)},
+		{SpanID: a, ParentID: root, Depth: 1},
+		{SpanID: b, ParentID: a, Depth: 2},
+		{
+			SpanID: c, ParentID: m, Depth: 4, LeafCarrier: true,
+			BloomBits: sb3TestBloom(t, cfg, a, b, m), CkptPrefix: sb3TestPrefix(root, 8),
+		},
+	}
+
+	res := ReconstructCGP0(survivors, cfg)
+	if res.GreedyChain.CandidateInitialHits != 2 || res.GreedyChain.CandidateAccepted != 2 || res.GreedyChain.CandidateRejected != 0 {
+		t.Fatalf("candidate chain telemetry=%+v, want two accepted initial hits", res.GreedyChain)
+	}
+	if len(res.GreedyChain.Routes) != 1 {
+		t.Fatalf("routes=%d, want 1", len(res.GreedyChain.Routes))
+	}
+	route := res.GreedyChain.Routes[0]
+	if !route.Routed || route.ParentID != m || route.AnchorID != b {
+		t.Fatalf("selected route=%+v, want M routed to B", route)
+	}
+	if route.MatchedLevels != 2 || route.PositiveBloomChecks != 2 || route.SupportingCarriers != 1 {
+		t.Fatalf("selected route chain=%+v, want two levels/two checks/one carrier", route)
+	}
+	if route.CheckpointDepth != 0 || route.AnchorDepth != 2 {
+		t.Fatalf("selected route depths=%+v, want checkpoint=0 anchor=2", route)
+	}
+}
+
 // Exact HA ancestry outranks sparse-chain admissibility. This intentionally
 // malformed chain rejects every ordinal-guided anchor path, but the emitted
 // topology must still route the carrier through the explicitly witnessed F.

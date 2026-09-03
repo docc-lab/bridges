@@ -50,7 +50,7 @@ var cpsatBoolSolveFn func(model string, nvars int, tlim float64) ([]int, bool)
 type cgpFragment struct {
 	root    *Span   // shallowest survivor of the component (its true parent dropped, or it is the trace root)
 	spans   []*Span // every survivor in the component
-	carrier *Span   // a span in the fragment carrying a _br payload — checkpoint OR leaf-carrier; both give own window evidence (prefix+bloom). nil => orphan.
+	carrier *Span   // a span carrying _br — periodic or leaf checkpoint; both give own window evidence (prefix+bloom). nil => orphan.
 
 	// Filled in later phases:
 	bf          *bloom.Filter // window bloom (own carrier's, or borrowed for an orphan)
@@ -60,10 +60,9 @@ type cgpFragment struct {
 	anchorAmbig bool          // >1 checkpoint matched the prefix
 }
 
-// isOrphan reports whether the fragment is carrier-less: no checkpoint and no
-// leaf-carrier, hence no window evidence of its own. It can only be placed by
-// borrowing a descendant carrier's window evidence. (A leaf-carrier counts as a
-// carrier — evidentially it is a checkpoint.)
+// isOrphan reports whether the fragment contains no periodic or leaf checkpoint,
+// hence no window evidence of its own. It can only be placed by borrowing a
+// descendant checkpoint's window evidence.
 func (f *cgpFragment) isOrphan() bool { return f.carrier == nil }
 
 // cgpBloom deserializes a window bloom in the hash mode the payloads were
@@ -138,8 +137,8 @@ func cgpParse(survivors []Span, cfg Config) *cgpSkeleton {
 			}
 			claimed[n.SpanID] = true
 			f.spans = append(f.spans, n)
-			// A carrier is any span with a _br payload — checkpoint or leaf-carrier;
-			// both anchor a window. Prefer the shallowest (closest to the window top).
+			// Every _br emitter is a checkpoint: periodic and leaf checkpoints both
+			// anchor a window. Prefer the shallowest (closest to the window top).
 			if n.BloomBits != nil && (f.carrier == nil || n.Depth < f.carrier.Depth ||
 				(n.Depth == f.carrier.Depth && n.SpanID < f.carrier.SpanID)) {
 				f.carrier = n
@@ -1816,6 +1815,19 @@ func ScorePBPathStrict(res Result, survivors []Span, truth []TruthSpan, dropped 
 func ScoreCGP2Strict(res Result, survivors []Span, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
 	_ = dropped
 	return ScoreCGP2Evidence(res, survivors, truth)
+}
+
+// ScoreCGP2HistoricalStrict reproduces the trace-clean predicate used by the
+// historical CGP greedy figures.  That predicate combined the permissive
+// reconstructed-node edge score with an emitted-bridge anchor check.  It did
+// not derive obligations from surviving records and did not inspect anonymous
+// nodes as parent-segment sources.  Keep this function as an evaluation
+// control; it must not be used for canonical accuracy.
+func ScoreCGP2HistoricalStrict(res Result, truth []TruthSpan, dropped map[uint64]struct{}) CGP2Iso {
+	historical := ScoreCGP2Iso(res, truth, dropped)
+	connectivity := ScorePB2Path(res, truth, dropped)
+	historical.EdgeWrong += connectivity.EdgeWrong
+	return historical
 }
 
 // cgpGreedyCandidates is the LEAN candidate step for the greedy baselines. For

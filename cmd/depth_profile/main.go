@@ -67,7 +67,7 @@ func main() {
 		open[tid] = 2 * int(counts[i])
 	}
 
-	const minCPD, maxCPD = 2, 6
+	const minCPD, maxCPD = 2, 8
 	// per-cpd accumulators
 	var (
 		leafResidue [maxCPD + 1][]int64 // [cpd][residue]
@@ -143,7 +143,7 @@ func main() {
 func bridgeKindIsStart(k uint8) bool { return k == 0 }
 
 func profileTrace(ts *traceState,
-	leafResidue *[7][]int64, leafCount, leafSum, branchAtCP, branchInner *[7]int64,
+	leafResidue *[9][]int64, leafCount, leafSum, branchAtCP, branchInner *[9]int64,
 	minCPD, maxCPD int) {
 
 	// depth via memoized parent walk; children counts for leaf/branch.

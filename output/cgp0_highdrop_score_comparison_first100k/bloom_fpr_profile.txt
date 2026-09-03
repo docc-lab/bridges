@@ -1,0 +1,16 @@
+=== RUN   TestPCRBCPDEffectiveFPRProfile
+    cpd_profile_test.go:33: prime=false cpd=3 n=2 m=39 k=14 delivered=81/200000=0.000405
+    cpd_profile_test.go:33: prime=false cpd=4 n=3 m=58 k=14 delivered=183/200000=0.000915
+    cpd_profile_test.go:33: prime=false cpd=5 n=4 m=77 k=14 delivered=42/200000=0.00021
+    cpd_profile_test.go:33: prime=false cpd=6 n=5 m=96 k=14 delivered=207/200000=0.001035
+    cpd_profile_test.go:33: prime=false cpd=7 n=6 m=116 k=14 delivered=117/200000=0.000585
+    cpd_profile_test.go:33: prime=false cpd=8 n=7 m=135 k=14 delivered=37/200000=0.000185
+    cpd_profile_test.go:33: prime=true cpd=3 n=2 m=41 k=15 delivered=49/200000=0.000245
+    cpd_profile_test.go:33: prime=true cpd=4 n=3 m=59 k=14 delivered=44/200000=0.00022
+    cpd_profile_test.go:33: prime=true cpd=5 n=4 m=79 k=14 delivered=43/200000=0.000215
+    cpd_profile_test.go:33: prime=true cpd=6 n=5 m=97 k=14 delivered=38/200000=0.00019
+    cpd_profile_test.go:33: prime=true cpd=7 n=6 m=127 k=15 delivered=15/200000=7.5e-05
+    cpd_profile_test.go:33: prime=true cpd=8 n=7 m=137 k=14 delivered=27/200000=0.000135
+--- PASS: TestPCRBCPDEffectiveFPRProfile (1.38s)
+PASS
+ok  	bridges/bloom	1.385s

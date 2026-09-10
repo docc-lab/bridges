@@ -26,11 +26,13 @@ import (
 // exactly the spans strictly between two checkpoints, <= cpd-1 entries,
 // which is what the bloom is sized for (see PCRBBloomCapacity).
 type PCRBBridgeHandler struct {
-	cpd       uint32
-	prefixLen int
-	bloomM    uint32
-	bloomK    uint32
-	bloomLen  int
+	cpd         uint32
+	checkpoints *CheckpointRange
+	bloomFP     float64
+	prefixLen   int
+	bloomM      uint32
+	bloomK      uint32
+	bloomLen    int
 
 	// Capture materializes serialized payloads for the reconstruction
 	// harness. Off for bagsize runs.
@@ -40,6 +42,7 @@ type PCRBBridgeHandler struct {
 }
 
 type pcrbState struct {
+	ttl         byte
 	ckpt        [8]byte
 	bloomBytes  []byte // propagated bloom (inherited + self; checkpoints: empty)
 	inherited   []byte // pre-self bloom — what this span emits in its own payload
@@ -84,6 +87,7 @@ func NewPCRBBridgeHandler(checkpointDistance, prefixLen int, bloomFPRate float64
 	m, k := bloom.EstimateParameters(PCRBBloomCapacity(checkpointDistance), bloomFPRate)
 	return &PCRBBridgeHandler{
 		cpd:       uint32(checkpointDistance),
+		bloomFP:   bloomFPRate,
 		prefixLen: prefixLen,
 		bloomM:    m,
 		bloomK:    k,
@@ -110,12 +114,19 @@ func (h *PCRBBridgeHandler) OnStart(ev *Event, _ int) StartResult {
 		depth = parentState.depth + 1
 		ckpt = parentState.ckpt
 		inherited = parentState.bloomBytes
-	} else {
-		bf, _ := bloom.New(h.bloomM, h.bloomK)
-		inherited = bf.ToBytes()
 	}
 
-	isCheckpoint := depth%h.cpd == 0
+	var incomingTTL byte
+	if parentState != nil {
+		incomingTTL = parentState.ttl
+	}
+	isCheckpoint, outgoingTTL := h.checkpoints.next(ev, parentState != nil, incomingTTL, int(depth), int(h.cpd))
+	if parentState == nil {
+		incomingTTL = outgoingTTL
+		g := h.checkpoints.bloom(incomingTTL, h.bloomM, h.bloomK)
+		bf, _ := bloom.New(g.m, g.k)
+		inherited = bf.ToBytes()
+	}
 
 	var emitBytes int
 	var payload []byte
@@ -127,12 +138,14 @@ func (h *PCRBBridgeHandler) OnStart(ev *Event, _ int) StartResult {
 			VarintLen(int(depth)) + h.prefixLen + len(inherited)
 		if h.Capture {
 			payload = packPCRBPayload(int(depth), ckpt, h.prefixLen, inherited)
+			h.checkpoints.tagPayload(payload, incomingTTL)
 		}
 		// Re-root and reset. The checkpoint does NOT add itself: threading
 		// never tests the anchor (the prefix names it), so its entry would
 		// only inflate the load.
 		ckpt = BigEndian8(ev.SpanID)
-		bf, _ := bloom.New(h.bloomM, h.bloomK)
+		g := h.checkpoints.bloom(outgoingTTL, h.bloomM, h.bloomK)
+		bf, _ := bloom.New(g.m, g.k)
 		inherited = bf.ToBytes() // empty: nothing nameable below a checkpoint yet
 	}
 
@@ -140,7 +153,8 @@ func (h *PCRBBridgeHandler) OnStart(ev *Event, _ int) StartResult {
 	// this span). Checkpoints skip the self-add per the above.
 	propagated := inherited
 	if !isCheckpoint {
-		bf := bloom.Deserialize(inherited, h.bloomM, h.bloomK)
+		g := h.checkpoints.bloom(incomingTTL, h.bloomM, h.bloomK)
+		bf := bloom.Deserialize(inherited, g.m, g.k)
 		spanHex := HexOf(ev.SpanID)
 		bf.Add(spanHex[:])
 		propagated = bf.ToBytes()
@@ -151,7 +165,12 @@ func (h *PCRBBridgeHandler) OnStart(ev *Event, _ int) StartResult {
 		baggageBytes = BaggageKeyBytes + VarintLen(int(depth)) + h.prefixLen + len(propagated)
 	}
 
+	if baggageFound && h.checkpoints != nil {
+		baggageBytes++
+	}
+
 	h.state[stateKey{ev.TraceID, ev.SpanID}] = &pcrbState{
+		ttl:        outgoingTTL,
 		ckpt:       ckpt,
 		bloomBytes: propagated,
 		inherited:  inherited,
@@ -160,10 +179,11 @@ func (h *PCRBBridgeHandler) OnStart(ev *Event, _ int) StartResult {
 	}
 
 	return StartResult{
-		BaggageFound: baggageFound,
-		BaggageBytes: baggageBytes,
-		EmitBytes:    emitBytes,
-		Payload:      payload,
+		CheckpointTTL: outgoingTTL,
+		BaggageFound:  baggageFound,
+		BaggageBytes:  baggageBytes,
+		EmitBytes:     emitBytes,
+		Payload:       payload,
 	}
 }
 
@@ -183,6 +203,10 @@ func (h *PCRBBridgeHandler) OnEnd(ev *Event) EndResult {
 			VarintLen(int(ps.depth)) + h.prefixLen + len(ps.inherited)
 		if h.Capture {
 			payload = packPCRBPayload(int(ps.depth), ps.ckpt, h.prefixLen, ps.inherited)
+			h.checkpoints.tagPayload(payload, ps.ttl)
+		}
+		if h.checkpoints != nil && len(payload) > 0 {
+			payload[0] |= LeafPayloadFlag
 		}
 		ps.emitted = true
 	} else if !ps.emitted {

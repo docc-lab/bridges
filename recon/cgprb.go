@@ -43,11 +43,12 @@ var stealMeasure = os.Getenv("TRACE_RECON_STEALMEASURE") == "1"
 //
 //	type(1) || varint(depth) || ckptK || bloomBits || haBytes
 //
-// The bloom has the fixed PCRB geometry length, so the HA is the trailing
+// The Bloom geometry comes from fixed config or the assigned-distance type
+// bits in randomized mode. HA is the trailing
 // remainder: a sequence of entries, each big-endian 8-byte branch-parent id
 // followed by varint(child depth).
 func DecodeCGPRBPayload(p []byte, cfg Config) (depth int, prefix, bloomBits []byte, ha []HAEntry, err error) {
-	if len(p) < 2 || p[0] != byte(bridge.CGPRBBridgeTypeID) {
+	if len(p) < 2 || bridge.PayloadType(p[0]) != byte(bridge.CGPRBBridgeTypeID) {
 		return 0, nil, nil, nil, errors.New("recon: not a CGPRB payload")
 	}
 	d, n := binary.Uvarint(p[1:])
@@ -55,7 +56,11 @@ func DecodeCGPRBPayload(p []byte, cfg Config) (depth int, prefix, bloomBits []by
 		return 0, nil, nil, nil, errors.New("recon: bad depth varint")
 	}
 	rest := p[1+n:]
-	bloomLen := int((cfg.BloomM + 7) / 8)
+	_, bm, _, err := DecodeBloomGeometry(p, cfg)
+	if err != nil {
+		return 0, nil, nil, nil, err
+	}
+	bloomLen := int((bm + 7) / 8)
 	if len(rest) < cfg.PrefixLen+bloomLen {
 		return 0, nil, nil, nil, errors.New("recon: cgprb payload too short")
 	}
@@ -191,8 +196,8 @@ func ReconstructCGPRB(survivors []Span, cfg Config) Result {
 		return bf
 	}
 
-	synSeq := uint64(1) << 62 // synthetic id space, disjoint from real span ids
-	synOwner := make(map[uint64]int)   // synthetic id -> owning bridge index
+	synSeq := uint64(1) << 62        // synthetic id space, disjoint from real span ids
+	synOwner := make(map[uint64]int) // synthetic id -> owning bridge index
 	phase1Anchor := make([]uint64, len(res.Bridges))
 	for bi := range res.Bridges {
 		phase1Anchor[bi] = res.Bridges[bi].AnchorID

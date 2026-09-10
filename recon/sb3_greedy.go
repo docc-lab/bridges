@@ -75,11 +75,73 @@ type sb3BloomIDIndex struct {
 }
 
 func newSB3BloomIDIndex(cfg Config) *sb3BloomIDIndex {
-	idx := &sb3BloomIDIndex{cfg: cfg, fast: cfg.BloomM <= 64}
-	for i := range idx.buckets {
-		idx.buckets[i] = make(map[uint16][]sb3BloomIndexEntry)
+	// Randomized windows can have different M/K; their exact window indexes
+	// query each carrier's filter directly instead of caching global masks.
+	idx := &sb3BloomIDIndex{cfg: cfg, fast: cfg.BloomM <= 64 && !cfg.RandomizedCheckpoints}
+	if idx.fast {
+		for i := range idx.buckets {
+			idx.buckets[i] = make(map[uint16][]sb3BloomIndexEntry)
+		}
 	}
 	return idx
+}
+
+// Known window roots partition candidate indexes before Bloom lookup. Bucket
+// zero holds fragments whose window is still unknown; fixed mode uses only it.
+type sb3WindowIDIndex struct {
+	cfg         Config
+	checkpoints *checkpointIndex
+	byWindow    map[uint64]map[int]*sb3BloomIDIndex
+}
+
+func newSB3WindowIDIndex(cfg Config, checkpoints *checkpointIndex) *sb3WindowIDIndex {
+	return &sb3WindowIDIndex{cfg: cfg, checkpoints: checkpoints, byWindow: make(map[uint64]map[int]*sb3BloomIDIndex)}
+}
+
+func (idx *sb3WindowIDIndex) add(id uint64, depth int, span *Span) {
+	add := func(root uint64) {
+		byDepth := idx.byWindow[root]
+		if byDepth == nil {
+			byDepth = make(map[int]*sb3BloomIDIndex)
+			idx.byWindow[root] = byDepth
+		}
+		bucket := byDepth[depth]
+		if bucket == nil {
+			bucket = newSB3BloomIDIndex(idx.cfg)
+			byDepth[depth] = bucket
+		}
+		bucket.add(id, span)
+	}
+	if idx.checkpoints != nil {
+		if w := idx.checkpoints.bySpan[id]; w != nil && w.known {
+			for _, root := range w.roots {
+				add(root.SpanID)
+			}
+			return
+		}
+	}
+	add(0)
+}
+
+func (idx *sb3WindowIDIndex) query(roots []*Span, depth int, bf *bloom.Filter) []sb3BloomIndexEntry {
+	out := idx.byWindow[0][depth].query(bf)
+	if !idx.cfg.RandomizedCheckpoints {
+		return out
+	}
+	for _, root := range roots {
+		out = append(out, idx.byWindow[root.SpanID][depth].query(bf)...)
+	}
+	if len(out) < 2 {
+		return out
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
+	unique := out[:1]
+	for _, entry := range out[1:] {
+		if entry.id != unique[len(unique)-1].id {
+			unique = append(unique, entry)
+		}
+	}
+	return unique
 }
 
 func (idx *sb3BloomIDIndex) add(id uint64, span *Span) {
@@ -245,6 +307,9 @@ func sb3ConfirmAnchorChain(sk *cgpSkeleton, e *sb3FragmentEvidence, start *Span)
 	seen := make(map[uint64]bool)
 	for cur := start; cur != nil && !seen[cur.SpanID]; {
 		seen[cur.SpanID] = true
+		if !sk.checkpoints.allows(cur.SpanID, e.checkpoints) {
+			return m
+		}
 		if cur.Depth <= lo {
 			m.ok = cur.Depth == lo && checkpointIDs[cur.SpanID]
 			return m
@@ -259,7 +324,7 @@ func sb3ConfirmAnchorChain(sk *cgpSkeleton, e *sb3FragmentEvidence, start *Span)
 		}
 		parent := sk.byID[cur.ParentID]
 		if parent == nil {
-			if cur.ParentID != 0 && confirmLevel(cur.ParentID, parentDepth) {
+			if cur.ParentID != 0 && sk.checkpoints.allows(cur.ParentID, e.checkpoints) && confirmLevel(cur.ParentID, parentDepth) {
 				m.ok = true
 			}
 			return m
@@ -285,25 +350,15 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 	if cpd < 1 {
 		cpd = 1
 	}
-	haIndex := make(map[int]*sb3BloomIDIndex)
+	haIndex := newSB3WindowIDIndex(cfg, sk.checkpoints)
 	for id, fo := range sk.fanouts {
-		idx := haIndex[fo.depth]
-		if idx == nil {
-			idx = newSB3BloomIDIndex(cfg)
-			haIndex[fo.depth] = idx
-		}
-		idx.add(id, nil)
+		haIndex.add(id, fo.depth, nil)
 	}
-	survIndex := make(map[int]*sb3BloomIDIndex)
+	survIndex := newSB3WindowIDIndex(cfg, sk.checkpoints)
 	ckptByDepthPrefix := make(map[int]map[string][]*Span)
 	for _, s := range sk.byID {
-		if !s.LeafCarrier {
-			idx := survIndex[s.Depth]
-			if idx == nil {
-				idx = newSB3BloomIDIndex(cfg)
-				survIndex[s.Depth] = idx
-			}
-			idx.add(s.SpanID, s)
+		if !s.LeafCarrier && (!cfg.RandomizedCheckpoints || s.BloomBits == nil) {
+			survIndex.add(s.SpanID, s.Depth, s)
 		}
 		if s.Depth%cpd == 0 {
 			id := bridge.BigEndian8(s.SpanID)
@@ -339,16 +394,22 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 		if prefixLen > len(f.prefix) {
 			prefixLen = len(f.prefix)
 		}
-		if prefixLen > 0 {
+		if cfg.RandomizedCheckpoints {
+			e.checkpoints = append(e.checkpoints, sk.checkpoints.matches(f.carrier)...)
+		} else if prefixLen > 0 {
 			e.checkpoints = append(e.checkpoints, ckptByDepthPrefix[lo][string(f.prefix[:prefixLen])]...)
 		}
 		if len(e.checkpoints) == 0 {
 			e.checkpoints = append(e.checkpoints, f.anchorCkpt)
 		}
 		for _, s := range f.spans {
-			if s.BloomBits != nil && wtop(s.Depth) == lo {
+			sameWindow := wtop(s.Depth) == lo
+			if cfg.RandomizedCheckpoints {
+				sameWindow = sk.checkpoints.contains(s, f.anchorCkpt)
+			}
+			if s.BloomBits != nil && sameWindow {
 				e.blooms = append(e.blooms, sb3WinBloom{
-					carrier: s.SpanID, depth: s.Depth, bf: cgpBloom(s.BloomBits, cfg),
+					carrier: s.SpanID, depth: s.Depth, bf: cgpSpanBloom(s, cfg),
 				})
 			}
 		}
@@ -394,7 +455,10 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 		}
 		// root.Depth-1 is the exact named parent, not a routing choice.
 		for d := hi - 2; d > lo; d-- {
-			for _, candidate := range haIndex[d].query(queryBloom) {
+			for _, candidate := range haIndex.query(e.checkpoints, d, queryBloom) {
+				if !sk.checkpoints.allows(candidate.id, e.checkpoints) {
+					continue
+				}
 				key := bridge.HexOf(candidate.id)
 				if confirmedByAll(key[:], d) {
 					e.fanouts[d] = append(e.fanouts[d], candidate.id)
@@ -402,7 +466,7 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 			}
 		}
 		for d := hi - 2; d > lo; d-- {
-			for _, candidate := range survIndex[d].query(queryBloom) {
+			for _, candidate := range survIndex.query(e.checkpoints, d, queryBloom) {
 				if chain != nil {
 					chain.CandidateInitialHits++
 				}
@@ -1118,6 +1182,46 @@ func sb3RollbackRoute(parent map[uint64]uint64, inserted []uint64) {
 	}
 }
 
+// A greedy join can reuse a route installed for another fragment. Its actual
+// ancestry must still stay in every member's assigned checkpoint window,
+// including when the joined fragment originally borrowed its window evidence.
+func sb3UnitWindowCompatible(sk *cgpSkeleton, u *sb3RouteUnit, parent map[uint64]uint64) bool {
+	if sk.checkpoints == nil || !sk.checkpoints.cfg.RandomizedCheckpoints {
+		return true
+	}
+	for _, e := range u.members {
+		if !e.resolved {
+			continue
+		}
+		floor := e.ckpt.Depth
+		cur := u.parentID
+		for d := u.depth; d >= floor; d-- {
+			if !sk.checkpoints.allows(cur, e.checkpoints) {
+				return false
+			}
+			if s := sk.byID[cur]; s != nil && s.Depth != d {
+				return false
+			}
+			if d == floor {
+				matched := false
+				for _, root := range e.checkpoints {
+					matched = matched || cur == root.SpanID
+				}
+				if !matched {
+					return false
+				}
+				break
+			}
+			next, connected := parent[cur]
+			if !connected {
+				break // a later upstream route will check this window again
+			}
+			cur = next
+		}
+	}
+	return true
+}
+
 // sb3UnitHardCompatible treats the partial topology as a three-valued path:
 // satisfied, contradicted, or unresolved. Every reconstructed node has an
 // absolute depth. Reaching the witness depth with a different node proves the
@@ -1627,8 +1731,8 @@ func (t *sb3OrdinalTxn) rollback() {
 // candidate touches the few fanouts on its own path instead of rescanning the
 // entire window.
 type sb3OrdinalAssignments struct {
-	cfg            Config
 	carrierWindow  map[uint64]uint64
+	windowDepth    map[uint64]int
 	unitCarriers   map[*sb3RouteUnit][]*Span
 	nodes          map[uint64]*sb3OrdinalNodeState
 	added          map[uint64]bool
@@ -1644,33 +1748,17 @@ type sb3OrdinalAssignments struct {
 }
 
 func sb3BuildOrdinalAssignments(sk *cgpSkeleton, cfg Config, units []*sb3RouteUnit, parent map[uint64]uint64) *sb3OrdinalAssignments {
-	cpd := cfg.CPD
-	if cpd < 1 {
-		cpd = 1
-	}
 	prefixLen := cfg.PrefixLen
 	if prefixLen < 1 {
 		prefixLen = 1
 	} else if prefixLen > 8 {
 		prefixLen = 8
 	}
-	type windowKey struct {
-		depth  int
-		prefix string
-	}
-	checkpoints := make(map[windowKey][]uint64)
-	for id, s := range sk.byID {
-		if s.Depth%cpd != 0 {
-			continue
-		}
-		raw := bridge.BigEndian8(id)
-		key := windowKey{depth: s.Depth, prefix: string(raw[:prefixLen])}
-		checkpoints[key] = append(checkpoints[key], id)
-	}
+	checkpoints := sk.checkpoints
 
 	a := &sb3OrdinalAssignments{
-		cfg:            cfg,
 		carrierWindow:  make(map[uint64]uint64),
+		windowDepth:    make(map[uint64]int),
 		unitCarriers:   make(map[*sb3RouteUnit][]*Span, len(units)),
 		nodes:          make(map[uint64]*sb3OrdinalNodeState),
 		added:          make(map[uint64]bool),
@@ -1682,17 +1770,13 @@ func sb3BuildOrdinalAssignments(sk *cgpSkeleton, cfg Config, units []*sb3RouteUn
 		if s.BloomBits == nil || s.Depth == 0 || len(s.CkptPrefix) < prefixLen {
 			continue
 		}
-		floor := (s.Depth / cpd) * cpd
-		if s.Depth%cpd == 0 {
-			floor = s.Depth - cpd
-		}
-		key := windowKey{depth: floor, prefix: string(s.CkptPrefix[:prefixLen])}
-		hits := checkpoints[key]
+		hits := checkpoints.matches(s)
 		if len(hits) != 1 {
 			continue
 		}
-		window := hits[0]
+		window := hits[0].SpanID
 		a.carrierWindow[s.SpanID] = window
+		a.windowDepth[window] = hits[0].Depth
 	}
 
 	for _, u := range units {
@@ -1768,14 +1852,7 @@ func (a *sb3OrdinalAssignments) connectedCode(s *Span, parent map[uint64]uint64)
 	if window == 0 || a.invalidWindows[window] {
 		return sb3OrdinalCursor{}, false
 	}
-	cpd := a.cfg.CPD
-	if cpd < 1 {
-		cpd = 1
-	}
-	floor := (s.Depth / cpd) * cpd
-	if s.Depth%cpd == 0 {
-		floor = s.Depth - cpd
-	}
+	floor := a.windowDepth[window]
 	cur := s.SpanID
 	rev := make([]uint64, 0, s.Depth-floor)
 	for d := s.Depth; d > floor; d-- {
@@ -2066,7 +2143,11 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 
 			inserted := sb3ApplyUnitRoute(parent, u)
 			stats.CandidateEvaluations++
-			haTxn, hardOK := ha.tryEdges(inserted, parent)
+			hardOK := sb3UnitWindowCompatible(sk, u, parent)
+			var haTxn *sb3HATxn
+			if hardOK {
+				haTxn, hardOK = ha.tryEdges(inserted, parent)
+			}
 			ordinalOK := true
 			var ordinalTxn *sb3OrdinalTxn
 			if hardOK && !cfg.SB3IgnoreOrdinals {
@@ -2115,6 +2196,11 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 			u.nodeChoice[d] = id
 		}
 		inserted := sb3ApplyUnitRoute(parent, u)
+		if !sb3UnitWindowCompatible(sk, u, parent) {
+			sb3RollbackRoute(parent, inserted)
+			u.anchor = nil
+			return false
+		}
 		if _, ok := ha.tryEdges(inserted, parent); !ok {
 			stats.Fanout.HardRouteCandidatesRejected++
 			u.hardRouteCandidatesRejected++

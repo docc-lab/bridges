@@ -2,17 +2,20 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
+
+	"bridges/bridge"
 )
 
 // writeBagsizeJSON emits a Python-compatible json.dump(out, f, indent=2)
 // representation of the bagsize output. Float formatting matches Python's
 // repr(): whole-number floats get a trailing ".0", others use the shortest
 // roundtrip representation.
-func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emitDepth, emitOC bool) error {
+func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emitDepth, emitOC bool, policies ...*bridge.CheckpointRange) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -24,6 +27,13 @@ func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emi
 	w := bw
 	io.WriteString(w, "{\n")
 	fmt.Fprintf(w, "  \"checkpoint_distance\": %d,\n", checkpointDistance)
+	if len(policies) > 0 && policies[0] != nil {
+		raw, err := json.Marshal(policies[0])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(w, "  \"checkpoint_randomization\": %s,\n", raw)
+	}
 	fmt.Fprintf(w, "  \"num_traces\": %d,\n", len(m))
 
 	writeIntArr(w, "num_spans", m, func(t TraceMetrics) int { return t.NumSpans }, true)

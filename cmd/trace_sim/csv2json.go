@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"bridges/bridge"
 )
 
 // runCSV2JSON converts a --stream-metrics CSV (one row per finalized trace) into
@@ -30,6 +32,8 @@ func runCSV2JSON(args []string) {
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	var checkpointRange string
+	var checkpointSeed int64
 	cpd := 0
 	emitDepth, emitOC := false, false
 	var metrics []TraceMetrics
@@ -45,6 +49,14 @@ func runCSV2JSON(args []string) {
 					continue
 				}
 				switch p[0] {
+				case "checkpoint_range":
+					checkpointRange = p[1]
+				case "checkpoint_seed":
+					checkpointSeed, err = strconv.ParseInt(p[1], 10, 64)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "line %d: invalid checkpoint seed %q\n", lineNo, p[1])
+						os.Exit(2)
+					}
 				case "cpd":
 					cpd, _ = strconv.Atoi(p[1])
 				case "emit_depth":
@@ -84,7 +96,12 @@ func runCSV2JSON(args []string) {
 		fmt.Fprintf(os.Stderr, "read %s: %v\n", in, err)
 		os.Exit(1)
 	}
-	if err := writeBagsizeJSON(out, cpd, metrics, emitDepth, emitOC); err != nil {
+	policy, err := bridge.ParseCheckpointRange(checkpointRange, checkpointSeed)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := writeBagsizeJSON(out, cpd, metrics, emitDepth, emitOC, policy); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", out, err)
 		os.Exit(1)
 	}

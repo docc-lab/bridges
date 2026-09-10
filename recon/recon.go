@@ -86,16 +86,20 @@ type Span struct {
 	// BloomBits is the raw bloom bit array from the _br payload, nil for
 	// spans that carried only _d.
 	BloomBits []byte
+	// Randomized payloads describe their incoming window's Bloom geometry in
+	// the existing type byte. Zero M/K retains fixed-geometry caller behavior.
+	WindowCPD      int
+	BloomM, BloomK uint32
 
 	// CkptPrefix is the truncated checkpoint-root span ID from a PCR _br
 	// payload (see recon/pcr.go), nil for spans that carried only _d.
 	// Mutually exclusive with BloomBits — a corpus is run in one mode.
 	CkptPrefix []byte
 
-	// LeafCarrier distinguishes a leaf checkpoint from a periodic checkpoint:
-	// both carry _br and terminate a reconstruction window, but only a leaf
-	// checkpoint is provably unable to be a threading candidate. Any Bloom
-	// positive on a leaf is therefore a structurally impossible attachment.
+	// LeafCarrier marks a leaf that emitted before a scheduled checkpoint.
+	// It closes a partial window without resetting baggage. Fixed mode derives
+	// this from depth; randomized mode reads the flag in the payload type byte.
+	// Such a leaf cannot be an ancestor candidate, even with a Bloom positive.
 	LeafCarrier bool
 
 	// HA is the decoded CGPRB hash array: the in-window branch points this
@@ -122,9 +126,14 @@ type HAEntry struct {
 // the bridge deployment configuration. Bloom geometry derives from CPD and
 // the false-positive rate exactly as the SDK computes it.
 type Config struct {
-	CPD    int
-	BloomM uint32
-	BloomK uint32
+	// RandomizedCheckpoints resolves windows from checkpoint-root identities.
+	// CPD is then the maximum spacing (maximum outgoing TTL + 1), not a cadence.
+	RandomizedCheckpoints bool
+	CheckpointMin         int
+	BloomFP               float64
+	CPD                   int
+	BloomM                uint32
+	BloomK                uint32
 
 	// FPBits is the S-Bridge non-checkpoint fingerprint width (bits). 0 => 16
 	// (the legacy 2-byte fp). Must match the width the payloads were emitted with.

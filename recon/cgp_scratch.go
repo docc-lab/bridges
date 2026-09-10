@@ -87,10 +87,11 @@ type cgpFanout struct {
 // cgpSkeleton is the output of Phase 1: the structural facts derived purely from
 // the survivors and their carried evidence, before any bloom guessing.
 type cgpSkeleton struct {
-	byID      map[uint64]*Span      // SpanID -> survivor
-	childrenS map[uint64][]*Span    // surviving-edge children (parent must survive)
-	frags     []*cgpFragment        // connected components
-	fanouts   map[uint64]*cgpFanout // HA-witnessed dropped fan-outs, by id
+	checkpoints *checkpointIndex
+	byID        map[uint64]*Span      // SpanID -> survivor
+	childrenS   map[uint64][]*Span    // surviving-edge children (parent must survive)
+	frags       []*cgpFragment        // connected components
+	fanouts     map[uint64]*cgpFanout // HA-witnessed dropped fan-outs, by id
 }
 
 // cgpParse performs Phase 1: it partitions the survivors into fragments,
@@ -105,6 +106,7 @@ func cgpParse(survivors []Span, cfg Config) *cgpSkeleton {
 	for i := range survivors {
 		sk.byID[survivors[i].SpanID] = &survivors[i]
 	}
+	sk.checkpoints = newCheckpointIndex(sk.byID, cfg)
 	for i := range survivors {
 		s := &survivors[i]
 		if s.ParentID == 0 {
@@ -263,7 +265,7 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 			continue
 		}
 		if f.carrier.BloomBits != nil {
-			f.bf = cgpBloom(f.carrier.BloomBits, cfg)
+			f.bf = cgpSpanBloom(f.carrier, cfg)
 		}
 		f.prefix = f.carrier.CkptPrefix
 		f.viaCarrier = 0
@@ -296,14 +298,29 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 		mk := bridge.HexOf(r.ParentID)
 		haveMF := r.ParentID != 0
 		wbot := (r.Depth/cfg.CPD + 1) * cfg.CPD // window-bottom checkpoint depth
+		if cfg.RandomizedCheckpoints {
+			wbot = r.Depth + cfg.CPD - 1
+		}
 		for d := r.Depth + 1; d <= wbot && f.carrier == nil; d++ {
 			for _, c := range carriersByDepth[d] {
-				bf := cgpBloom(c.BloomBits, cfg)
+				if cfg.RandomizedCheckpoints {
+					hits := sk.checkpoints.matches(c)
+					if !commonCheckpointDepth(hits) || hits[0].Depth >= r.Depth-1 {
+						continue
+					}
+					if !sk.checkpoints.allows(r.SpanID, hits) || !sk.checkpoints.allows(r.ParentID, hits) {
+						continue
+					}
+				}
+				bf := cgpSpanBloom(c, cfg)
 				if !bf.Test(rk[:]) {
 					continue
 				}
 				if haveMF && !bf.Test(mk[:]) {
 					continue
+				}
+				if cfg.RandomizedCheckpoints {
+					sk.checkpoints.bindBorrowed(r.SpanID, sk.checkpoints.matches(c))
 				}
 				f.carrier = c
 				f.bf = bf
@@ -322,6 +339,16 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 // ============================================================================
 
 func cgpResolveAnchors(sk *cgpSkeleton, cfg Config) {
+	if cfg.RandomizedCheckpoints {
+		for _, f := range sk.frags {
+			hits := sk.checkpoints.matches(f.carrier)
+			f.anchorAmbig = len(hits) > 1
+			if commonCheckpointDepth(hits) {
+				f.anchorCkpt = hits[0]
+			}
+		}
+		return
+	}
 	// Index surviving checkpoints by depth (depth % cpd == 0).
 	ckptByDepth := make(map[int][]*Span)
 	for _, s := range sk.byID {
@@ -459,7 +486,7 @@ func cgpGenCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
 		gather := func(frag *cgpFragment) {
 			for _, s := range frag.spans {
 				if s.BloomBits != nil && wtop(s.Depth) == lo {
-					blooms = append(blooms, winBloom{s.Depth, cgpBloom(s.BloomBits, cfg)})
+					blooms = append(blooms, winBloom{s.Depth, cgpSpanBloom(s, cfg)})
 				}
 			}
 		}
@@ -1874,7 +1901,7 @@ func cgpGreedyCandidates(sk *cgpSkeleton, cfg Config) *cgpCandidates {
 		var bdepth []int
 		for _, s := range f.spans {
 			if s.BloomBits != nil && wtop(s.Depth) == lo {
-				blooms = append(blooms, cgpBloom(s.BloomBits, cfg))
+				blooms = append(blooms, cgpSpanBloom(s, cfg))
 				bdepth = append(bdepth, s.Depth)
 			}
 		}

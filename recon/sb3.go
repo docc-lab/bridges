@@ -20,7 +20,11 @@ func DecodeSB3SpanPayload(p []byte, cfg Config) (depth int, prefix, bits []byte,
 // route those records by DEEQuad.TraceID16 before passing them to
 // ReconstructSB3WithDEE; the carrier span may belong to a later trace.
 func DecodeSB3SpanPayloadFull(p []byte, cfg Config) (depth int, prefix, bits []byte, ha []HAEntry, ords []bridge.SB3Branch, dees []bridge.DEEQuad, err error) {
-	bloomLen := int((cfg.BloomM + 7) / 8)
+	_, bm, _, err := DecodeBloomGeometry(p, cfg)
+	if err != nil {
+		return 0, nil, nil, nil, nil, nil, err
+	}
+	bloomLen := int((bm + 7) / 8)
 	fpBits := cfg.FPBits
 	if fpBits <= 0 {
 		fpBits = 16
@@ -179,6 +183,18 @@ func (a *sb3Aligner) alignNode(node uint64, codes []sb3Code, bottomDepth int) {
 		}
 	}
 	if a.depth[node] >= bottomDepth {
+		return
+	}
+	// A randomized checkpoint closes this window even when other branches
+	// continue deeper. Its children belong to the next window.
+	terminal := true
+	for _, c := range codes {
+		if len(c.path) != 0 {
+			terminal = false
+			break
+		}
+	}
+	if terminal {
 		return
 	}
 
@@ -349,6 +365,11 @@ func runSB3Alignment(survivors []Span, cfg Config, topo Result) (*sb3Aligner, ui
 		}
 	}
 
+	byID := make(map[uint64]*Span, len(survivors))
+	for i := range survivors {
+		byID[survivors[i].SpanID] = &survivors[i]
+	}
+	checkpoints := newCheckpointIndex(byID, cfg)
 	windows := make(map[uint64][]sb3Code)
 	for i := range survivors {
 		s := &survivors[i]
@@ -361,6 +382,14 @@ func runSB3Alignment(survivors []Span, cfg Config, topo Result) (*sb3Aligner, ui
 		floor := (s.Depth / cpd) * cpd
 		if s.Depth%cpd == 0 {
 			floor = s.Depth - cpd
+		}
+		if cfg.RandomizedCheckpoints {
+			hits := checkpoints.matches(s)
+			if !commonCheckpointDepth(hits) {
+				a.conflictAt(s.SpanID, "carrier %016x has unresolved checkpoint identity", s.SpanID)
+				continue
+			}
+			floor = hits[0].Depth
 		}
 		cur := s.SpanID
 		rev := make([]uint64, 0, s.Depth-floor)
@@ -377,6 +406,12 @@ func runSB3Alignment(survivors []Span, cfg Config, topo Result) (*sb3Aligner, ui
 		if !ok || a.depth[cur] != floor {
 			a.conflictAt(s.SpanID, "carrier %016x cannot reach checkpoint floor depth %d", s.SpanID, floor)
 			continue
+		}
+		if cfg.RandomizedCheckpoints {
+			if !checkpoints.contains(s, byID[cur]) {
+				a.conflictAt(s.SpanID, "carrier %016x reaches a different checkpoint", s.SpanID)
+				continue
+			}
 		}
 		path := make([]uint64, len(rev))
 		for j := range rev {

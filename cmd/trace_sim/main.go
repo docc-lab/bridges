@@ -29,6 +29,7 @@ type config struct {
 	outputPath         string
 	mode               string
 	checkpointDistance int
+	checkpointPolicy   *bridge.CheckpointRange
 	bagsize            bool
 	traceCount         int
 	requireClean       bool
@@ -62,6 +63,10 @@ func parseFlags() config {
 	flag.StringVar(&c.corpusDir, "corpus", "", "Read events.bin + meta.bin from this corpus dir (skips JSON parse)")
 	flag.StringVar(&c.mode, "mode", "vanilla", "Bridge mode: vanilla, pb, cgpb, sbridge, sb3, pcr, pcrb, cgprb")
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
+	var checkpointRange string
+	var checkpointSeed int64
+	flag.StringVar(&checkpointRange, "checkpoint-range", "", "Randomized checkpoint distance, inclusive MIN:MAX (1..256); outgoing TTL is sampled distance minus one")
+	flag.Int64Var(&checkpointSeed, "checkpoint-seed", 42, "Seed for randomized checkpoints, independent of drop and sampling seeds")
 	flag.BoolVar(&c.bagsize, "bagsize", false, "Output per-trace bagsize metrics")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
 	flag.IntVar(&c.sampleCount, "sample", 0, "Corpus mode: if >0, simulate a RANDOM sample of this many traces (uniform over the trace order, seeded by --sample-seed). Same seed => same sample (match the recon sweep's --sample/--sample-seed for overhead-vs-accuracy on identical traces).")
@@ -90,6 +95,19 @@ func parseFlags() config {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	var checkpointErr error
+	c.checkpointPolicy, checkpointErr = bridge.ParseCheckpointRange(checkpointRange, checkpointSeed)
+	if checkpointErr != nil {
+		fmt.Fprintln(os.Stderr, "error:", checkpointErr)
+		os.Exit(2)
+	}
+	if c.checkpointPolicy != nil {
+		if c.mode != "pcrb" && c.mode != "cgprb" && c.mode != "sb3" {
+			fmt.Fprintln(os.Stderr, "error: --checkpoint-range is supported only for pcrb, cgprb, sb3")
+			os.Exit(2)
+		}
+		c.checkpointDistance = c.checkpointPolicy.MaxDistance()
+	}
 	if c.corpusDir == "" {
 		if flag.NArg() < 1 {
 			fmt.Fprintln(os.Stderr, "error: input_dir or --corpus required")
@@ -125,7 +143,15 @@ func parseFlags() config {
 	return c
 }
 
-func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint64) string) bridge.Handler {
+func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint64) string) (h bridge.Handler) {
+	if c.checkpointPolicy != nil {
+		c.checkpointDistance = c.checkpointPolicy.MaxDistance()
+	}
+	defer func() {
+		if err := bridge.ConfigureCheckpoints(h, c.checkpointPolicy); err != nil {
+			panic(err)
+		}
+	}()
 	switch c.mode {
 	case "vanilla":
 		return bridge.NewVanillaHandler()
@@ -232,7 +258,7 @@ func main() {
 		// Post-process with cmd/bagsize_csv2json to get the bagsize JSON.
 		fmt.Fprintf(os.Stderr, "Streamed per-trace metrics to %s\n", c.streamMetrics)
 	} else if c.outputPath != "" {
-		if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth, c.emitOC); err != nil {
+		if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth, c.emitOC, c.checkpointPolicy); err != nil {
 			fmt.Fprintf(os.Stderr, "write output: %v\n", err)
 			os.Exit(1)
 		}
@@ -350,7 +376,7 @@ func runFromCorpus(c config, hist *sizeHistograms) []TraceMetrics {
 
 	var stream *streamWriter
 	if c.streamMetrics != "" {
-		sw, err := newStreamWriter(c.streamMetrics, c.checkpointDistance, c.emitDepth, c.emitOC)
+		sw, err := newStreamWriter(c.streamMetrics, c.checkpointDistance, c.emitDepth, c.emitOC, c.checkpointPolicy)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "open stream-metrics file: %v\n", err)
 			os.Exit(1)

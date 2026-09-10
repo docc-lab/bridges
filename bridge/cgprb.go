@@ -31,14 +31,17 @@ import (
 //
 //	type(1) || varint(absolute depth) || ckptK || bloomBits || haBytes
 //
-// bloomBits has the fixed PCRB geometry length, so the decoder splits the HA
-// off as the trailing remainder. Depth is always absolute (PCR convention).
+// bloomBits uses the assigned window's geometry in randomized mode, identified
+// by the existing type byte; fixed mode uses deployment geometry. HA follows
+// as the trailing remainder. Depth is always absolute (PCR convention).
 type CGPRBBridgeHandler struct {
-	cpd       uint32
-	prefixLen int
-	bloomM    uint32
-	bloomK    uint32
-	bloomLen  int
+	cpd         uint32
+	checkpoints *CheckpointRange
+	bloomFP     float64
+	prefixLen   int
+	bloomM      uint32
+	bloomK      uint32
+	bloomLen    int
 
 	// Capture materializes serialized payloads for the reconstruction harness.
 	Capture bool
@@ -47,6 +50,7 @@ type CGPRBBridgeHandler struct {
 }
 
 type cgprbState struct {
+	ttl         byte
 	ckpt        [8]byte
 	bloomBytes  []byte // propagated bloom (inherited + self; checkpoints: empty)
 	inherited   []byte // pre-self bloom — what this span emits in its own payload
@@ -73,6 +77,7 @@ func NewCGPRBBridgeHandler(checkpointDistance, prefixLen int, bloomFPRate float6
 	m, k := bloom.EstimateParameters(PCRBBloomCapacity(checkpointDistance), bloomFPRate)
 	return &CGPRBBridgeHandler{
 		cpd:       uint32(checkpointDistance),
+		bloomFP:   bloomFPRate,
 		prefixLen: prefixLen,
 		bloomM:    m,
 		bloomK:    k,
@@ -99,9 +104,6 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		depth = parentState.depth + 1
 		ckpt = parentState.ckpt
 		inherited = parentState.bloomBytes
-	} else {
-		bf, _ := bloom.New(h.bloomM, h.bloomK)
-		inherited = bf.ToBytes()
 	}
 
 	// HA inheritance: only the FIRST child carries the parent's accumulated HA
@@ -120,7 +122,17 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		ha = next
 	}
 
-	isCheckpoint := depth%h.cpd == 0
+	var incomingTTL byte
+	if parentState != nil {
+		incomingTTL = parentState.ttl
+	}
+	isCheckpoint, outgoingTTL := h.checkpoints.next(ev, parentState != nil, incomingTTL, int(depth), int(h.cpd))
+	if parentState == nil {
+		incomingTTL = outgoingTTL
+		g := h.checkpoints.bloom(incomingTTL, h.bloomM, h.bloomK)
+		bf, _ := bloom.New(g.m, g.k)
+		inherited = bf.ToBytes()
+	}
 
 	var emitBytes int
 	var payload []byte
@@ -131,10 +143,12 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 			VarintLen(int(depth)) + h.prefixLen + len(inherited) + len(ha)
 		if h.Capture {
 			payload = packCGPRBPayload(int(depth), ckpt, h.prefixLen, inherited, ha)
+			h.checkpoints.tagPayload(payload, incomingTTL)
 		}
 		// Re-root and reset bloom AND ha for the new window.
 		ckpt = BigEndian8(ev.SpanID)
-		bf, _ := bloom.New(h.bloomM, h.bloomK)
+		g := h.checkpoints.bloom(outgoingTTL, h.bloomM, h.bloomK)
+		bf, _ := bloom.New(g.m, g.k)
 		inherited = bf.ToBytes()
 		ha = nil
 	}
@@ -144,7 +158,8 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	// branching parent's 2nd child, never by the parent itself.
 	propagated := inherited
 	if !isCheckpoint {
-		bf := bloom.Deserialize(inherited, h.bloomM, h.bloomK)
+		g := h.checkpoints.bloom(incomingTTL, h.bloomM, h.bloomK)
+		bf := bloom.Deserialize(inherited, g.m, g.k)
 		spanHex := HexOf(ev.SpanID)
 		bf.Add(spanHex[:])
 		propagated = bf.ToBytes()
@@ -155,7 +170,12 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		baggageBytes = BaggageKeyBytes + VarintLen(int(depth)) + h.prefixLen + len(propagated) + len(ha)
 	}
 
+	if baggageFound && h.checkpoints != nil {
+		baggageBytes++
+	}
+
 	h.state[stateKey{ev.TraceID, ev.SpanID}] = &cgprbState{
+		ttl:        outgoingTTL,
 		ckpt:       ckpt,
 		bloomBytes: propagated,
 		inherited:  inherited,
@@ -165,10 +185,11 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	}
 
 	return StartResult{
-		BaggageFound: baggageFound,
-		BaggageBytes: baggageBytes,
-		EmitBytes:    emitBytes,
-		Payload:      payload,
+		CheckpointTTL: outgoingTTL,
+		BaggageFound:  baggageFound,
+		BaggageBytes:  baggageBytes,
+		EmitBytes:     emitBytes,
+		Payload:       payload,
 	}
 }
 
@@ -188,6 +209,10 @@ func (h *CGPRBBridgeHandler) OnEnd(ev *Event) EndResult {
 			VarintLen(int(ps.depth)) + h.prefixLen + len(ps.inherited) + len(ps.ha)
 		if h.Capture {
 			payload = packCGPRBPayload(int(ps.depth), ps.ckpt, h.prefixLen, ps.inherited, ps.ha)
+			h.checkpoints.tagPayload(payload, ps.ttl)
+		}
+		if h.checkpoints != nil && len(payload) > 0 {
+			payload[0] |= LeafPayloadFlag
 		}
 		ps.emitted = true
 	} else if !ps.emitted {
@@ -202,7 +227,7 @@ const cgprbTypeTagBytes = 1
 
 // packCGPRBPayload serializes the on-wire _br value:
 // type(1) || varint(depth) || ckptK || bloomBits || haBytes. The bloom has the
-// fixed PCRB geometry length, so the HA is recovered as the trailing remainder.
+// configured or type-byte-identified geometry; HA is the trailing remainder.
 func packCGPRBPayload(depth int, ckpt [8]byte, prefixLen int, bloomBytes, haBytes []byte) []byte {
 	out := make([]byte, 0, 1+VarintLen(depth)+prefixLen+len(bloomBytes)+len(haBytes))
 	out = append(out, byte(CGPRBBridgeTypeID))

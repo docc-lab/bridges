@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"sync"
 
@@ -78,28 +79,30 @@ func snapshotHistogram(m map[int]uint64) histogramOutput {
 }
 
 type sizeHistogramFile struct {
-	Schema             string                        `json:"schema"`
-	Mode               string                        `json:"mode"`
-	CheckpointDistance int                           `json:"checkpoint_distance"`
-	LehmerEE           bool                          `json:"lehmer_ee"`
-	DEEInstanceQueues  bool                          `json:"dee_instance_queues"`
-	DEEDequeueOne      bool                          `json:"dee_dequeue_one"`
-	DEEQueueStats      *bridge.DEEQueueStatsSnapshot `json:"dee_queue_stats,omitempty"`
-	BaggageCallBytes   histogramOutput               `json:"baggage_call_bytes"`
-	BridgePayloadBytes histogramOutput               `json:"bridge_payload_bytes"`
+	Schema                  string                        `json:"schema"`
+	Mode                    string                        `json:"mode"`
+	CheckpointDistance      int                           `json:"checkpoint_distance"`
+	CheckpointRandomization *bridge.CheckpointRange       `json:"checkpoint_randomization,omitempty"`
+	LehmerEE                bool                          `json:"lehmer_ee"`
+	DEEInstanceQueues       bool                          `json:"dee_instance_queues"`
+	DEEDequeueOne           bool                          `json:"dee_dequeue_one"`
+	DEEQueueStats           *bridge.DEEQueueStatsSnapshot `json:"dee_queue_stats,omitempty"`
+	BaggageCallBytes        histogramOutput               `json:"baggage_call_bytes"`
+	BridgePayloadBytes      histogramOutput               `json:"bridge_payload_bytes"`
 }
 
 func writeSizeHistograms(path string, c config, h *sizeHistograms) error {
 	h.mu.Lock()
 	out := sizeHistogramFile{
-		Schema:             "bridges.size_histograms.v1",
-		Mode:               c.mode,
-		CheckpointDistance: c.checkpointDistance,
-		LehmerEE:           c.lehmerEE,
-		DEEInstanceQueues:  c.deeQueueIDs != "",
-		DEEDequeueOne:      c.deeDequeueOne,
-		BaggageCallBytes:   snapshotHistogram(h.baggage),
-		BridgePayloadBytes: snapshotHistogram(h.payload),
+		Schema:                  "bridges.size_histograms.v1",
+		Mode:                    c.mode,
+		CheckpointDistance:      c.checkpointDistance,
+		CheckpointRandomization: c.checkpointPolicy,
+		LehmerEE:                c.lehmerEE,
+		DEEInstanceQueues:       c.deeQueueIDs != "",
+		DEEDequeueOne:           c.deeDequeueOne,
+		BaggageCallBytes:        snapshotHistogram(h.baggage),
+		BridgePayloadBytes:      snapshotHistogram(h.payload),
 	}
 	if c.deeStats != nil {
 		snapshot := c.deeStats.Snapshot()
@@ -149,9 +152,10 @@ func runHistogramMerge(args []string) {
 			hasStats = in.DEEQueueStats != nil
 		} else if in.Schema != base.Schema || in.Mode != base.Mode ||
 			in.CheckpointDistance != base.CheckpointDistance || in.LehmerEE != base.LehmerEE ||
+			!reflect.DeepEqual(in.CheckpointRandomization, base.CheckpointRandomization) ||
 			in.DEEInstanceQueues != base.DEEInstanceQueues || in.DEEDequeueOne != base.DEEDequeueOne ||
 			(in.DEEQueueStats != nil) != hasStats {
-			fmt.Fprintf(os.Stderr, "incompatible histogram %s (schema/mode/cpd/lehmer/DEE-instance/dequeue mismatch)\n", path)
+			fmt.Fprintf(os.Stderr, "incompatible histogram %s (schema/mode/cpd/checkpoint-range/seed/lehmer/DEE-instance/dequeue mismatch)\n", path)
 			os.Exit(1)
 		}
 		for _, b := range in.BaggageCallBytes.Bins {
@@ -164,7 +168,7 @@ func runHistogramMerge(args []string) {
 			mergeDEEQueueStats(&mergedStats, *in.DEEQueueStats)
 		}
 	}
-	c := config{mode: base.Mode, checkpointDistance: base.CheckpointDistance, lehmerEE: base.LehmerEE}
+	c := config{mode: base.Mode, checkpointDistance: base.CheckpointDistance, checkpointPolicy: base.CheckpointRandomization, lehmerEE: base.LehmerEE}
 	if base.DEEInstanceQueues {
 		c.deeQueueIDs = "merged"
 	}

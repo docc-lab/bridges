@@ -33,7 +33,7 @@ func DecodeSB3Payload(b []byte, prefixLen, bloomLen, fpBits int, lehmer bool) (S
 	}
 	c := &cursor{b: b}
 	tag := c.take(1)
-	if c.err != nil || len(tag) != 1 || tag[0] != byte(SB3BridgeTypeID) {
+	if c.err != nil || len(tag) != 1 || PayloadType(tag[0]) != byte(SB3BridgeTypeID) {
 		return out, errors.New("not an SB3 payload")
 	}
 	out.Depth = c.uvarint()

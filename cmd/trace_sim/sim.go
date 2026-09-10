@@ -27,13 +27,17 @@ type streamWriter struct {
 	f  *os.File
 }
 
-func newStreamWriter(path string, cpd int, emitDepth, emitOC bool) (*streamWriter, error) {
+func newStreamWriter(path string, cpd int, emitDepth, emitOC bool, policies ...*bridge.CheckpointRange) (*streamWriter, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
 	w := bufio.NewWriterSize(f, 1<<20)
 	fmt.Fprintf(w, "#cpd=%d emit_depth=%t emit_oc=%t\n", cpd, emitDepth, emitOC)
+	if len(policies) > 0 && policies[0] != nil {
+		r := policies[0]
+		fmt.Fprintf(w, "#checkpoint_range=%d:%d checkpoint_seed=%d\n", r.Min, r.Max, r.Seed)
+	}
 	fmt.Fprintln(w, "tid,num_spans,num_ckpt_spans,ckpt_sum,ckpt_max,n_bag,bag_sum,bag_max,n_depth,depth_sum,n_oc,oc_sum")
 	return &streamWriter{w: w, f: f}, nil
 }

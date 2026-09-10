@@ -51,6 +51,7 @@ type config struct {
 	noParents          bool   // ablation: ignore the intrinsic ParentID naming (no sibling coalescing) even though it is available
 	timingPath         string // non-empty: write per-trace reconstruction timing CSV here
 	checkpointDistance int
+	checkpointPolicy   *bridge.CheckpointRange
 	dropRate           float64
 	dropRates          string // comma list: one decode, all rates reconstructed per pass (CGP/PB/SB3 families)
 	seed               int64
@@ -104,6 +105,10 @@ func parseFlags() config {
 	flag.StringVar(&c.onlyTraces, "only-traces", "", "Diagnostic: comma-separated hex trace IDs to reconstruct ONLY (corpus still streams and drop RNG still advances for all traces, so survivors are bit-identical to a full run). Lets you repro a single slow trace in seconds.")
 	flag.StringVar(&c.dumpSurvivors, "dump-survivors", "", "Gob-dump each reconstructed trace's decoded survivors+truth+dropped+cfg to this file. Pair with --only-traces to capture one trace from a single corpus walk, then replay it offline with cmd/recon_one (no corpus walk).")
 	flag.IntVar(&c.checkpointDistance, "checkpoint-distance", 1, "Checkpoint distance")
+	var checkpointRange string
+	var checkpointSeed int64
+	flag.StringVar(&checkpointRange, "checkpoint-range", "", "Randomized checkpoint distance, inclusive MIN:MAX (1..256); outgoing TTL is sampled distance minus one")
+	flag.Int64Var(&checkpointSeed, "checkpoint-seed", 42, "Seed for randomized checkpoints, independent of drop and sampling seeds")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides)")
 	flag.IntVar(&c.fpBits, "fp-bits", 16, "SB3 delayed-end owner fingerprint width in bits")
 	flag.BoolVar(&c.topoOnly, "topo-only", false, "SB3: omit lateral EE/DEE evidence while retaining topology and sparse ordinals")
@@ -144,6 +149,23 @@ func parseFlags() config {
 	flag.BoolVar(&primeM, "prime-m", false, "size blooms with a prime bit count (fixes small-m double-hash clustering; affects emit + recon together)")
 	flag.BoolVar(&primeMByteCap, "prime-m-bytecap", false, "with --prime-m: keep the prime within the raw size's byte budget")
 	flag.Parse()
+	var checkpointErr error
+	c.checkpointPolicy, checkpointErr = bridge.ParseCheckpointRange(checkpointRange, checkpointSeed)
+	if checkpointErr != nil {
+		fmt.Fprintln(os.Stderr, "error:", checkpointErr)
+		os.Exit(2)
+	}
+	if c.checkpointPolicy != nil {
+		if c.mode != "pb0" && c.mode != "cgp0" && c.mode != "sb3" {
+			fmt.Fprintln(os.Stderr, "error: --checkpoint-range is supported only for pb0, cgp0, sb3")
+			os.Exit(2)
+		}
+		if c.pb0Legacy || c.cgp0Legacy || c.verifyInline {
+			fmt.Fprintln(os.Stderr, "error: randomized checkpoints require the default greedy engine; legacy reconstructors and --verify do not support this mode")
+			os.Exit(2)
+		}
+		c.checkpointDistance = c.checkpointPolicy.MaxDistance()
+	}
 	bloom.PrimeM = primeM // set before any handler/config sizing (emit + recon must match)
 	bloom.PrimeMByteCap = primeMByteCap
 	if c.mode != "pb" && c.mode != "pcr" && c.mode != "pcrb" && c.mode != "pcrs" && c.mode != "cgprb" && c.mode != "cgp2" && c.mode != "pb2" && c.mode != "cgp1" && c.mode != "pb1" && c.mode != "cgp0" && c.mode != "pb0" && c.mode != "sb3" {
@@ -507,7 +529,7 @@ func coverageBucket(x float64) int {
 	}
 }
 
-func (a *fanoutEvidenceAcc) add(s recon.GreedyFanoutStats, res recon.Result, survivors []recon.Span, truth []recon.TruthSpan, cpd int, clean bool) {
+func (a *fanoutEvidenceAcc) add(s recon.GreedyFanoutStats, res recon.Result, survivors []recon.Span, truth []recon.TruthSpan, cfg recon.Config, clean bool) {
 	a.traces++
 	if clean {
 		a.clean++
@@ -572,10 +594,14 @@ func (a *fanoutEvidenceAcc) add(s recon.GreedyFanoutStats, res recon.Result, sur
 	}
 	nameable := make(map[uint64]bool, len(survivors)*2)
 	survived := make(map[uint64]bool, len(survivors))
+	checkpoints := make(map[uint64]bool)
 	missingParentReferences := make(map[uint64]int)
 	knownFanouts := make(map[uint64]bool)
 	for _, span := range survivors {
 		survived[span.SpanID] = true
+		if span.BloomBits != nil && !span.LeafCarrier {
+			checkpoints[span.SpanID] = true
+		}
 		nameable[span.SpanID] = true
 		if span.ParentID != 0 {
 			nameable[span.ParentID] = true
@@ -670,9 +696,7 @@ func (a *fanoutEvidenceAcc) add(s recon.GreedyFanoutStats, res recon.Result, sur
 		addRouteMetric(route.ApplicableMultiBloomGroups, &a.sumRouteMultiBloomGroups, &a.sumRouteMultiBloomGroupsSq, &a.sumRouteMultiBloomGroupsCorrect, a.routeByMultiBloomGroups)
 		addRouteMetric(route.FanoutCandidateTests, &a.sumRouteFanoutTests, &a.sumRouteFanoutTestsSq, &a.sumRouteFanoutTestsCorrect, a.routeByFanoutTests)
 	}
-	if cpd < 1 {
-		cpd = 1
-	}
+	cpd := max(1, cfg.CPD)
 	traceWindows, traceHA, traceKnown, traceFanouts := 0, 0, 0, 0
 	for _, carrier := range survivors {
 		if carrier.Depth == 0 || carrier.BloomBits == nil {
@@ -683,6 +707,22 @@ func (a *fanoutEvidenceAcc) add(s recon.GreedyFanoutStats, res recon.Result, sur
 			// A periodic checkpoint closes the preceding full window. A leaf
 			// checkpoint closes the partial window below its periodic checkpoint.
 			windowTop -= cpd
+		}
+		if cfg.RandomizedCheckpoints {
+			// Scoring only: find the preceding reset checkpoint on the true
+			// path. Reconstruction itself never receives this path lookup.
+			windowTop = -1
+			parent := trueParent[carrier.SpanID]
+			for step := 0; step < cpd && parent != 0; step++ {
+				if checkpoints[parent] {
+					windowTop = trueDepth[parent]
+					break
+				}
+				parent = trueParent[parent]
+			}
+			if windowTop < 0 {
+				continue
+			}
 		}
 		steps := carrier.Depth - windowTop
 		pathIDs := make(map[uint64]bool, cpd)
@@ -1143,8 +1183,20 @@ type spanKey struct{ traceID, spanID uint64 }
 // pipeline can give each parallel replay worker its own handler instance
 // (handler state is strictly per-trace, so a per-worker handler reused across
 // traces with EvictTrace is identical to the shared streaming handler).
-func makeHandler(c config) (bridge.Handler, recon.Config) {
-	cfg := recon.NewConfig(c.checkpointDistance, c.bloomFP)
+func makeHandler(c config) (h bridge.Handler, cfg recon.Config) {
+	if c.checkpointPolicy != nil {
+		c.checkpointDistance = c.checkpointPolicy.MaxDistance()
+	}
+	defer func() {
+		if err := bridge.ConfigureCheckpoints(h, c.checkpointPolicy); err != nil {
+			panic(err)
+		}
+		cfg.RandomizedCheckpoints = c.checkpointPolicy != nil
+		if c.checkpointPolicy != nil {
+			cfg.CheckpointMin = c.checkpointPolicy.Min
+		}
+	}()
+	cfg = recon.NewConfig(c.checkpointDistance, c.bloomFP)
 	cfg.BottomUp = c.bottomUp
 	cfg.ChainCheck = c.chainCheck
 	switch c.mode {
@@ -1248,7 +1300,7 @@ func newHarness(c config) *harness {
 		h:              h,
 		mode:           c.mode,
 		topoOn:         os.Getenv("TRACE_RECON_TOPO") == "1",
-		cpd:            c.checkpointDistance,
+		cpd:            cfg.CPD,
 		wrongLog:       wlog,
 		cfg:            cfg,
 		rng:            rand.New(rand.NewSource(c.seed)),
@@ -1836,7 +1888,7 @@ func (ha *harness) process(j finishJob) {
 		ha.cg2.sb3.add(sb3)
 		ha.cg2.chainEvidence.add(res.GreedyChain, truth, dropped, iso.Clean())
 		if res.GreedyMode == "full-evidence" {
-			ha.cg2.fanoutEvidence.add(res.GreedyFanout, res, survivors, truth, ha.cpd, iso.Clean())
+			ha.cg2.fanoutEvidence.add(res.GreedyFanout, res, survivors, truth, ha.cfg, iso.Clean())
 		}
 		if structure != nil {
 			ha.cg2.sb3.addStructure(*structure, sb3.StructureStatus)
@@ -2040,6 +2092,14 @@ func (ha *harness) decodeSpan(tid uint64, s collSpan) recon.Span {
 		sp.Depth = d
 		sp.BloomBits = bits
 	}
+	if ha.cfg.RandomizedCheckpoints {
+		sp.LeafCarrier = bridge.IsLeafPayload(s.br)
+		var err error
+		sp.WindowCPD, sp.BloomM, sp.BloomK, err = recon.DecodeBloomGeometry(s.br, ha.cfg)
+		if err != nil {
+			die(err)
+		}
+	}
 	return sp
 }
 
@@ -2129,7 +2189,7 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 		a.sb3.add(c.sb3)
 		a.chainEvidence.add(c.greedyChain, truth, j.droppedMulti[r], c.iso.Clean())
 		if c.greedyMode == "full-evidence" {
-			a.fanoutEvidence.add(c.greedyFanout, c.result, c.survivors, truth, ha.cpd, c.iso.Clean())
+			a.fanoutEvidence.add(c.greedyFanout, c.result, c.survivors, truth, ha.cfg, c.iso.Clean())
 		}
 		if c.structure != nil {
 			a.sb3.addStructure(*c.structure, c.sb3.StructureStatus)
@@ -2910,59 +2970,60 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainE
 
 // output is the per-trace score arrays, in trace load order.
 type output struct {
-	Mode               string                   `json:"mode"`
-	Corpus             string                   `json:"corpus,omitempty"`
-	TraceStore         string                   `json:"trace_store,omitempty"`
-	CheckpointDistance int                      `json:"checkpoint_distance"`
-	DropRate           float64                  `json:"drop_rate,omitempty"`
-	DropRates          []float64                `json:"drop_rates,omitempty"`
-	RateSummaries      []rateSummary            `json:"rate_summaries,omitempty"`
-	BloomFP            float64                  `json:"bloom_fp,omitempty"`
-	PrimeM             bool                     `json:"prime_m,omitempty"`
-	PrimeMByteCap      bool                     `json:"prime_m_bytecap,omitempty"`
-	PrefixLen          int                      `json:"prefix_len,omitempty"`
-	FPBits             int                      `json:"fp_bits,omitempty"`
-	LehmerEE           bool                     `json:"lehmer_ee,omitempty"`
-	TopoOnly           bool                     `json:"topo_only,omitempty"`
-	SB3IgnoreOrdinals  bool                     `json:"sb3_ignore_ordinals,omitempty"`
-	CGP0Legacy         bool                     `json:"cgp0_legacy,omitempty"`
-	PB0Legacy          bool                     `json:"pb0_legacy,omitempty"`
-	GreedyNoGrouped    bool                     `json:"greedy_no_grouped_evidence,omitempty"`
-	GreedyNoHardHA     bool                     `json:"greedy_no_hard_ha,omitempty"`
-	GreedyNoFallback   bool                     `json:"greedy_no_route_fallback,omitempty"`
-	PerTraceDropSeed   bool                     `json:"per_trace_drop_seed,omitempty"`
-	Order              string                   `json:"order"`
-	Consistency        string                   `json:"consistency"`
-	Seed               int64                    `json:"seed"`
-	Sample             int                      `json:"sample,omitempty"`
-	SampleSeed         int64                    `json:"sample_seed,omitempty"`
-	NumTraces          int                      `json:"num_traces"`
-	NumSpans           []int                    `json:"num_spans,omitempty"`
-	NumDropped         []int                    `json:"num_dropped,omitempty"`
-	NumOrphans         []int                    `json:"num_orphans,omitempty"`
-	NumReconnected     []int                    `json:"num_reconnected,omitempty"`
-	NumAnchorCorrect   []int                    `json:"num_anchor_correct,omitempty"`
-	NumAnchorAncestor  []int                    `json:"num_anchor_ancestor,omitempty"`
-	NumGapCorrect      []int                    `json:"num_gap_correct,omitempty"`
-	NumMisattached     []int                    `json:"num_misattached,omitempty"`
-	NumUnanchored      []int                    `json:"num_unanchored,omitempty"`
-	NumSynthetic       []int                    `json:"num_synthetic,omitempty"`
-	NumBorrowed        []int                    `json:"num_borrowed_bloom,omitempty"`
-	NumFragmentsLost   []int                    `json:"num_fragments_lost,omitempty"`    // PCR only
-	NumSpansLost       []int                    `json:"num_spans_lost,omitempty"`        // PCR only
-	NumAncestorsSkip   []int                    `json:"num_ancestors_skipped,omitempty"` // PCR only
-	NumSpansInSkipped  []int                    `json:"num_spans_in_skipped,omitempty"`  // PCR only
-	NumOpenEnds        []int                    `json:"num_open_ends,omitempty"`         // PCRB only
-	NumOpenEndsMatched []int                    `json:"num_open_ends_matched,omitempty"` // PCRB only
-	NumForcedMatches   []int                    `json:"num_forced_matches,omitempty"`    // PCRB only
-	NumOrphansPlaced   []int                    `json:"num_orphans_placed,omitempty"`    // PCRB only
-	NumOrphanOpenEnds  []int                    `json:"num_orphan_open_ends,omitempty"`  // PCRB only
-	TopologySummary    *topologySummary         `json:"topology_summary,omitempty"`
-	GreedySummary      *greedySummary           `json:"greedy_summary,omitempty"`
-	ChainEvidence      *chainEvidenceSummary    `json:"chain_evidence_summary,omitempty"`
-	SB3Summary         *sb3Summary              `json:"sb3_summary,omitempty"`
-	ScorerComparison   *scorerComparisonSummary `json:"scorer_comparison,omitempty"`
-	CompareScorers     bool                     `json:"compare_scorers,omitempty"`
+	Mode                    string                   `json:"mode"`
+	Corpus                  string                   `json:"corpus,omitempty"`
+	TraceStore              string                   `json:"trace_store,omitempty"`
+	CheckpointDistance      int                      `json:"checkpoint_distance"`
+	CheckpointRandomization *bridge.CheckpointRange  `json:"checkpoint_randomization,omitempty"`
+	DropRate                float64                  `json:"drop_rate,omitempty"`
+	DropRates               []float64                `json:"drop_rates,omitempty"`
+	RateSummaries           []rateSummary            `json:"rate_summaries,omitempty"`
+	BloomFP                 float64                  `json:"bloom_fp,omitempty"`
+	PrimeM                  bool                     `json:"prime_m,omitempty"`
+	PrimeMByteCap           bool                     `json:"prime_m_bytecap,omitempty"`
+	PrefixLen               int                      `json:"prefix_len,omitempty"`
+	FPBits                  int                      `json:"fp_bits,omitempty"`
+	LehmerEE                bool                     `json:"lehmer_ee,omitempty"`
+	TopoOnly                bool                     `json:"topo_only,omitempty"`
+	SB3IgnoreOrdinals       bool                     `json:"sb3_ignore_ordinals,omitempty"`
+	CGP0Legacy              bool                     `json:"cgp0_legacy,omitempty"`
+	PB0Legacy               bool                     `json:"pb0_legacy,omitempty"`
+	GreedyNoGrouped         bool                     `json:"greedy_no_grouped_evidence,omitempty"`
+	GreedyNoHardHA          bool                     `json:"greedy_no_hard_ha,omitempty"`
+	GreedyNoFallback        bool                     `json:"greedy_no_route_fallback,omitempty"`
+	PerTraceDropSeed        bool                     `json:"per_trace_drop_seed,omitempty"`
+	Order                   string                   `json:"order"`
+	Consistency             string                   `json:"consistency"`
+	Seed                    int64                    `json:"seed"`
+	Sample                  int                      `json:"sample,omitempty"`
+	SampleSeed              int64                    `json:"sample_seed,omitempty"`
+	NumTraces               int                      `json:"num_traces"`
+	NumSpans                []int                    `json:"num_spans,omitempty"`
+	NumDropped              []int                    `json:"num_dropped,omitempty"`
+	NumOrphans              []int                    `json:"num_orphans,omitempty"`
+	NumReconnected          []int                    `json:"num_reconnected,omitempty"`
+	NumAnchorCorrect        []int                    `json:"num_anchor_correct,omitempty"`
+	NumAnchorAncestor       []int                    `json:"num_anchor_ancestor,omitempty"`
+	NumGapCorrect           []int                    `json:"num_gap_correct,omitempty"`
+	NumMisattached          []int                    `json:"num_misattached,omitempty"`
+	NumUnanchored           []int                    `json:"num_unanchored,omitempty"`
+	NumSynthetic            []int                    `json:"num_synthetic,omitempty"`
+	NumBorrowed             []int                    `json:"num_borrowed_bloom,omitempty"`
+	NumFragmentsLost        []int                    `json:"num_fragments_lost,omitempty"`    // PCR only
+	NumSpansLost            []int                    `json:"num_spans_lost,omitempty"`        // PCR only
+	NumAncestorsSkip        []int                    `json:"num_ancestors_skipped,omitempty"` // PCR only
+	NumSpansInSkipped       []int                    `json:"num_spans_in_skipped,omitempty"`  // PCR only
+	NumOpenEnds             []int                    `json:"num_open_ends,omitempty"`         // PCRB only
+	NumOpenEndsMatched      []int                    `json:"num_open_ends_matched,omitempty"` // PCRB only
+	NumForcedMatches        []int                    `json:"num_forced_matches,omitempty"`    // PCRB only
+	NumOrphansPlaced        []int                    `json:"num_orphans_placed,omitempty"`    // PCRB only
+	NumOrphanOpenEnds       []int                    `json:"num_orphan_open_ends,omitempty"`  // PCRB only
+	TopologySummary         *topologySummary         `json:"topology_summary,omitempty"`
+	GreedySummary           *greedySummary           `json:"greedy_summary,omitempty"`
+	ChainEvidence           *chainEvidenceSummary    `json:"chain_evidence_summary,omitempty"`
+	SB3Summary              *sb3Summary              `json:"sb3_summary,omitempty"`
+	ScorerComparison        *scorerComparisonSummary `json:"scorer_comparison,omitempty"`
+	CompareScorers          bool                     `json:"compare_scorers,omitempty"`
 }
 
 // slowReconMS: if >0 (set via TRACE_RECON_SLOW=<ms>), log any single cgprb
@@ -3040,27 +3101,28 @@ func main() {
 		orderName = "bottom-up"
 	}
 	out := output{
-		Mode:               c.mode,
-		Corpus:             c.corpusDir,
-		TraceStore:         c.traceStore,
-		CheckpointDistance: c.checkpointDistance,
-		DropRate:           c.dropRate,
-		PrimeM:             bloom.PrimeM,
-		PrimeMByteCap:      bloom.PrimeMByteCap,
-		PerTraceDropSeed:   c.perTraceDropSeed,
-		TopoOnly:           c.topoOnly,
-		SB3IgnoreOrdinals:  c.sb3IgnoreOrdinals,
-		CGP0Legacy:         c.cgp0Legacy,
-		PB0Legacy:          c.pb0Legacy,
-		GreedyNoGrouped:    c.greedyNoGrouped,
-		GreedyNoHardHA:     c.greedyNoHardHA,
-		GreedyNoFallback:   c.greedyNoFallback,
-		CompareScorers:     c.compareScorers,
-		Order:              orderName,
-		Consistency:        map[bool]string{true: "chain", false: "none"}[c.chainCheck],
-		Seed:               c.seed,
-		Sample:             c.sampleCount,
-		NumTraces:          len(traceOrder),
+		Mode:                    c.mode,
+		Corpus:                  c.corpusDir,
+		TraceStore:              c.traceStore,
+		CheckpointDistance:      c.checkpointDistance,
+		CheckpointRandomization: c.checkpointPolicy,
+		DropRate:                c.dropRate,
+		PrimeM:                  bloom.PrimeM,
+		PrimeMByteCap:           bloom.PrimeMByteCap,
+		PerTraceDropSeed:        c.perTraceDropSeed,
+		TopoOnly:                c.topoOnly,
+		SB3IgnoreOrdinals:       c.sb3IgnoreOrdinals,
+		CGP0Legacy:              c.cgp0Legacy,
+		PB0Legacy:               c.pb0Legacy,
+		GreedyNoGrouped:         c.greedyNoGrouped,
+		GreedyNoHardHA:          c.greedyNoHardHA,
+		GreedyNoFallback:        c.greedyNoFallback,
+		CompareScorers:          c.compareScorers,
+		Order:                   orderName,
+		Consistency:             map[bool]string{true: "chain", false: "none"}[c.chainCheck],
+		Seed:                    c.seed,
+		Sample:                  c.sampleCount,
+		NumTraces:               len(traceOrder),
 	}
 	if c.sampleCount > 0 {
 		out.SampleSeed = c.sampleSeed

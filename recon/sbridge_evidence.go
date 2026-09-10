@@ -123,18 +123,20 @@ func ApplyStructureEvidence(res *SBResult, dees []bridge.DEEQuad) SBStructureSta
 	// next pass. Records that remain multi-owner after the fixpoint are genuine
 	// ambiguities and are rejected together.
 	pending := append([]bridge.DEEQuad(nil), dees...)
-	assigned := make([]bool, len(cands)) // one parent emits at most one DEE quad
+	// Candidate identities stay fixed throughout propagation. Share the EE maps
+	// and retire a candidate after its sole DEE, instead of copying the entire
+	// array for every record (quadratic allocation on large traces).
+	var flat []DEECandidate
+	if len(pending) > 0 {
+		flat = make([]DEECandidate, len(cands))
+		for i := range cands {
+			flat[i] = cands[i].cand
+		}
+	}
 	for len(pending) > 0 {
 		progress := false
 		next := make([]bridge.DEEQuad, 0, len(pending))
 		for _, dq := range pending {
-			flat := make([]DEECandidate, len(cands))
-			for i := range cands {
-				flat[i] = cands[i].cand
-				if assigned[i] {
-					flat[i].ChildOrds = nil // already consumed by its sole DEE
-				}
-			}
 			idx, status := AttributeDEE(dq.OwnerFP, dq.Depth, dq.Seqs, flat, fpBits)
 			switch status {
 			case DEEAmbiguous:
@@ -144,7 +146,7 @@ func ApplyStructureEvidence(res *SBResult, dees []bridge.DEEQuad) SBStructureSta
 				out.fail("DEE owner fp %x at depth %d has no valid parent", dq.OwnerFP, dq.Depth)
 			case DEEPlaced:
 				progress = true
-				assigned[idx] = true
+				flat[idx].ChildOrds = nil // one parent emits at most one DEE quad
 				out.DEEPlaced++
 				sc := &cands[idx]
 				sc.node.DEE = append(sc.node.DEE, dq.Seqs...)

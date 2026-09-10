@@ -36,7 +36,7 @@ func NewPCRBConfig(cpd, prefixLen int, bloomFPRate float64) Config {
 		cpd = 1
 	}
 	m, k := bloom.EstimateParameters(bridge.PCRBBloomCapacity(cpd), bloomFPRate)
-	return Config{CPD: cpd, BloomM: m, BloomK: k, PrefixLen: prefixLen}
+	return Config{CPD: cpd, BloomM: m, BloomK: k, BloomFP: bloomFPRate, PrefixLen: prefixLen}
 }
 
 func ReconstructPCRB(survivors []Span, cfg Config) Result {
@@ -1266,7 +1266,7 @@ func coveringPCRBPayload(o *Span, children map[uint64][]*Span, cfg Config) (int,
 // DecodePCRBPayload parses a PCRB _br value:
 // type(1) || varint(depth) || ckptK || bloom bits.
 func DecodePCRBPayload(p []byte, cfg Config) (depth int, prefix, bloomBits []byte, err error) {
-	if len(p) < 2 || p[0] != byte(bridge.PCRBBridgeTypeID) {
+	if len(p) < 2 || bridge.PayloadType(p[0]) != byte(bridge.PCRBBridgeTypeID) {
 		return 0, nil, nil, errors.New("recon: not a PCRB payload")
 	}
 	d, n := binary.Uvarint(p[1:])
@@ -1274,7 +1274,11 @@ func DecodePCRBPayload(p []byte, cfg Config) (depth int, prefix, bloomBits []byt
 		return 0, nil, nil, errors.New("recon: bad depth varint")
 	}
 	rest := p[1+n:]
-	bloomLen := int((cfg.BloomM + 7) / 8)
+	_, m, _, err := DecodeBloomGeometry(p, cfg)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	bloomLen := int((m + 7) / 8)
 	if len(rest) != cfg.PrefixLen+bloomLen {
 		return 0, nil, nil, errors.New("recon: pcrb payload length mismatch")
 	}

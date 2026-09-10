@@ -22,12 +22,14 @@ type SB3Branch struct {
 // Unary and first-child edges append no ordinal; child 2 and later append one
 // SB3Branch to the propagated chain.
 type SB3Handler struct {
-	cpd       uint32
-	prefixLen int
-	bloomM    uint32
-	bloomK    uint32
-	bloomLen  int
-	deeLogger *DeeSizeLogger
+	cpd         uint32
+	checkpoints *CheckpointRange
+	bloomFP     float64
+	prefixLen   int
+	bloomM      uint32
+	bloomK      uint32
+	bloomLen    int
+	deeLogger   *DeeSizeLogger
 
 	Capture bool
 
@@ -49,6 +51,7 @@ type SB3Handler struct {
 }
 
 type sb3State struct {
+	ttl         byte
 	depth       int
 	ckpt        [8]byte
 	bloomBytes  []byte // propagated ancestor bloom (inherited + self)
@@ -73,6 +76,7 @@ func NewSB3Handler(checkpointDistance, prefixLen int, bloomFPRate float64, deeLo
 	m, k := bloom.EstimateParameters(PCRBBloomCapacity(checkpointDistance), bloomFPRate)
 	return &SB3Handler{
 		cpd:              uint32(checkpointDistance),
+		bloomFP:          bloomFPRate,
 		prefixLen:        prefixLen,
 		bloomM:           m,
 		bloomK:           k,
@@ -182,9 +186,6 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		if parentSeqNum == 1 {
 			ha = append([]byte(nil), parentState.ha...)
 		}
-	} else {
-		bf, _ := bloom.New(h.bloomM, h.bloomK)
-		inherited = bf.ToBytes()
 	}
 
 	if pid != 0 {
@@ -212,7 +213,17 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		deeBytes = nil
 	}
 
-	isCheckpoint := depth%int(h.cpd) == 0
+	var incomingTTL byte
+	if parentState != nil {
+		incomingTTL = parentState.ttl
+	}
+	isCheckpoint, outgoingTTL := h.checkpoints.next(ev, parentState != nil, incomingTTL, int(depth), int(h.cpd))
+	if parentState == nil {
+		incomingTTL = outgoingTTL
+		g := h.checkpoints.bloom(incomingTTL, h.bloomM, h.bloomK)
+		bf, _ := bloom.New(g.m, g.k)
+		inherited = bf.ToBytes()
+	}
 	var emitBytes int
 	var payload []byte
 	if isCheckpoint {
@@ -220,12 +231,14 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		emitBytes = BRPropertyNameOverheadBytes + 1 + body
 		if h.Capture || h.EmitSink != nil {
 			payload = packSB3Payload(depth, ckpt, h.prefixLen, inherited, ha, branches, deeBytes, h.LehmerEE)
+			h.checkpoints.tagPayload(payload, incomingTTL)
 			if h.EmitSink != nil {
 				h.EmitSink(tid, sid, payload)
 			}
 		}
 		ckpt = BigEndian8(sid)
-		bf, _ := bloom.New(h.bloomM, h.bloomK)
+		g := h.checkpoints.bloom(outgoingTTL, h.bloomM, h.bloomK)
+		bf, _ := bloom.New(g.m, g.k)
 		inherited = bf.ToBytes()
 		ha = nil
 		branches = nil
@@ -236,7 +249,8 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 
 	propagated := inherited
 	if !isCheckpoint {
-		bf := bloom.Deserialize(inherited, h.bloomM, h.bloomK)
+		g := h.checkpoints.bloom(incomingTTL, h.bloomM, h.bloomK)
+		bf := bloom.Deserialize(inherited, g.m, g.k)
 		spanHex := HexOf(sid)
 		bf.Add(spanHex[:])
 		propagated = bf.ToBytes()
@@ -248,12 +262,17 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		baggageBody := sb3BodySize(depth, h.prefixLen, len(propagated), ha, branches, deeBytes, h.LehmerEE)
 		baggageBytes = BaggageKeyBytes + baggageBody
 	}
+	if baggageFound && h.checkpoints != nil {
+		baggageBytes++
+	}
+
 	h.state[stateKey{tid, sid}] = &sb3State{
+		ttl:   outgoingTTL,
 		depth: depth, ckpt: ckpt, bloomBytes: propagated, inherited: inherited,
 		ha: ha, branches: branches, deeBytes: deeBytes, payloadBody: payloadBody,
 		emitted: isCheckpoint,
 	}
-	return StartResult{BaggageFound: baggageFound, BaggageBytes: baggageBytes, EmitBytes: emitBytes, Payload: payload}
+	return StartResult{CheckpointTTL: outgoingTTL, BaggageFound: baggageFound, BaggageBytes: baggageBytes, EmitBytes: emitBytes, Payload: payload}
 }
 
 func (h *SB3Handler) OnEnd(ev *Event) EndResult {
@@ -294,6 +313,10 @@ func (h *SB3Handler) OnEnd(ev *Event) EndResult {
 		ps.emitted = true
 		if h.Capture || h.EmitSink != nil {
 			payload = packSB3Payload(ps.depth, ps.ckpt, h.prefixLen, ps.inherited, ps.ha, ps.branches, ps.deeBytes, h.LehmerEE)
+			h.checkpoints.tagPayload(payload, ps.ttl)
+			if h.checkpoints != nil {
+				payload[0] |= LeafPayloadFlag
+			}
 			if h.EmitSink != nil {
 				h.EmitSink(tid, sid, payload)
 			}
@@ -328,7 +351,7 @@ func (h *SB3Handler) EvictTrace(traceID uint64) {
 }
 
 // sb3BodySize excludes the one-byte type tag. HA is length-framed; the Bloom
-// length is fixed by the deployment config; trailing DEE quads consume EOF.
+// length follows the window geometry; trailing DEE quads consume EOF.
 func sb3BodySize(depth, prefixLen, bloomLen int, ha []byte, branches []SB3Branch, dee []byte, lehmer bool) int {
 	n := VarintLen(depth) + prefixLen + bloomLen + VarintLen(len(ha)) + len(ha) + VarintLen(len(branches))
 	for _, b := range branches {

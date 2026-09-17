@@ -189,13 +189,16 @@ func TestReverseReconstruction(t *testing.T) {
 			return rec.br == nil
 		}},
 	}
+	// inverse_depth is the policy under evaluation. The others are coverage
+	// controls, not competing designs: p=1 makes the immediate parent accept
+	// every truss, p=0 makes nothing accept, and q=0.5 rejects half the leaves.
 	policies := []struct {
 		name string
 		rc   bridge.ReverseConfig
 	}{
 		{"inverse_depth", bridge.ReverseConfig{Policy: "inverse_depth", LeafRejectProbability: 1, Seed: 42}},
-		{"promote_all", bridge.ReverseConfig{Policy: "probability", Probability: 1, LeafRejectProbability: 1, Seed: 42}},
-		{"absorb_at_checkpoints", bridge.ReverseConfig{Policy: "probability", Probability: 0, LeafRejectProbability: 1, Seed: 42}},
+		{"control_accept_always", bridge.ReverseConfig{Policy: "probability", Probability: 1, LeafRejectProbability: 1, Seed: 42}},
+		{"control_absorb_at_checkpoints", bridge.ReverseConfig{Policy: "probability", Probability: 0, LeafRejectProbability: 1, Seed: 42}},
 		{"half_rejected", bridge.ReverseConfig{Policy: "inverse_depth", LeafRejectProbability: 0.5, Seed: 7}},
 	}
 	windows := []struct {
@@ -264,11 +267,11 @@ func TestReverseReconstruction(t *testing.T) {
 								t.Fatalf("origin %d exported %d times, rejected=%t", id, n, rejected[id])
 							}
 						}
-						if pol.name == "promote_all" && demoted == 0 {
-							t.Fatal("promote_all produced no demoted carrier")
+						if pol.name == "control_accept_always" && demoted == 0 {
+							t.Fatal("accept-always control produced no demoted carrier")
 						}
-						if pol.name == "absorb_at_checkpoints" && demoted != 0 {
-							t.Fatalf("absorb_at_checkpoints demoted %d carriers", demoted)
+						if pol.name == "control_absorb_at_checkpoints" && demoted != 0 {
+							t.Fatalf("absorb-at-checkpoints control demoted %d carriers", demoted)
 						}
 
 						dropped := make(map[uint64]struct{})

@@ -60,10 +60,14 @@ the post-routing protected set: intended checkpoints are protected, demoted
 receivers are not.
 
 Tests: `recon/reverse_recon_test.go` replays synthetic traces through the real
-`ReverseHandler` for all three bridges, randomized and fixed windows, four
-policies (inverse-depth, promote-all, absorb-at-checkpoints, half rejection),
-and three loss scenarios (promoted checkpoints' records lost; those and their
-parents lost; every unprotected record lost). It asserts that at total loss no
+`ReverseHandler` for all three bridges, randomized and fixed windows, and
+three loss scenarios (promoted checkpoints' records lost; those and their
+parents lost; every unprotected record lost). The acceptance settings used
+there are the 1/n policy plus three coverage controls, not competing designs:
+p=1 (the immediate parent always accepts, so every truss is promoted after one
+hop), p=0 (nothing accepts, so every truss rides to its original checkpoint),
+and partial leaf rejection q=0.5. The controls exist to force the promotion
+and demotion paths to fire on every truss or on none. It asserts that at total loss no
 non-checkpoint span survives, that demoted carriers hold trusses and no own
 payload, and that promoted checkpoints never become window roots.
 `cmd/trace_recon/reverse_test.go` drives the full harness from a trace store.

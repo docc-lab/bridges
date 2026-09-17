@@ -2,6 +2,7 @@ package recon
 
 import (
 	"fmt"
+	"sort"
 
 	"bridges/bridge"
 )
@@ -102,6 +103,65 @@ func DecodeReverseSegmentEvidence(carrierSpanID uint64, segment bridge.ReverseSe
 		out.LeafCarrier = bridge.IsLeafPayload(out.RawPayload)
 	} else {
 		out.LeafCarrier = depth%max(1, cfg.CPD) != 0
+	}
+	return out, nil
+}
+
+// MergeReverseEvidence binds decoded returned trusses to the collected
+// survivors. An origin whose ordinary record survived receives its own truss
+// as a leaf carrier, exactly as if it had checkpointed locally. An origin whose
+// record was lost becomes an evidence-only span: exact identity, depth, window
+// root, and filter, but an unknown parent. Each origin is bound once; the
+// exporting receiver's own record is never altered, and no parent is invented.
+func MergeReverseEvidence(survivors []Span, evidence []ReverseEvidence) ([]Span, error) {
+	if len(evidence) == 0 {
+		return survivors, nil
+	}
+	out := make([]Span, len(survivors), len(survivors)+len(evidence))
+	copy(out, survivors)
+	index := make(map[uint64]int, len(out))
+	for i := range out {
+		index[out[i].SpanID] = i
+	}
+	sorted := append([]ReverseEvidence(nil), evidence...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].OriginSpanID != sorted[j].OriginSpanID {
+			return sorted[i].OriginSpanID < sorted[j].OriginSpanID
+		}
+		return sorted[i].CarrierSpanID < sorted[j].CarrierSpanID
+	})
+	bound := make(map[uint64]bool, len(sorted))
+	bind := func(s *Span, e ReverseEvidence) {
+		s.BloomBits = e.BloomBits
+		s.CkptPrefix = e.CkptPrefix
+		s.WindowCPD, s.BloomM, s.BloomK = e.WindowCPD, e.BloomM, e.BloomK
+		s.HA = e.HA
+		s.SparseOrdinals = e.SparseOrdinals
+		s.EvidenceOwner = e.CarrierSpanID
+		// A returned truss always originates at an unscheduled leaf: it closes
+		// a partial window and can never be an ancestor.
+		s.LeafCarrier = true
+	}
+	for _, e := range sorted {
+		if e.OriginSpanID == 0 || bound[e.OriginSpanID] {
+			continue
+		}
+		bound[e.OriginSpanID] = true
+		if i, ok := index[e.OriginSpanID]; ok {
+			s := &out[i]
+			if s.Depth != e.OriginDepth {
+				return nil, fmt.Errorf("reverse origin %016x: record depth %d disagrees with truss depth %d", e.OriginSpanID, s.Depth, e.OriginDepth)
+			}
+			if s.BloomBits != nil {
+				continue // the record already carries its own payload
+			}
+			bind(s, e)
+			continue
+		}
+		s := Span{SpanID: e.OriginSpanID, Depth: e.OriginDepth, ParentUnknown: true}
+		bind(&s, e)
+		index[s.SpanID] = len(out)
+		out = append(out, s)
 	}
 	return out, nil
 }

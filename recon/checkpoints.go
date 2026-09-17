@@ -31,7 +31,7 @@ func newCheckpointIndex(spans map[uint64]*Span, cfg Config) *checkpointIndex {
 	}
 	for _, s := range spans {
 		if cfg.RandomizedCheckpoints {
-			if s.LeafCarrier || (s.BloomBits == nil && s.ParentID != 0) {
+			if s.LeafCarrier || s.PartialWindow || s.ParentUnknown || (s.BloomBits == nil && s.ParentID != 0) {
 				continue
 			}
 		} else if s.Depth%max(1, cfg.CPD) != 0 {
@@ -109,8 +109,11 @@ func (idx *checkpointIndex) groupWindows(spans map[uint64]*Span) {
 		}
 		parent[y] = x
 	}
+	// A promoted reverse receiver carries a partial-window snapshot; like an
+	// early leaf it does not reset baggage. An evidence-only origin has no
+	// parent record, which does not make it a root.
 	resets := func(s *Span) bool {
-		return s.ParentID == 0 || (s.BloomBits != nil && !s.LeafCarrier)
+		return (s.ParentID == 0 && !s.ParentUnknown) || (s.BloomBits != nil && !s.LeafCarrier && !s.PartialWindow)
 	}
 	incoming := func(s *Span) uint64 {
 		if resets(s) {

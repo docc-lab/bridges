@@ -6,10 +6,57 @@ emits an accepted return is a checkpoint span for collection and counting. This
 does not make it a forward checkpoint: its descendants retain the previously
 assigned checkpoint root, distance, and Bloom geometry.
 
-The implementation currently adds simulation and byte/count measurements, plus
-a collector-facing evidence decoder in `recon/reverse.go`. It does **not** add
-reverse evidence to the existing reconstruction engines or establish accuracy
-under reverse routing. The decoder has no automatic conversion to `recon.Span`.
+## Status
+
+Reverse evidence is consumed by the shared PB0/CGP0/SB3 greedy topology engine.
+The reconstruction harness (`cmd/trace_recon`) accepts the simulator's reverse
+options (`--reverse-policy`, `--reverse-probability`, `--reverse-ttl-range`,
+`--reverse-seed`, `--leaf-reject`), routes trusses through
+`bridge.ReverseHandler` during replay, applies collection loss to the resulting
+records, decodes exported bundles, binds each origin's truss, and scores the
+emitted topology against pre-loss truth with the existing strict scorers.
+
+The representation decisions below are implemented in `recon`:
+
+| Fact | Representation | Effect |
+| --- | --- | --- |
+| Origin record survived | Its `Span` receives the returned truss (`BloomBits`, prefix, geometry, HA, ordinals) with `LeafCarrier` set | Identical to a leaf that checkpointed locally |
+| Origin record lost | A new `Span` with exact `SpanID`, `Depth`, truss evidence, `LeafCarrier`, and `ParentUnknown`; `ParentID` is zero and meaningless | Fragment root with no named parent; never a trace root |
+| Promoted receiver (exported a bundle, own payload flagged as a partial window) | `PartialWindow` on the receiver's `Span`; `LeafCarrier` cleared | Evidence carrier for its incoming window; not a window root, not a baggage reset, still an admissible ancestor |
+| Export owner | `EvidenceOwner` on the origin `Span` | Provenance only; never a parent edge or window identity |
+
+`recon.MergeReverseEvidence` performs the binding. The harness sets
+`PartialWindow` when a span exported a bundle and its own payload decodes as a
+leaf/partial-window carrier (the randomized flag, or a non-multiple depth in
+fixed mode).
+
+Engine behavior for an evidence-only origin: it forms its own route unit whose
+head is the origin itself (`anonymousParent`). The unit's depth is the origin's
+depth, so the node at depth-1 is inferred from admissible evidence like any
+other gap level: a surviving span at depth-1 confirmed by the origin's filter
+and every downstream filter, a witnessed or Bloom-confirmed named fanout, an
+anonymous node, or the checkpoint root itself when the origin sits directly
+below it. Persistent downstream AMQ, HA, window, and ordinal constraints apply
+unchanged. Two origins never coalesce by parent identity, because neither names
+one.
+
+Scoring: `ScorePBPathStrict` creates an obligation for every evidence-only
+origin and requires the emitted bridge to reach its true nearest surviving
+ancestor with the depth-implied synthetic count. `ScoreCGP2Evidence` treats the
+origin as a nameable node whose parent chain must match truth through nameable
+nodes and anonymous stand-ins. A trace with a lost origin therefore always has a
+reconstruction obligation; eligibility uses the post-routing protected set,
+because rejected leaves have no `_br` and are eligible for loss while every
+bundle owner is protected.
+
+Tests: `recon/reverse_recon_test.go` replays synthetic traces through the real
+`ReverseHandler` for all three bridges, randomized and fixed windows, four
+policies (inverse-depth, promote-all, absorb-at-checkpoints, half rejection),
+and three loss scenarios (origins lost; origins and their parents lost; every
+unprotected record lost). `cmd/trace_recon/reverse_test.go` drives the full
+harness from a trace store. Both require zero hard conflicts and clean strict
+scores with a negligible Bloom FPR, and assert that promoted receivers and
+origins never become window roots.
 
 ## Three identities that must stay separate
 
@@ -56,7 +103,7 @@ values for all three bridge types, checking origin identity, forward window,
 payload bytes, HA, and ordinals. They validate evidence extraction; they do not
 establish correctness of the outstanding reconstruction-engine changes below.
 
-## Why the current engine cannot consume a dropped origin directly
+## Why a naive adapter was wrong (design record)
 
 `recon.Span` represents an ordinary surviving record with exact `ParentID`;
 zero means an actual root. The current fragment parser, exact-parent
@@ -79,7 +126,7 @@ does not reset baggage and must not enter this reset category. Reusing
 internal span and remains a possible ancestor, whereas that flag excludes
 actual leaves from ancestor candidates.
 
-## Required engine input and processing changes
+## Engine input and processing changes (implemented as described above)
 
 Keep ordinary collected records separate from decoded origin evidence. The
 engine needs an explicit parent-known state, an explicit original-forward-
@@ -139,7 +186,7 @@ against pre-loss truth. It must not relabel a lost origin as a surviving record
 or grade only the receiver. Trace eligibility at a loss rate must use the new
 post-routing protected set rather than the original leaf-protected set.
 
-## Validation required before claiming reverse reconstruction accuracy
+## Validation performed and still required
 
 Use a chain and unequal-depth fanouts with original checkpoints above the
 accepting receivers. Drop origin metadata while retaining its returned
@@ -150,3 +197,11 @@ and every rejected origin is represented exactly once. For SB3, include
 ordinal evidence and a DEE belonging to a different trace than its export
 owner. Evaluate topology and structure only after this ingestion and scoring
 contract is implemented.
+
+The unit and harness tests above cover chain and unequal-depth fanouts,
+lost-origin and paired-origin cases, partial sibling acceptance, several
+origins per owner, promoted receivers as admissible ancestors, unknown parents
+that stay unknown until inferred, and duplicate HA from a promoted snapshot plus
+a descendant truss. Full-corpus reverse reconstruction accuracy and timing
+sweeps have not yet been run; results below the tests' negligible-FPR regime
+are the next measurement.

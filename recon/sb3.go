@@ -327,7 +327,7 @@ func runSB3Alignment(survivors []Span, cfg Config, topo Result) (*sb3Aligner, ui
 	for i := range survivors {
 		s := &survivors[i]
 		a.surv[s.SpanID] = true
-		if s.ParentID == 0 && (root == 0 || s.SpanID < root) {
+		if s.ParentID == 0 && !s.ParentUnknown && (root == 0 || s.SpanID < root) {
 			root = s.SpanID
 		}
 	}

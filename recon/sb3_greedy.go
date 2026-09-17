@@ -245,6 +245,11 @@ type sb3RouteUnit struct {
 	depth       int
 	members     []*sb3FragmentEvidence
 	knownFanout bool
+	// anonymousParent marks a unit for one evidence-only reverse origin whose
+	// parent identity is unknown. parentID is zero, depth is the origin's own
+	// depth, and the route supplies the origin's upstream edge directly: its
+	// parent is the chosen node at depth-1, or the anchor itself.
+	anonymousParent bool
 
 	anchors []*Span // deepest first; all are confirmed by every resolved sibling
 	anchor  *Span
@@ -262,6 +267,15 @@ type sb3RouteUnit struct {
 	fanoutBloomTests            int
 	fanoutCandidatesPruned      int
 	hardRouteCandidatesRejected int
+}
+
+// head is the node whose upstream edge this unit's route supplies: the named
+// dropped parent, or the evidence-only origin itself when its parent is unknown.
+func (u *sb3RouteUnit) head() uint64 {
+	if u.anonymousParent && len(u.members) > 0 {
+		return u.members[0].frag.root.SpanID
+	}
+	return u.parentID
 }
 
 type sb3ChainMatch struct {
@@ -359,7 +373,7 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 	survIndex := newSB3WindowIDIndex(cfg, sk.checkpoints)
 	ckptByDepthPrefix := make(map[int]map[string][]*Span)
 	for _, s := range sk.byID {
-		if !s.LeafCarrier && (!cfg.RandomizedCheckpoints || s.BloomBits == nil) {
+		if !s.LeafCarrier && (!cfg.RandomizedCheckpoints || s.BloomBits == nil || s.PartialWindow) {
 			survIndex.add(s.SpanID, s.Depth, s)
 		}
 		if s.Depth%cpd == 0 {
@@ -392,6 +406,13 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 		}
 		e.resolved = true
 		lo, hi := f.anchorCkpt.Depth, f.root.Depth
+		// root.Depth-1 is the exact named parent, not a routing choice, unless
+		// the root is an evidence-only origin whose parent is unknown: then the
+		// node at depth-1 is itself inferred from admissible evidence.
+		top := hi - 2
+		if f.root.ParentUnknown {
+			top = hi - 1
+		}
 		prefixLen := cfg.PrefixLen
 		if prefixLen > len(f.prefix) {
 			prefixLen = len(f.prefix)
@@ -455,8 +476,7 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 				queryBloom = wb.bf
 			}
 		}
-		// root.Depth-1 is the exact named parent, not a routing choice.
-		for d := hi - 2; d > lo; d-- {
+		for d := top; d > lo; d-- {
 			for _, candidate := range haIndex.query(e.checkpoints, d, queryBloom) {
 				if !sk.checkpoints.allows(candidate.id, e.checkpoints) {
 					continue
@@ -467,7 +487,7 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 				}
 			}
 		}
-		for d := hi - 2; d > lo; d-- {
+		for d := top; d > lo; d-- {
 			for _, candidate := range survIndex.query(e.checkpoints, d, queryBloom) {
 				if chain != nil {
 					chain.CandidateInitialHits++
@@ -509,7 +529,14 @@ func sb3IntersectRouteUnitsWithConfig(sk *cgpSkeleton, evidence map[uint64]*sb3F
 
 func sb3IntersectRouteUnitsWithStats(sk *cgpSkeleton, evidence map[uint64]*sb3FragmentEvidence, cfg Config, fanout *GreedyFanoutStats) []*sb3RouteUnit {
 	byParent := make(map[uint64][]*sb3FragmentEvidence)
+	var anonymous []*sb3FragmentEvidence
 	for _, f := range sk.frags {
+		if f.root.ParentUnknown {
+			// An evidence-only origin names no parent, so it cannot coalesce
+			// with siblings by parent identity. It forms its own unit.
+			anonymous = append(anonymous, evidence[f.root.SpanID])
+			continue
+		}
 		if f.root.ParentID == 0 {
 			continue
 		}
@@ -518,20 +545,39 @@ func sb3IntersectRouteUnitsWithStats(sk *cgpSkeleton, evidence map[uint64]*sb3Fr
 		}
 		byParent[f.root.ParentID] = append(byParent[f.root.ParentID], evidence[f.root.SpanID])
 	}
+	sort.Slice(anonymous, func(i, j int) bool { return anonymous[i].frag.root.SpanID < anonymous[j].frag.root.SpanID })
 
-	units := make([]*sb3RouteUnit, 0, len(byParent))
+	type unitSeed struct {
+		parentID  uint64
+		anonymous bool
+		members   []*sb3FragmentEvidence
+	}
+	seeds := make([]unitSeed, 0, len(byParent)+len(anonymous))
 	for parentID, members := range byParent {
+		seeds = append(seeds, unitSeed{parentID: parentID, members: members})
+	}
+	for _, e := range anonymous {
+		seeds = append(seeds, unitSeed{anonymous: true, members: []*sb3FragmentEvidence{e}})
+	}
+	units := make([]*sb3RouteUnit, 0, len(seeds))
+	for _, seed := range seeds {
+		parentID, members := seed.parentID, seed.members
 		sort.Slice(members, func(i, j int) bool {
 			return members[i].frag.root.SpanID < members[j].frag.root.SpanID
 		})
+		unitDepth := members[0].frag.root.Depth - 1
+		if seed.anonymous {
+			unitDepth = members[0].frag.root.Depth
+		}
 		u := &sb3RouteUnit{
-			parentID:       parentID,
-			depth:          members[0].frag.root.Depth - 1,
-			members:        members,
-			fanoutsByDepth: make(map[int][]uint64),
-			requiredFanout: make(map[int]uint64),
-			nodeChoice:     make(map[int]uint64),
-			anonAtDepth:    make(map[int]uint64),
+			parentID:        parentID,
+			depth:           unitDepth,
+			members:         members,
+			anonymousParent: seed.anonymous,
+			fanoutsByDepth:  make(map[int][]uint64),
+			requiredFanout:  make(map[int]uint64),
+			nodeChoice:      make(map[int]uint64),
+			anonAtDepth:     make(map[int]uint64),
 		}
 		resolved := 0
 		anchorCount := make(map[uint64]int)
@@ -625,7 +671,7 @@ func sb3IntersectRouteUnitsWithStats(sk *cgpSkeleton, evidence map[uint64]*sb3Fr
 		if units[i].depth != units[j].depth {
 			return units[i].depth < units[j].depth
 		}
-		return units[i].parentID < units[j].parentID
+		return units[i].head() < units[j].head()
 	})
 	return units
 }
@@ -667,7 +713,11 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 	}
 
 	// Literal ParentID groups: every member Bloom is below the exact parent.
+	// An unknown parent names no group.
 	for _, u := range units {
+		if u.anonymousParent {
+			continue
+		}
 		g := group(u.parentID, u.depth)
 		if len(u.members) >= 2 {
 			g.witness = true // matching parent IDs prove a surviving fanout group
@@ -704,7 +754,7 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 
 	for _, u := range units {
 		applicable := make(map[uint64]*sb3FanoutEvidenceGroup)
-		if g := groups[u.parentID]; g != nil {
+		if g := groups[u.parentID]; g != nil && !u.anonymousParent {
 			if useGroupedEvidence {
 				applicable[g.id] = g
 			}
@@ -992,7 +1042,11 @@ func sb3EmitGreedyTopology(sk *cgpSkeleton, units []*sb3RouteUnit, accepted map[
 	for _, u := range units {
 		for _, e := range u.members {
 			f := e.frag
-			anchorID, anchorDepth := nearestSurvivor(u.parentID)
+			start := u.parentID
+			if u.anonymousParent {
+				start = parent[f.root.SpanID]
+			}
+			anchorID, anchorDepth := nearestSurvivor(start)
 			if anchorID == 0 {
 				res.Unanchored = append(res.Unanchored, f.root.SpanID)
 				continue
@@ -1139,6 +1193,9 @@ func sb3SeedGreedyParent(sk *cgpSkeleton, units []*sb3RouteUnit) map[uint64]uint
 		}
 	}
 	for _, u := range units {
+		if u.anonymousParent {
+			continue // the origin's upstream edge is supplied by its route
+		}
 		for _, e := range u.members {
 			parent[e.frag.root.SpanID] = u.parentID
 		}
@@ -1154,7 +1211,7 @@ func sb3ApplyUnitRoute(parent map[uint64]uint64, u *sb3RouteUnit) []uint64 {
 	if u.anchor == nil {
 		return nil
 	}
-	cur := u.parentID
+	cur := u.head()
 	inserted := make([]uint64, 0, u.depth-u.anchor.Depth)
 	for d := u.depth - 1; d > u.anchor.Depth; d-- {
 		if _, joined := parent[cur]; joined {
@@ -1196,7 +1253,7 @@ func sb3UnitWindowCompatible(sk *cgpSkeleton, u *sb3RouteUnit, parent map[uint64
 			continue
 		}
 		floor := e.ckpt.Depth
-		cur := u.parentID
+		cur := u.head()
 		for d := u.depth; d >= floor; d-- {
 			if !sk.checkpoints.allows(cur, e.checkpoints) {
 				return false
@@ -1263,7 +1320,9 @@ func sb3BuildNodeDepth(sk *cgpSkeleton, units []*sb3RouteUnit) map[uint64]int {
 		depth[id] = fo.depth
 	}
 	for _, u := range units {
-		depth[u.parentID] = u.depth
+		if !u.anonymousParent {
+			depth[u.parentID] = u.depth
+		}
 		for d, id := range u.requiredFanout {
 			if id != 0 {
 				depth[id] = d
@@ -1550,7 +1609,7 @@ func (h *sb3HATracker) diagPending(units []*sb3RouteUnit, parent map[uint64]uint
 	}
 	unitByParent := make(map[uint64]*sb3RouteUnit, len(units))
 	for _, u := range units {
-		unitByParent[u.parentID] = u
+		unitByParent[u.head()] = u
 	}
 	printed := 0
 	for terminal, set := range h.waiting {
@@ -1610,7 +1669,7 @@ func sb3ResolvePendingHA(cfg Config, sk *cgpSkeleton, units []*sb3RouteUnit, ord
 	}
 	unitByParent := make(map[uint64]*sb3RouteUnit, len(units))
 	for _, u := range units {
-		unitByParent[u.parentID] = u
+		unitByParent[u.head()] = u
 	}
 	for {
 		before := ha.pending()

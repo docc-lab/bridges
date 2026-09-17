@@ -52,6 +52,7 @@ type config struct {
 	timingPath         string // non-empty: write per-trace reconstruction timing CSV here
 	checkpointDistance int
 	checkpointPolicy   *bridge.CheckpointRange
+	reverse            *bridge.ReverseConfig // non-nil: unscheduled leaf trusses return upstream through bridge.ReverseHandler
 	dropRate           float64
 	dropRates          string // comma list: one decode, all rates reconstructed per pass (CGP/PB/SB3 families)
 	seed               int64
@@ -111,6 +112,14 @@ func parseFlags() config {
 	var checkpointSeed int64
 	flag.StringVar(&checkpointRange, "checkpoint-range", "", "Randomized checkpoint distance, inclusive MIN:MAX (1..256); outgoing TTL is sampled distance minus one")
 	flag.Int64Var(&checkpointSeed, "checkpoint-seed", 42, "Seed for randomized checkpoints, independent of drop and sampling seeds")
+	var reversePolicy, reverseTTL string
+	var reverseProbability, leafReject float64
+	var reverseSeed uint64
+	flag.StringVar(&reversePolicy, "reverse-policy", "", "Reverse trusses (pb0/cgp0/sb3): unscheduled leaves return their truss upstream and receivers accept per policy: ttl, probability, inverse_depth, depth_linear, upstream_pressure")
+	flag.Float64Var(&reverseProbability, "reverse-probability", -1, "Receiver acceptance probability in [0,1]; required exactly for --reverse-policy probability")
+	flag.StringVar(&reverseTTL, "reverse-ttl-range", "", "Inclusive reverse distance MIN:MAX for the ttl policy; defaults to the forward checkpoint range or fixed distance")
+	flag.Uint64Var(&reverseSeed, "reverse-seed", 42, "Seed for reverse leaf rejection, TTL, and acceptance draws")
+	flag.Float64Var(&leafReject, "leaf-reject", 1, "Probability that an unscheduled leaf returns its truss (requires --reverse-policy)")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides)")
 	flag.IntVar(&c.fpBits, "fp-bits", 16, "SB3 delayed-end owner fingerprint width in bits")
 	flag.BoolVar(&c.topoOnly, "topo-only", false, "SB3: omit lateral EE/DEE evidence while retaining topology and sparse ordinals")
@@ -171,6 +180,17 @@ func parseFlags() config {
 			os.Exit(2)
 		}
 		c.checkpointDistance = c.checkpointPolicy.MaxDistance()
+	}
+	if reversePolicy != "" {
+		rc, err := parseReverseConfig(c, reversePolicy, reverseProbability, reverseTTL, reverseSeed, leafReject)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(2)
+		}
+		c.reverse = rc
+	} else if reverseProbability >= 0 || reverseTTL != "" || leafReject != 1 {
+		fmt.Fprintln(os.Stderr, "error: reverse options require --reverse-policy")
+		os.Exit(2)
 	}
 	bloom.PrimeM = primeM // set before any handler/config sizing (emit + recon must match)
 	bloom.PrimeMByteCap = primeMByteCap
@@ -275,6 +295,7 @@ type collSpan struct {
 	parentID uint64
 	depth    int    // handler-derived absolute depth (ground truth for scoring)
 	br       []byte // _br payload; nil = the span carried only _d
+	ckpt     []byte // bridges.checkpoint value: returned trusses this span exported; nil = none
 	ordinal  int    // ground-truth start ordinal under parent
 	endPos   int64  // ground-truth END position in the trace event total-order
 }
@@ -1345,6 +1366,7 @@ func newHarness(c config) *harness {
 			ha.deesByTID[tid] = append(ha.deesByTID[tid], quads...)
 		}
 	}
+	ha.h = wrapReverse(h, c) // after the base handler's sinks are wired
 	ha.fullsatEngine = c.fullsatEngine
 	ha.timingPath = c.timingPath
 	ha.timingOn = c.timingPath != "" || os.Getenv("TRACE_RECON_TIMING") == "1"
@@ -1595,6 +1617,9 @@ func (ha *harness) onEvent(ts int64, kind bridge.Kind, tid, sid, pid uint64, ser
 			if r.Payload != nil {
 				s.br = r.Payload
 			}
+			if r.Reverse != nil && len(r.Reverse.CheckpointContext) > 0 {
+				s.ckpt = append([]byte(nil), r.Reverse.CheckpointContext...)
+			}
 		}
 	}
 
@@ -1776,6 +1801,7 @@ func (ha *harness) process(j finishJob) {
 		}
 		survivors = append(survivors, ha.decodeSpan(tid, s))
 	}
+	survivors = ha.mergeReverseEvidence(tid, spans, dropped, survivors)
 
 	if ha.dumpW != nil {
 		dropIDs := make([]uint64, 0, len(dropped))
@@ -1984,7 +2010,7 @@ func hasReconstructionObligation(survivors []recon.Span) bool {
 	}
 	for i := range survivors {
 		s := &survivors[i]
-		if s.ParentID != 0 && !surviving[s.ParentID] {
+		if s.ParentUnknown || (s.ParentID != 0 && !surviving[s.ParentID]) {
 			return true
 		}
 	}
@@ -2115,6 +2141,14 @@ func (ha *harness) decodeSpan(tid uint64, s collSpan) recon.Span {
 			die(err)
 		}
 	}
+	if s.ckpt != nil && sp.LeafCarrier {
+		// A span that exported returned trusses received them from children, so
+		// it is an internal span. Its own payload is a partial-window snapshot:
+		// evidence for its incoming window that neither resets baggage nor
+		// marks a leaf. It remains an admissible ancestor.
+		sp.LeafCarrier = false
+		sp.PartialWindow = true
+	}
 	return sp
 }
 
@@ -2159,6 +2193,7 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			}
 			survivors = append(survivors, decoded[i])
 		}
+		survivors = ha.mergeReverseEvidence(tid, spans, dropped, survivors)
 		t0 := time.Now()
 		res, sb3 := ha.cg2Reconstruct(survivors, j.dees)
 		ns := time.Since(t0).Nanoseconds()
@@ -3002,6 +3037,7 @@ type output struct {
 	SerialTraces            bool                     `json:"serial_traces,omitempty"`
 	CheckpointDistance      int                      `json:"checkpoint_distance"`
 	CheckpointRandomization *bridge.CheckpointRange  `json:"checkpoint_randomization,omitempty"`
+	Reverse                 *bridge.ReverseConfig    `json:"reverse,omitempty"`
 	DropRate                float64                  `json:"drop_rate,omitempty"`
 	DropRates               []float64                `json:"drop_rates,omitempty"`
 	RateSummaries           []rateSummary            `json:"rate_summaries,omitempty"`
@@ -3134,6 +3170,7 @@ func main() {
 		SerialTraces:            c.serialTraces,
 		CheckpointDistance:      c.checkpointDistance,
 		CheckpointRandomization: c.checkpointPolicy,
+		Reverse:                 c.reverse,
 		DropRate:                c.dropRate,
 		PrimeM:                  bloom.PrimeM,
 		PrimeMByteCap:           bloom.PrimeMByteCap,
@@ -3502,6 +3539,9 @@ func replayTrace(h bridge.Handler, st corpus.StoredTrace) []collSpan {
 				if r.Payload != nil {
 					spans[j].br = r.Payload
 				}
+				if r.Reverse != nil && len(r.Reverse.CheckpointContext) > 0 {
+					spans[j].ckpt = append([]byte(nil), r.Reverse.CheckpointContext...)
+				}
 			}
 		}
 	}
@@ -3647,6 +3687,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 		go func() {
 			defer p1wg.Done()
 			h, workerCfg := makeHandler(c)
+			replayHandler := wrapReverse(h, c)
 			for stx := range inCh {
 				var dees []bridge.DEEQuad
 				if sh, ok := h.(*bridge.SB3Handler); ok {
@@ -3664,7 +3705,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 						dees = append(dees, decoded...)
 					}
 				}
-				spans := replayTrace(h, stx.st)
+				spans := replayTrace(replayHandler, stx.st)
 				outCh <- prepped{seq: stx.seq, tid: stx.st.TraceID, spans: spans, dees: dees}
 			}
 		}()

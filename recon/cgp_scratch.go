@@ -1796,7 +1796,7 @@ func ScorePBPathStrict(res Result, survivors []Span, truth []TruthSpan, dropped 
 	expected := make(map[uint64]bool)
 	for i := range survivors {
 		s := &survivors[i]
-		if s.ParentID == 0 || surviving[s.ParentID] {
+		if (s.ParentID == 0 && !s.ParentUnknown) || surviving[s.ParentID] {
 			continue
 		}
 		expected[s.SpanID] = true

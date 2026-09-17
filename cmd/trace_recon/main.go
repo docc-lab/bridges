@@ -295,7 +295,7 @@ type collSpan struct {
 	parentID uint64
 	depth    int    // handler-derived absolute depth (ground truth for scoring)
 	br       []byte // _br payload; nil = the span carried only _d
-	ckpt     []byte // bridges.checkpoint value: returned trusses this span exported; nil = none
+	ckpt     []byte // returned trusses this span carried to the collector; retained even if the span record is lost
 	ordinal  int    // ground-truth start ordinal under parent
 	endPos   int64  // ground-truth END position in the trace event total-order
 }
@@ -1617,8 +1617,17 @@ func (ha *harness) onEvent(ts int64, kind bridge.Kind, tid, sid, pid uint64, ser
 			if r.Payload != nil {
 				s.br = r.Payload
 			}
-			if r.Reverse != nil && len(r.Reverse.CheckpointContext) > 0 {
-				s.ckpt = append([]byte(nil), r.Reverse.CheckpointContext...)
+			if r.Reverse != nil {
+				if len(r.Reverse.CheckpointContext) > 0 {
+					s.ckpt = append([]byte(nil), r.Reverse.CheckpointContext...)
+				}
+				if r.Reverse.PromotedCheckpoint {
+					// A receiver that emits only reverse trusses is not a checkpoint:
+					// its own record stays an ordinary span, eligible for loss, and
+					// its snapshot is not checkpoint evidence. The trusses it carried
+					// identify the real checkpoints and are retained separately.
+					s.br = nil
+				}
 			}
 		}
 	}
@@ -2140,14 +2149,6 @@ func (ha *harness) decodeSpan(tid uint64, s collSpan) recon.Span {
 		if err != nil {
 			die(err)
 		}
-	}
-	if s.ckpt != nil && sp.LeafCarrier {
-		// A span that exported returned trusses received them from children, so
-		// it is an internal span. Its own payload is a partial-window snapshot:
-		// evidence for its incoming window that neither resets baggage nor
-		// marks a leaf. It remains an admissible ancestor.
-		sp.LeafCarrier = false
-		sp.PartialWindow = true
 	}
 	return sp
 }
@@ -3539,8 +3540,13 @@ func replayTrace(h bridge.Handler, st corpus.StoredTrace) []collSpan {
 				if r.Payload != nil {
 					spans[j].br = r.Payload
 				}
-				if r.Reverse != nil && len(r.Reverse.CheckpointContext) > 0 {
-					spans[j].ckpt = append([]byte(nil), r.Reverse.CheckpointContext...)
+				if r.Reverse != nil {
+					if len(r.Reverse.CheckpointContext) > 0 {
+						spans[j].ckpt = append([]byte(nil), r.Reverse.CheckpointContext...)
+					}
+					if r.Reverse.PromotedCheckpoint {
+						spans[j].br = nil // demoted: see onEvent
+					}
 				}
 			}
 		}

@@ -8,55 +8,67 @@ assigned checkpoint root, distance, and Bloom geometry.
 
 ## Status
 
-Reverse evidence is consumed by the shared PB0/CGP0/SB3 greedy topology engine.
+Reverse evidence is consumed by the shared PB0/CGP0/SB3 greedy topology engine
+under the **intended-checkpoint model**:
+
+- A checkpoint is any span that emits a truss. A receiver that emits only
+  returned trusses is **demoted**: its own record is an ordinary span, eligible
+  for collection loss like any other, and its snapshot is not checkpoint
+  evidence.
+- The span identified by each returned truss is **promoted**: the rejected leaf
+  is the checkpoint, reconstructed from its truss with exact identity, depth,
+  window root, geometry, and filter. Trusses are checkpoint payloads and are
+  retained regardless of whether the record that carried them survives.
+- The reconstructor therefore sees the original set of intended checkpoints.
+  At total loss the survivor set is exactly that set, so PB0 joins every
+  checkpoint to its named previous checkpoint root with no filter probes.
+
 The reconstruction harness (`cmd/trace_recon`) accepts the simulator's reverse
 options (`--reverse-policy`, `--reverse-probability`, `--reverse-ttl-range`,
 `--reverse-seed`, `--leaf-reject`), routes trusses through
-`bridge.ReverseHandler` during replay, applies collection loss to the resulting
-records, decodes exported bundles, binds each origin's truss, and scores the
-emitted topology against pre-loss truth with the existing strict scorers.
-
-The representation decisions below are implemented in `recon`:
+`bridge.ReverseHandler` during replay, demotes receivers that carried only
+returned trusses, applies collection loss, decodes every carried bundle, binds
+each truss to its checkpoint, and scores the emitted topology against pre-loss
+truth with the existing strict scorers.
 
 | Fact | Representation | Effect |
 | --- | --- | --- |
-| Origin record survived | Its `Span` receives the returned truss (`BloomBits`, prefix, geometry, HA, ordinals) with `LeafCarrier` set | Identical to a leaf that checkpointed locally |
-| Origin record lost | A new `Span` with exact `SpanID`, `Depth`, truss evidence, `LeafCarrier`, and `ParentUnknown`; `ParentID` is zero and meaningless | Fragment root with no named parent; never a trace root |
-| Promoted receiver (exported a bundle, own payload flagged as a partial window) | `PartialWindow` on the receiver's `Span`; `LeafCarrier` cleared | Evidence carrier for its incoming window; not a window root, not a baggage reset, still an admissible ancestor |
-| Export owner | `EvidenceOwner` on the origin `Span` | Provenance only; never a parent edge or window identity |
+| Promoted checkpoint whose record survived | Its `Span` receives the truss (`BloomBits`, prefix, geometry, HA, ordinals) with `LeafCarrier` set | Identical to a leaf that checkpointed locally |
+| Promoted checkpoint whose record was lost | A new `Span` with exact `SpanID`, `Depth`, truss evidence, `LeafCarrier`, and `ParentUnknown`; `ParentID` is zero and meaningless | Fragment root with no named parent; never a trace root |
+| Demoted receiver | Ordinary span record without `_br`; its carried bundle is decoded separately | Not protected, not a window root, not a carrier |
+| Original checkpoint that also carried trusses | Unchanged checkpoint record; bundle decoded separately | Still a window root |
+| Carrier of a truss | `EvidenceOwner` on the checkpoint `Span` | Provenance only |
 
-`recon.MergeReverseEvidence` performs the binding. The harness sets
-`PartialWindow` when a span exported a bundle and its own payload decodes as a
-leaf/partial-window carrier (the randomized flag, or a non-multiple depth in
-fixed mode).
+`recon.MergeReverseEvidence` performs the binding. Engine behavior for a
+promoted checkpoint with an unknown parent: it forms its own route unit whose
+head is the checkpoint itself (`anonymousParent`). The unit's depth is the
+checkpoint's depth, so the node at depth-1 is inferred from admissible evidence
+like any other gap level: a surviving ordinary span at depth-1 confirmed by the
+filter and every downstream filter, a witnessed or Bloom-confirmed named
+fanout, an anonymous node, or the checkpoint root itself. When no ordinary
+interior span survives, the only admissible anchor is the named root and no
+filter is probed. Persistent downstream AMQ, HA, window, and ordinal constraints
+apply unchanged. Two promoted checkpoints never coalesce by parent identity,
+because neither names one.
 
-Engine behavior for an evidence-only origin: it forms its own route unit whose
-head is the origin itself (`anonymousParent`). The unit's depth is the origin's
-depth, so the node at depth-1 is inferred from admissible evidence like any
-other gap level: a surviving span at depth-1 confirmed by the origin's filter
-and every downstream filter, a witnessed or Bloom-confirmed named fanout, an
-anonymous node, or the checkpoint root itself when the origin sits directly
-below it. Persistent downstream AMQ, HA, window, and ordinal constraints apply
-unchanged. Two origins never coalesce by parent identity, because neither names
-one.
-
-Scoring: `ScorePBPathStrict` creates an obligation for every evidence-only
-origin and requires the emitted bridge to reach its true nearest surviving
-ancestor with the depth-implied synthetic count. `ScoreCGP2Evidence` treats the
-origin as a nameable node whose parent chain must match truth through nameable
-nodes and anonymous stand-ins. A trace with a lost origin therefore always has a
-reconstruction obligation; eligibility uses the post-routing protected set,
-because rejected leaves have no `_br` and are eligible for loss while every
-bundle owner is protected.
+Scoring: `ScorePBPathStrict` creates an obligation for every promoted
+checkpoint with an unknown parent and requires the emitted bridge to reach its
+true nearest surviving ancestor with the depth-implied synthetic count.
+`ScoreCGP2Evidence` treats it as a nameable node whose parent chain must match
+truth through nameable nodes and anonymous stand-ins. Trace eligibility uses
+the post-routing protected set: intended checkpoints are protected, demoted
+receivers are not.
 
 Tests: `recon/reverse_recon_test.go` replays synthetic traces through the real
 `ReverseHandler` for all three bridges, randomized and fixed windows, four
 policies (inverse-depth, promote-all, absorb-at-checkpoints, half rejection),
-and three loss scenarios (origins lost; origins and their parents lost; every
-unprotected record lost). `cmd/trace_recon/reverse_test.go` drives the full
-harness from a trace store. Both require zero hard conflicts and clean strict
-scores with a negligible Bloom FPR, and assert that promoted receivers and
-origins never become window roots.
+and three loss scenarios (promoted checkpoints' records lost; those and their
+parents lost; every unprotected record lost). It asserts that at total loss no
+non-checkpoint span survives, that demoted carriers hold trusses and no own
+payload, and that promoted checkpoints never become window roots.
+`cmd/trace_recon/reverse_test.go` drives the full harness from a trace store.
+Both require zero hard conflicts and clean strict scores with a negligible
+Bloom FPR.
 
 ## Three identities that must stay separate
 

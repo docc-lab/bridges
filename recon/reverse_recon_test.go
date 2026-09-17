@@ -13,6 +13,7 @@ type reverseCollected struct {
 	spanID, parentID uint64
 	depth            int
 	br, ckpt         []byte
+	demoted          bool // carried only returned trusses: not a checkpoint
 }
 
 // reverseReconFixture replays one synthetic trace through the real
@@ -100,8 +101,13 @@ func reverseReconFixture(t *testing.T, mode string, policy *bridge.CheckpointRan
 		if r.Payload != nil {
 			rec.br = r.Payload
 		}
-		if r.Reverse != nil && len(r.Reverse.CheckpointContext) > 0 {
-			rec.ckpt = append([]byte(nil), r.Reverse.CheckpointContext...)
+		if r.Reverse != nil {
+			if len(r.Reverse.CheckpointContext) > 0 {
+				rec.ckpt = append([]byte(nil), r.Reverse.CheckpointContext...)
+			}
+			if r.Reverse.PromotedCheckpoint {
+				rec.br, rec.demoted = nil, true
+			}
 		}
 	}
 	h.EvictTrace(77)
@@ -142,10 +148,6 @@ func decodeReverseCollected(t *testing.T, mode string, rec reverseCollected, cfg
 		}
 	} else {
 		sp.LeafCarrier = sp.Depth%max(1, cfg.CPD) != 0
-	}
-	if rec.ckpt != nil && sp.LeafCarrier {
-		sp.LeafCarrier = false
-		sp.PartialWindow = true
 	}
 	return sp
 }
@@ -220,23 +222,25 @@ func TestReverseReconstruction(t *testing.T) {
 						if pol.rc.LeafRejectProbability == 1 && len(rejected) == 0 {
 							t.Fatal("fixture produced no rejected leaves")
 						}
+						// Trusses are checkpoint payloads: every carried bundle is retained
+						// whether or not the carrying span's ordinary record survives.
 						var evidence []ReverseEvidence
-						promoted := 0
+						demoted := 0
 						for _, rec := range collected {
+							if rec.demoted {
+								demoted++
+								if rec.ckpt == nil || rec.br != nil {
+									t.Fatalf("demoted carrier %d must hold trusses and no own payload", rec.spanID)
+								}
+							}
 							if rec.ckpt == nil {
 								continue
-							}
-							if rec.br == nil {
-								t.Fatalf("owner %d exported a bundle without its own payload", rec.spanID)
 							}
 							ev, err := DecodeReverseEvidence(rec.spanID, rec.ckpt, cfg)
 							if err != nil {
 								t.Fatal(err)
 							}
 							evidence = append(evidence, ev...)
-							if decodeReverseCollected(t, mode, rec, cfg).PartialWindow {
-								promoted++
-							}
 						}
 						seen := make(map[uint64]int)
 						for _, e := range evidence {
@@ -250,8 +254,11 @@ func TestReverseReconstruction(t *testing.T) {
 								t.Fatalf("origin %d exported %d times, rejected=%t", id, n, rejected[id])
 							}
 						}
-						if pol.name == "promote_all" && pol.rc.LeafRejectProbability == 1 && promoted == 0 {
-							t.Fatal("promote_all produced no promoted receiver")
+						if pol.name == "promote_all" && demoted == 0 {
+							t.Fatal("promote_all produced no demoted carrier")
+						}
+						if pol.name == "absorb_at_checkpoints" && demoted != 0 {
+							t.Fatalf("absorb_at_checkpoints demoted %d carriers", demoted)
 						}
 
 						dropped := make(map[uint64]struct{})
@@ -291,12 +298,22 @@ func TestReverseReconstruction(t *testing.T) {
 						if unknown != wantUnknown {
 							t.Fatalf("evidence-only origins %d, want %d", unknown, wantUnknown)
 						}
-						// Promoted receivers and origins are never checkpoint-window roots.
+						// Reverse-promoted checkpoints are leaves: never window roots.
 						idx := newCheckpointIndex(byIDSpan, cfg)
 						for _, roots := range idx.byPrefix {
 							for _, r := range roots {
-								if r.PartialWindow || r.ParentUnknown || r.LeafCarrier {
+								if r.ParentUnknown || r.LeafCarrier {
 									t.Fatalf("span %d became a window root: %+v", r.SpanID, *r)
+								}
+							}
+						}
+						// At total loss the survivor set is exactly the intended checkpoint
+						// set, so no Bloom candidate is ever probed and every checkpoint
+						// joins its named root.
+						if sc.name == "all_unprotected" {
+							for _, s := range merged {
+								if s.BloomBits == nil && s.ParentID != 0 {
+									t.Fatalf("non-checkpoint survivor %d at total loss", s.SpanID)
 								}
 							}
 						}

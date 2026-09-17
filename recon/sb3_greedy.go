@@ -373,7 +373,7 @@ func sb3CollectFragmentEvidenceWithStats(sk *cgpSkeleton, cfg Config, chain *Gre
 	survIndex := newSB3WindowIDIndex(cfg, sk.checkpoints)
 	ckptByDepthPrefix := make(map[int]map[string][]*Span)
 	for _, s := range sk.byID {
-		if !s.LeafCarrier && (!cfg.RandomizedCheckpoints || s.BloomBits == nil || s.PartialWindow) {
+		if !s.LeafCarrier && (!cfg.RandomizedCheckpoints || s.BloomBits == nil) {
 			survIndex.add(s.SpanID, s.Depth, s)
 		}
 		if s.Depth%cpd == 0 {

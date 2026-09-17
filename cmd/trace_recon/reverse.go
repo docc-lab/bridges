@@ -69,18 +69,17 @@ func wrapReverse(h bridge.Handler, c config) bridge.Handler {
 	return rh
 }
 
-// mergeReverseEvidence decodes the returned-truss bundles exported by
-// surviving receivers and binds every origin's truss to its surviving record
-// or, when that record was lost, to an evidence-only span with an unknown
-// parent. A bundle survives or is lost with its owner. This is collection-side
-// decoding and runs before reconstruction timing starts.
+// mergeReverseEvidence decodes every returned-truss bundle and restores the
+// intended checkpoint set: each truss identifies a checkpoint leaf, bound to
+// its surviving record or reconstructed from the truss alone. Trusses are
+// checkpoint payloads and are retained regardless of whether the ordinary
+// record of the span that carried them survived collection. This is
+// collection-side decoding and runs before reconstruction timing starts.
 func (ha *harness) mergeReverseEvidence(tid uint64, spans []collSpan, dropped map[uint64]struct{}, survivors []recon.Span) []recon.Span {
+	_ = dropped
 	var evidence []recon.ReverseEvidence
 	for _, s := range spans {
 		if s.ckpt == nil {
-			continue
-		}
-		if _, gone := dropped[s.spanID]; gone {
 			continue
 		}
 		decoded, err := recon.DecodeReverseEvidence(s.spanID, s.ckpt, ha.cfg)

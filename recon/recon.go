@@ -102,15 +102,10 @@ type Span struct {
 	// Such a leaf cannot be an ancestor candidate, even with a Bloom positive.
 	LeafCarrier bool
 
-	// PartialWindow marks a promoted reverse receiver's own snapshot: an
-	// internal span that exported evidence for its incoming partial window
-	// without resetting baggage. It remains an admissible ancestor and is not
-	// a checkpoint-window root.
-	PartialWindow bool
-
-	// ParentUnknown marks an evidence-only reverse origin whose ordinary
-	// record was lost. Its identity, depth, and truss are exact; ParentID is
-	// zero and carries no meaning. It is never a trace root.
+	// ParentUnknown marks a reverse-promoted checkpoint: a leaf whose truss
+	// was returned upstream and whose ordinary record was lost. Its identity,
+	// depth, window root, and filter are exact; ParentID is zero and carries
+	// no meaning. It is never a trace root.
 	ParentUnknown bool
 
 	// EvidenceOwner is the exporting span that retained this origin's truss,

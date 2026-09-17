@@ -107,12 +107,13 @@ func DecodeReverseSegmentEvidence(carrierSpanID uint64, segment bridge.ReverseSe
 	return out, nil
 }
 
-// MergeReverseEvidence binds decoded returned trusses to the collected
-// survivors. An origin whose ordinary record survived receives its own truss
-// as a leaf carrier, exactly as if it had checkpointed locally. An origin whose
-// record was lost becomes an evidence-only span: exact identity, depth, window
-// root, and filter, but an unknown parent. Each origin is bound once; the
-// exporting receiver's own record is never altered, and no parent is invented.
+// MergeReverseEvidence restores the intended checkpoint set. Every returned
+// truss identifies a checkpoint: the leaf that would have exported it. If that
+// leaf's ordinary record survived, the record receives its truss as a leaf
+// carrier, exactly as if it had checkpointed locally. If the record was lost,
+// the leaf is reconstructed from the truss alone: exact identity, depth, window
+// root, and filter, with an unknown parent. Each origin is bound once. The
+// receiver that carried the truss is not a checkpoint and is never altered.
 func MergeReverseEvidence(survivors []Span, evidence []ReverseEvidence) ([]Span, error) {
 	if len(evidence) == 0 {
 		return survivors, nil

@@ -37,7 +37,7 @@ func parseReverseConfig(c config, policy string, q float64, p optionalProbabilit
 		return nil, fmt.Errorf("--reverse-policy supports pcrb, cgprb and sb3")
 	}
 	switch policy {
-	case "ttl", "probability", "inverse_depth", "depth_linear", "depth_quadratic", "depth_cubic", "depth_ratio", "upstream_pressure":
+	case "ttl", "probability", "inverse_depth", "depth_linear", "depth_quadratic", "depth_cubic", "depth_quartic", "depth_ratio", "upstream_pressure":
 	default:
 		return nil, fmt.Errorf("unknown reverse policy %q", policy)
 	}

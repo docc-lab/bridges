@@ -36,7 +36,7 @@ func (c ReverseConfig) Validate() error {
 		if math.IsNaN(c.Exponent) || math.IsInf(c.Exponent, 0) || c.Exponent <= 0 {
 			return fmt.Errorf("reverse depth_ratio exponent must be finite and positive")
 		}
-	case "inverse_depth", "depth_linear", "depth_quadratic", "depth_cubic", "upstream_pressure":
+	case "inverse_depth", "depth_linear", "depth_quadratic", "depth_cubic", "depth_quartic", "upstream_pressure":
 	default:
 		return fmt.Errorf("unknown reverse policy %q", c.Policy)
 	}
@@ -77,6 +77,11 @@ func reverseAcceptance(policy string, p, exponent float64, receiverDepth, origin
 		// (n(n+1)/2)^2. First-hop acceptance is 4n/(n+1)^2, tending to 4/n.
 		d, n := float64(receiverDepth)+1, float64(originDepth)
 		return 4 * d * d * d / (n * n * (n + 1) * (n + 1))
+	case "depth_quartic":
+		// Weights proportional to (d+1)^4, normalized by sum_{j=1..n} j^4 =
+		// n(n+1)(2n+1)(3n^2+3n-1)/30. First-hop acceptance tends to 5/n.
+		d, n := float64(receiverDepth)+1, float64(originDepth)
+		return 30 * d * d * d * d / (n * (n + 1) * (2*n + 1) * (3*n*n + 3*n - 1))
 	case "depth_ratio":
 		return math.Pow((float64(receiverDepth)+1)/(float64(originDepth)+1), exponent)
 	case "depth_quadratic":

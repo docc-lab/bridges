@@ -10,7 +10,7 @@ import (
 // 0..n-1. Their first-hop value at the immediate parent fixes how quickly a
 // truss is absorbed, and is (k+1)/n asymptotically for weights (d+1)^k.
 func TestDepthWeightedPoliciesAreNormalized(t *testing.T) {
-	for _, policy := range []string{"depth_linear", "depth_quadratic", "depth_cubic"} {
+	for _, policy := range []string{"depth_linear", "depth_quadratic", "depth_cubic", "depth_quartic"} {
 		for _, n := range []int{1, 2, 3, 5, 8, 15, 40, 90} {
 			total := 0.0
 			for d := 0; d < n; d++ {
@@ -35,8 +35,23 @@ func TestNormalizedDepthFamilyIsOrdered(t *testing.T) {
 		lin := ReverseAcceptanceProbability("depth_linear", 0, n-1, n)
 		quad := ReverseAcceptanceProbability("depth_quadratic", 0, n-1, n)
 		cub := ReverseAcceptanceProbability("depth_cubic", 0, n-1, n)
-		if !(lin < quad && quad < cub) {
-			t.Fatalf("n=%d: first hop must increase linear<quad<cubic, got %g %g %g", n, lin, quad, cub)
+		quar := ReverseAcceptanceProbability("depth_quartic", 0, n-1, n)
+		if !(lin < quad && quad < cub && cub < quar) {
+			t.Fatalf("n=%d: first hop must increase linear<quad<cubic<quartic, got %g %g %g %g", n, lin, quad, cub, quar)
+		}
+		if want := 30 * math.Pow(float64(n), 3) / (float64(n+1) * float64(2*n+1) * float64(3*n*n+3*n-1)); math.Abs(quar-want) > 1e-12 {
+			t.Fatalf("n=%d: quartic first hop %g, want %g", n, quar, want)
+		}
+		for d := 1; d < n; d++ {
+			if ReverseAcceptanceProbability("depth_quartic", 0, d, n) <=
+				ReverseAcceptanceProbability("depth_quartic", 0, d-1, n) {
+				t.Fatalf("n=%d d=%d: quartic must increase with receiver depth", n, d)
+			}
+		}
+		for _, d := range []int{n, n + 1} {
+			if p := ReverseAcceptanceProbability("depth_quartic", 0, d, n); p != 0 {
+				t.Fatalf("n=%d d=%d quartic: expected 0, got %g", n, d, p)
+			}
 		}
 		if want := 4 * float64(n) / float64((n+1)*(n+1)); math.Abs(cub-want) > 1e-12 {
 			t.Fatalf("n=%d: cubic first hop %g, want %g", n, cub, want)

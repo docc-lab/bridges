@@ -31,7 +31,7 @@ func (c ReverseConfig) Validate() error {
 		if math.IsNaN(c.Probability) || c.Probability < 0 || c.Probability > 1 {
 			return fmt.Errorf("reverse probability must be finite and in [0,1]")
 		}
-	case "inverse_depth", "depth_linear", "upstream_pressure":
+	case "inverse_depth", "depth_linear", "depth_quadratic", "upstream_pressure":
 	default:
 		return fmt.Errorf("unknown reverse policy %q", c.Policy)
 	}
@@ -55,6 +55,13 @@ func ReverseAcceptanceProbability(policy string, p float64, receiverDepth, origi
 		return 1 / float64(originDepth)
 	case "depth_linear":
 		return 2 * (float64(receiverDepth) + 1) / (float64(originDepth) * (float64(originDepth) + 1))
+	case "depth_quadratic":
+		// Weights proportional to (d+1)^2 over the origin's ancestors, normalized
+		// by sum_{j=1..n} j^2 = n(n+1)(2n+1)/6. Steeper than depth_linear, so more
+		// of the mass sits on the deep receivers the truss actually reaches before
+		// its window root absorbs it.
+		d, n := float64(receiverDepth)+1, float64(originDepth)
+		return 6 * d * d / (n * (n + 1) * (2*n + 1))
 	case "upstream_pressure":
 		return 1 / (float64(receiverDepth) + 1)
 	default:

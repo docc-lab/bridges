@@ -232,7 +232,7 @@ func TestReverseRoutingSiblingOrderAndOriginDepth(t *testing.T) {
 
 func TestReversePoliciesMatchAnalyticalEmissionDistributions(t *testing.T) {
 	const samples = 40000
-	for _, policy := range []string{"probability", "inverse_depth", "depth_linear", "upstream_pressure"} {
+	for _, policy := range []string{"probability", "inverse_depth", "depth_linear", "depth_quadratic", "upstream_pressure"} {
 		c := ReverseConfig{Policy: policy, Probability: 0.25, Seed: 73}
 		expected := [6]float64{}
 		survival := 1.0

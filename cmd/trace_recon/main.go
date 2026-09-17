@@ -115,7 +115,7 @@ func parseFlags() config {
 	var reversePolicy, reverseTTL string
 	var reverseProbability, leafReject float64
 	var reverseSeed uint64
-	flag.StringVar(&reversePolicy, "reverse-policy", "", "Reverse trusses (pb0/cgp0/sb3): unscheduled leaves return their truss upstream and receivers accept per policy: ttl, probability, inverse_depth, depth_linear, upstream_pressure")
+	flag.StringVar(&reversePolicy, "reverse-policy", "", "Reverse trusses (pb0/cgp0/sb3): unscheduled leaves return their truss upstream and receivers accept per policy: ttl, probability, inverse_depth, depth_linear, depth_quadratic, upstream_pressure")
 	flag.Float64Var(&reverseProbability, "reverse-probability", -1, "Receiver acceptance probability in [0,1]; required exactly for --reverse-policy probability")
 	flag.StringVar(&reverseTTL, "reverse-ttl-range", "", "Inclusive reverse distance MIN:MAX for the ttl policy; defaults to the forward checkpoint range or fixed distance")
 	flag.Uint64Var(&reverseSeed, "reverse-seed", 42, "Seed for reverse leaf rejection, TTL, and acceptance draws")

@@ -75,7 +75,7 @@ func parseFlags() config {
 	var reverseProbability optionalProbability
 	var leafReject float64
 	var reverseSeed uint64
-	flag.StringVar(&reversePolicy, "reverse-policy", "", "Enable reverse trusses: ttl, probability, inverse_depth, depth_linear, or experimental upstream_pressure")
+	flag.StringVar(&reversePolicy, "reverse-policy", "", "Enable reverse trusses: ttl, probability, inverse_depth, depth_linear, depth_quadratic, or experimental upstream_pressure")
 	flag.Float64Var(&leafReject, "leaf-reject", 1, "Probability that an unscheduled leaf returns its truss (requires --reverse-policy)")
 	flag.Var(&reverseProbability, "reverse-probability", "Receiver acceptance probability in [0,1]; required only for --reverse-policy probability")
 	flag.Uint64Var(&reverseSeed, "reverse-seed", 42, "Seed for independent leaf rejection, reverse distance and receiver decisions")

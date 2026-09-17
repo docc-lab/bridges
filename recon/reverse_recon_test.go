@@ -19,6 +19,12 @@ type reverseCollected struct {
 // reverseReconFixture replays one synthetic trace through the real
 // ReverseHandler and returns the collected records, truth, DEEs, and config.
 func reverseReconFixture(t *testing.T, mode string, policy *bridge.CheckpointRange, fixedCPD int, rc bridge.ReverseConfig) ([]reverseCollected, []TruthSpan, []bridge.DEEQuad, Config) {
+	return reverseReconFixtureWith(t, mode, policy, fixedCPD, &rc)
+}
+
+// reverseReconFixtureWith replays the fixture trace; rc == nil replays the
+// forward-only handler, which defines the intended checkpoint set.
+func reverseReconFixtureWith(t *testing.T, mode string, policy *bridge.CheckpointRange, fixedCPD int, rc *bridge.ReverseConfig) ([]reverseCollected, []TruthSpan, []bridge.DEEQuad, Config) {
 	t.Helper()
 	cpd := fixedCPD
 	if policy != nil {
@@ -61,9 +67,13 @@ func reverseReconFixture(t *testing.T, mode string, policy *bridge.CheckpointRan
 			t.Fatal(err)
 		}
 	}
-	h, err := bridge.NewReverseHandler(base, rc)
-	if err != nil {
-		t.Fatal(err)
+	h := base
+	if rc != nil {
+		rh, err := bridge.NewReverseHandler(base, *rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h = rh
 	}
 	// Unequal fanouts with leaves at many depths, so unscheduled leaves occur
 	// above, below, and directly under original checkpoints.
@@ -364,6 +374,90 @@ func TestReverseReconstruction(t *testing.T) {
 						}
 					})
 				}
+			}
+		}
+	}
+}
+
+// TestReverseRealizedCheckpointsMatchIntended checks the defining property of
+// the model: after demoting carriers and promoting returned leaves, the
+// checkpoint set the reconstructor sees at zero loss is exactly the forward
+// schedule's intended set, with identical evidence on every checkpoint.
+func TestReverseRealizedCheckpointsMatchIntended(t *testing.T) {
+	type key struct {
+		depth                  int
+		prefix, bits, ha, ords string
+		parent                 uint64
+	}
+	evidence := func(s Span) key {
+		return key{s.Depth, string(s.CkptPrefix), string(s.BloomBits), fmt.Sprint(s.HA), fmt.Sprint(s.SparseOrdinals), s.ParentID}
+	}
+	policies := []bridge.ReverseConfig{
+		{Policy: "inverse_depth", LeafRejectProbability: 1, Seed: 42},
+		{Policy: "probability", Probability: 1, LeafRejectProbability: 1, Seed: 42},
+		{Policy: "probability", Probability: 0, LeafRejectProbability: 1, Seed: 42},
+		{Policy: "inverse_depth", LeafRejectProbability: 0.5, Seed: 7},
+	}
+	for _, mode := range []string{"pb0", "cgp0", "sb3"} {
+		for _, w := range []struct {
+			name   string
+			policy *bridge.CheckpointRange
+			fixed  int
+		}{{"random2_4", &bridge.CheckpointRange{Min: 2, Max: 4, Seed: 42}, 0}, {"fixed3", nil, 3}} {
+			intendedRecs, truth, _, cfg := reverseReconFixtureWith(t, mode, w.policy, w.fixed, nil)
+			intended := make(map[uint64]key)
+			for _, rec := range intendedRecs {
+				if rec.br != nil {
+					intended[rec.spanID] = evidence(decodeReverseCollected(t, mode, rec, cfg))
+				}
+			}
+			if len(intended) == 0 {
+				t.Fatal("fixture has no checkpoints")
+			}
+			for _, rc := range policies {
+				t.Run(fmt.Sprintf("%s/%s/%s_q%g_p%g", mode, w.name, rc.Policy, rc.LeafRejectProbability, rc.Probability), func(t *testing.T) {
+					recs, truth2, _, cfg2 := reverseReconFixtureWith(t, mode, w.policy, w.fixed, &rc)
+					if len(truth2) != len(truth) {
+						t.Fatal("fixture changed")
+					}
+					var survivors []Span
+					var ev []ReverseEvidence
+					for _, rec := range recs {
+						survivors = append(survivors, decodeReverseCollected(t, mode, rec, cfg2))
+						if rec.ckpt != nil {
+							decoded, err := DecodeReverseEvidence(rec.spanID, rec.ckpt, cfg2)
+							if err != nil {
+								t.Fatal(err)
+							}
+							ev = append(ev, decoded...)
+						}
+					}
+					merged, err := MergeReverseEvidence(survivors, ev)
+					if err != nil {
+						t.Fatal(err)
+					}
+					realized := make(map[uint64]key)
+					for _, s := range merged {
+						if s.ParentUnknown {
+							t.Fatalf("span %d has an unknown parent at zero loss", s.SpanID)
+						}
+						if s.BloomBits != nil {
+							realized[s.SpanID] = evidence(s)
+						}
+					}
+					if len(realized) != len(intended) {
+						t.Fatalf("realized %d checkpoints, intended %d", len(realized), len(intended))
+					}
+					for id, want := range intended {
+						got, ok := realized[id]
+						if !ok {
+							t.Fatalf("intended checkpoint %d not realized", id)
+						}
+						if got != want {
+							t.Fatalf("checkpoint %d evidence differs: %+v vs %+v", id, got, want)
+						}
+					}
+				})
 			}
 		}
 	}

@@ -22,32 +22,61 @@ import (
 // concurrent use (the sharded runner has W workers writing through it). The
 // leading header documents the schema and run parameters for the post-processor.
 type streamWriter struct {
-	mu sync.Mutex
-	w  *bufio.Writer
-	f  *os.File
+	mu      sync.Mutex
+	w       *bufio.Writer
+	f       *os.File
+	reverse bool
 }
 
 func newStreamWriter(path string, cpd int, emitDepth, emitOC bool, policies ...*bridge.CheckpointRange) (*streamWriter, error) {
+	c := config{checkpointDistance: cpd, emitDepth: emitDepth, emitOC: emitOC}
+	if len(policies) > 0 {
+		c.checkpointPolicy = policies[0]
+	}
+	return newStreamWriterWithConfig(path, c)
+}
+
+func newStreamWriterWithConfig(path string, c config) (*streamWriter, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
 	w := bufio.NewWriterSize(f, 1<<20)
-	fmt.Fprintf(w, "#cpd=%d emit_depth=%t emit_oc=%t\n", cpd, emitDepth, emitOC)
-	if len(policies) > 0 && policies[0] != nil {
-		r := policies[0]
+	fmt.Fprintf(w, "#cpd=%d emit_depth=%t emit_oc=%t\n", c.checkpointDistance, c.emitDepth, c.emitOC)
+	if c.checkpointPolicy != nil {
+		r := c.checkpointPolicy
 		fmt.Fprintf(w, "#checkpoint_range=%d:%d checkpoint_seed=%d\n", r.Min, r.Max, r.Seed)
 	}
-	fmt.Fprintln(w, "tid,num_spans,num_ckpt_spans,ckpt_sum,ckpt_max,n_bag,bag_sum,bag_max,n_depth,depth_sum,n_oc,oc_sum")
-	return &streamWriter{w: w, f: f}, nil
+	if c.reverse != nil {
+		fmt.Fprintf(w, "#reverse_config=%s\n", reverseConfigJSON(c.reverse))
+		fmt.Fprintf(w, "#reverse_encoding=%s\n", bridge.ReverseEncoding)
+	}
+	fmt.Fprint(w, "tid,num_spans,num_ckpt_spans,ckpt_sum,ckpt_max,n_bag,bag_sum,bag_max,n_depth,depth_sum,n_oc,oc_sum")
+	if c.reverse != nil {
+		for _, col := range reverseMetricColumns {
+			fmt.Fprintf(w, ",%s", col.name)
+		}
+	}
+	fmt.Fprintln(w)
+	return &streamWriter{w: w, f: f, reverse: c.reverse != nil}, nil
 }
 
 func (sw *streamWriter) writeRec(tid uint64, m *TraceMetrics) {
 	sw.mu.Lock()
-	fmt.Fprintf(sw.w, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+	fmt.Fprintf(sw.w, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
 		tid, m.NumSpans, m.NumCheckpointSpans, m.CheckpointSum, m.CheckpointMax,
 		m.NumBaggageCalls, m.BaggageSum, m.BaggageMax,
 		m.NumDepthSpans, m.DepthSum, m.NumOcSpans, m.OcSum)
+	if sw.reverse {
+		r := m.Reverse
+		if r == nil {
+			r = &reverseTraceMetrics{}
+		}
+		for _, col := range reverseMetricColumns {
+			fmt.Fprintf(sw.w, ",%d", *col.ptr(r))
+		}
+	}
+	fmt.Fprintln(sw.w)
 	sw.mu.Unlock()
 }
 
@@ -69,14 +98,15 @@ func btoi(b bool) int {
 // streamEvent is one start or end event in the simulator's sorted order.
 // Same shape as corpus.Event but in-memory; conversions are trivial.
 type streamEvent struct {
-	ts         int64
-	kind       bridge.Kind
-	depth      int // sort tie-break, not consumed by handlers
-	traceID    uint64
-	spanID     uint64
-	parentID   uint64
-	serviceID  uint16
-	deeQueueID uint32
+	ts                 int64
+	kind               bridge.Kind
+	depth              int // sort tie-break, not consumed by handlers
+	traceID            uint64
+	spanID             uint64
+	parentID           uint64
+	serviceID          uint16
+	deeQueueID         uint32
+	pressureInstanceID uint32
 }
 
 // buildAndSortEvents takes traces in load order and returns the globally
@@ -139,10 +169,11 @@ type TraceMetrics struct {
 	NumBaggageCalls    int
 	BaggageSum         int
 	BaggageMax         int
-	NumDepthSpans      int                 // spans carrying a _d attribute (--emit-depth only)
-	DepthSum           int                 // total _d attribute bytes (--emit-depth only)
-	NumOcSpans         int                 // spans carrying an _oc ordinal chain (--emit-oc only)
-	OcSum              int                 // total _oc attribute bytes (--emit-oc only)
+	NumDepthSpans      int // spans carrying a _d attribute (--emit-depth only)
+	DepthSum           int // total _d attribute bytes (--emit-depth only)
+	NumOcSpans         int // spans carrying an _oc ordinal chain (--emit-oc only)
+	OcSum              int // total _oc attribute bytes (--emit-oc only)
+	Reverse            *reverseTraceMetrics
 	emitted            map[uint64]struct{} // (span_id) — dedupe Start vs End emit
 }
 
@@ -183,6 +214,7 @@ type simState struct {
 	spanCountByTID map[uint64]int
 	releaseMetrics bool
 	hist           *sizeHistograms
+	pressure       *checkpointPressure
 }
 
 func newSimState(traceOrder []uint64, spanCounts []int, stream *streamWriter, releaseMetrics bool, hist *sizeHistograms) *simState {
@@ -243,6 +275,7 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 			pm[e.parentID] = seqNum
 		}
 		r := h.OnStart(ev, seqNum)
+		s.pressure.onStart(e, r)
 		if dumpPerSpans {
 			ne := r.EmitBytes
 			if _, seen := m.emitted[e.spanID]; seen {
@@ -272,6 +305,8 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 		}
 	} else {
 		r := h.OnEnd(ev)
+		s.pressure.onEnd(e, r)
+		s.recordReverse(m, r.Reverse)
 		if dumpPerSpans {
 			ne := r.EmitBytes
 			if _, seen := m.emitted[e.spanID]; seen {
@@ -302,6 +337,10 @@ func (s *simState) onEvent(h bridge.Handler, e streamEvent) {
 
 	s.openByTID[e.traceID]--
 	if s.openByTID[e.traceID] == 0 {
+		s.pressure.finishTrace(e.traceID, m.NumSpans)
+		if m.Reverse != nil {
+			s.hist.recordReverse("checkpoint_spans_per_trace", m.NumCheckpointSpans)
+		}
 		h.EvictTrace(e.traceID)
 		delete(s.openByTID, e.traceID)
 		delete(s.nextSeq, e.traceID) // free this trace's child-ordinal counters
@@ -405,11 +444,12 @@ func selectTraces(meta *corpus.Meta, cfg config) (traceOrder []uint64, spanCount
 	return
 }
 
-func runInterleavedFromCorpus(er *corpus.EventsReader, qr *corpus.DEEQueueReader, meta *corpus.Meta, h bridge.Handler, cfg config, stream *streamWriter, hist *sizeHistograms) []TraceMetrics {
+func runInterleavedFromCorpus(er *corpus.EventsReader, qr, pr *corpus.DEEQueueReader, meta *corpus.Meta, h bridge.Handler, cfg config, stream *streamWriter, hist *sizeHistograms) []TraceMetrics {
 	traceOrder, spanCounts, selected := selectTraces(meta, cfg)
 	releaseMetrics := stream != nil || (cfg.outputPath == "" && cfg.streamMetrics == "")
 	s := newSimState(traceOrder, spanCounts, stream, releaseMetrics, hist)
 	s.progressN, s.t0 = cfg.progressN, time.Now()
+	s.pressure = cfg.pressure
 
 	for {
 		ce, err := er.Next()
@@ -428,20 +468,33 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, qr *corpus.DEEQueueReader
 				os.Exit(1)
 			}
 		}
+		var instanceID uint32
+		if pr != nil {
+			if pr == qr {
+				instanceID = queueID
+			} else {
+				instanceID, err = pr.Next()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "pressure instance-ID read error: %v\n", err)
+					os.Exit(1)
+				}
+			}
+		}
 		if selected != nil {
 			if _, ok := selected[ce.TraceID]; !ok {
 				continue
 			}
 		}
 		s.onEvent(h, streamEvent{
-			ts:         ce.TS,
-			kind:       bridge.Kind(ce.Kind),
-			depth:      int(ce.Depth),
-			traceID:    ce.TraceID,
-			spanID:     ce.SpanID,
-			parentID:   ce.ParentID,
-			serviceID:  ce.ServiceID,
-			deeQueueID: queueID,
+			ts:                 ce.TS,
+			kind:               bridge.Kind(ce.Kind),
+			depth:              int(ce.Depth),
+			traceID:            ce.TraceID,
+			spanID:             ce.SpanID,
+			parentID:           ce.ParentID,
+			serviceID:          ce.ServiceID,
+			deeQueueID:         queueID,
+			pressureInstanceID: instanceID,
 		})
 		// --first: stop as soon as all selected traces have finalized.
 		if cfg.first > 0 && s.completed >= len(traceOrder) {
@@ -453,6 +506,16 @@ func runInterleavedFromCorpus(er *corpus.EventsReader, qr *corpus.DEEQueueReader
 			fmt.Fprintf(os.Stderr, "DEE queue-ID validation error: %v\n", err)
 			os.Exit(1)
 		}
+	}
+	if pr != nil && pr != qr && !(cfg.first > 0 && s.completed >= len(traceOrder)) {
+		if err := pr.ValidateEOF(); err != nil {
+			fmt.Fprintf(os.Stderr, "pressure instance-ID validation error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if s.pressure != nil && (s.completed != len(traceOrder) || len(s.pressure.active) != 0) {
+		fmt.Fprintf(os.Stderr, "checkpoint pressure: incomplete selected corpus, completed %d/%d traces\n", s.completed, len(traceOrder))
+		os.Exit(1)
 	}
 	if stream != nil {
 		return nil // records were streamed to disk; nothing retained to dump
@@ -547,6 +610,9 @@ func runShardedFromCorpus(er *corpus.EventsReader, meta *corpus.Meta, makeH func
 
 	if stream != nil {
 		return nil // streamed to disk; per-worker maps were emptied on finalize
+	}
+	if cfg.outputPath == "" && cfg.streamMetrics == "" {
+		return nil
 	}
 	// Reassemble metrics in the global selected order (the JSON's row order).
 	out := make([]TraceMetrics, len(traceOrder))

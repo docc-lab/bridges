@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -34,6 +35,8 @@ func runCSV2JSON(args []string) {
 	sc.Buffer(make([]byte, 1<<20), 1<<24)
 	var checkpointRange string
 	var checkpointSeed int64
+	var reverse *bridge.ReverseConfig
+	var reverseEncoding string
 	cpd := 0
 	emitDepth, emitOC := false, false
 	var metrics []TraceMetrics
@@ -49,6 +52,13 @@ func runCSV2JSON(args []string) {
 					continue
 				}
 				switch p[0] {
+				case "reverse_encoding":
+					reverseEncoding = p[1]
+				case "reverse_config":
+					if err := json.Unmarshal([]byte(p[1]), &reverse); err != nil {
+						fmt.Fprintf(os.Stderr, "line %d: invalid reverse configuration: %v\n", lineNo, err)
+						os.Exit(2)
+					}
 				case "checkpoint_range":
 					checkpointRange = p[1]
 				case "checkpoint_seed":
@@ -72,8 +82,12 @@ func runCSV2JSON(args []string) {
 			continue
 		}
 		fields := strings.Split(line, ",")
-		if len(fields) != 12 {
-			fmt.Fprintf(os.Stderr, "line %d: expected 12 fields, got %d\n", lineNo, len(fields))
+		expected := 12
+		if reverse != nil {
+			expected += len(reverseMetricColumns)
+		}
+		if len(fields) != expected {
+			fmt.Fprintf(os.Stderr, "line %d: expected %d fields, got %d\n", lineNo, expected, len(fields))
 			os.Exit(1)
 		}
 		// tid,num_spans,num_ckpt_spans,ckpt_sum,ckpt_max,n_bag,bag_sum,bag_max,n_depth,depth_sum,n_oc,oc_sum
@@ -91,17 +105,34 @@ func runCSV2JSON(args []string) {
 			NumOcSpans:         ai(10),
 			OcSum:              ai(11),
 		})
+		if reverse != nil {
+			r := &reverseTraceMetrics{}
+			for i, col := range reverseMetricColumns {
+				v, parseErr := strconv.Atoi(fields[12+i])
+				if parseErr != nil {
+					fmt.Fprintf(os.Stderr, "line %d: invalid %s: %v\n", lineNo, col.name, parseErr)
+					os.Exit(2)
+				}
+				*col.ptr(r) = v
+			}
+			metrics[len(metrics)-1].Reverse = r
+		}
 	}
 	if err := sc.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "read %s: %v\n", in, err)
 		os.Exit(1)
+	}
+	if reverse != nil && reverseEncoding != bridge.ReverseEncoding {
+		fmt.Fprintf(os.Stderr, "reverse CSV encoding %q is not %s; legacy modeled-envelope results cannot be relabeled as native binary measurements\n", reverseEncoding, bridge.ReverseEncoding)
+		os.Exit(2)
 	}
 	policy, err := bridge.ParseCheckpointRange(checkpointRange, checkpointSeed)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	if err := writeBagsizeJSON(out, cpd, metrics, emitDepth, emitOC, policy); err != nil {
+	c := config{checkpointDistance: cpd, checkpointPolicy: policy, emitDepth: emitDepth, emitOC: emitOC, reverse: reverse}
+	if err := writeBagsizeJSONWithConfig(out, c, metrics); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", out, err)
 		os.Exit(1)
 	}

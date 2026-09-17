@@ -22,6 +22,8 @@ type sb3GreedyStats struct {
 	HardConflicts        int
 	ParentConflicts      int
 	HAConflicts          int
+	AMQConflicts         int
+	AMQPrunes            int
 	Chain                GreedyChainStats
 	Fanout               GreedyFanoutStats
 }
@@ -2084,9 +2086,9 @@ func sb3RouteHasChoice(sk *cgpSkeleton, u *sb3RouteUnit) bool {
 }
 
 // sb3SelectGreedyRoute enumerates Bloom/HA-admissible choices in the ordinary
-// deepest-anchor, named-fanout-first order. Hard facts and sparse chains are
-// predicates over each candidate: a contradiction prunes that path; ordinals
-// are never converted into a post-hoc global penalty.
+// deepest-anchor, named-fanout-first order. Persistent downstream AMQs, hard
+// facts, and sparse chains are predicates over each candidate: a contradiction
+// prunes that path before commitment.
 func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3OrdinalAssignments, ha *sb3HATracker, parent map[uint64]uint64, stats *sb3GreedyStats) bool {
 	if len(u.anchors) == 0 {
 		return false
@@ -2144,9 +2146,20 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 			inserted := sb3ApplyUnitRoute(parent, u)
 			stats.CandidateEvaluations++
 			hardOK := sb3UnitWindowCompatible(sk, u, parent)
+			var amqTxn *greedyAMQTxn
+			if hardOK {
+				amqTxn, hardOK = sk.amq.tryEdges(inserted, parent)
+				if !hardOK {
+					stats.AMQPrunes++
+				}
+			}
 			var haTxn *sb3HATxn
 			if hardOK {
 				haTxn, hardOK = ha.tryEdges(inserted, parent)
+			}
+			if hardOK && !greedyPendingHAAMQCompatible(sk.amq, ha, amqTxn, haTxn) {
+				hardOK = false
+				stats.AMQPrunes++
 			}
 			ordinalOK := true
 			var ordinalTxn *sb3OrdinalTxn
@@ -2183,6 +2196,7 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 			if haTxn != nil {
 				haTxn.rollback()
 			}
+			amqTxn.rollback()
 			sb3RollbackRoute(parent, inserted)
 			return false
 		}
@@ -2201,9 +2215,26 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 			u.anchor = nil
 			return false
 		}
-		if _, ok := ha.tryEdges(inserted, parent); !ok {
+		amqTxn, amqOK := sk.amq.tryEdges(inserted, parent)
+		if !amqOK {
+			stats.AMQPrunes++
+			sb3RollbackRoute(parent, inserted)
+			u.anchor = nil
+			return false
+		}
+		haTxn, haOK := ha.tryEdges(inserted, parent)
+		if !haOK {
+			amqTxn.rollback()
 			stats.Fanout.HardRouteCandidatesRejected++
 			u.hardRouteCandidatesRejected++
+			sb3RollbackRoute(parent, inserted)
+			u.anchor = nil
+			return false
+		}
+		if !greedyPendingHAAMQCompatible(sk.amq, ha, amqTxn, haTxn) {
+			haTxn.rollback()
+			amqTxn.rollback()
+			stats.AMQPrunes++
 			sb3RollbackRoute(parent, inserted)
 			u.anchor = nil
 			return false
@@ -2216,9 +2247,9 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 	return false
 }
 
-// reconstructFullEvidenceGreedyTopology is the shared non-SAT CGP0/SB3
+// reconstructFullEvidenceGreedyTopology is the shared non-SAT PB0/CGP0/SB3
 // topology engine. Bloom evidence enumerates possible routes; surviving
-// ParentID/HA facts and (for SB3) sparse ordinal chains prune impossible ones
+// ParentID/HA facts, downstream AMQs, and (for SB3) sparse ordinal chains prune impossible ones
 // before the ordinary greedy preference selects a route. It never invokes an
 // older reconstructor or applies evidence as a post-hoc repair.
 func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result, sb3GreedyStats) {
@@ -2272,6 +2303,7 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 	}
 
 	parent := sb3SeedGreedyParent(sk, units)
+	sk.amq = newGreedyAMQTracker(sk, cfg, parent)
 	var haTracker *sb3HATracker
 	initialHAConflicts := 0
 	if !cfg.NoFanout && !cfg.GreedyNoHardHA {
@@ -2315,13 +2347,16 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 	}
 	topo := sb3EmitGreedyTopology(sk, units, parent)
 	stats.ParentConflicts, stats.HAConflicts, _ = sb3CheckHardEvidenceForMode(survivors, topo, !cfg.NoFanout)
-	stats.HardConflicts = stats.ParentConflicts + stats.HAConflicts
+	stats.AMQConflicts = sk.amq.conflicts(parent)
+	stats.HardConflicts = stats.ParentConflicts + stats.HAConflicts + stats.AMQConflicts
 	topo.GreedyMode = "full-evidence"
 	topo.GreedyCandidateEvaluations = stats.CandidateEvaluations
 	topo.GreedyHardOverrides = stats.HardOverrides
 	topo.GreedyHardConflicts = stats.HardConflicts
 	topo.GreedyParentConflicts = stats.ParentConflicts
 	topo.GreedyHAConflicts = stats.HAConflicts
+	topo.GreedyAMQConflicts = stats.AMQConflicts
+	topo.GreedyAMQPrunes = stats.AMQPrunes
 	topo.GreedyChain = stats.Chain
 	topo.GreedyFanout = stats.Fanout
 	if stats.HardConflicts > 0 {

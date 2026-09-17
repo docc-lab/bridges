@@ -365,7 +365,7 @@ type Result struct {
 	// fan-out, or both; this set marks the HA-witnessed ones.
 	ReconHAFanouts map[uint64]bool
 
-	// Greedy telemetry is populated by the full-evidence CGP0/SB3 topology
+	// Greedy telemetry is populated by the full-evidence PB0/CGP0/SB3 topology
 	// engine. It remains zero-valued for legacy and non-greedy reconstructors.
 	GreedyMode                 string
 	GreedyCandidateEvaluations int
@@ -373,6 +373,8 @@ type Result struct {
 	GreedyHardConflicts        int
 	GreedyParentConflicts      int
 	GreedyHAConflicts          int
+	GreedyAMQConflicts         int // carrier evidence contradicted by named ancestry; included in HardConflicts
+	GreedyAMQPrunes            int // route trials rejected by downstream AMQs
 
 	// GreedyChain records how the full-evidence CGP0/PB0/SB3 engine used
 	// nameable ancestor chains.  The reconstructor records evidence only; the

@@ -180,11 +180,11 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		depth = parentState.depth + 1
 		ckpt = parentState.ckpt
 		inherited = parentState.bloomBytes
-		parentDEE = parentState.deeBytes
 		branches = cloneSB3Branches(parentState.branches, 1)
 		// Preserve CGPRB's one-record-per-fanout HA propagation rule.
 		if parentSeqNum == 1 {
 			ha = append([]byte(nil), parentState.ha...)
+			parentDEE = parentState.deeBytes
 		}
 	}
 
@@ -206,12 +206,11 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		}
 	}
 
+	// Only inherited DEEs follow the first-child edge. Fresh queue pickups
+	// belong to this call and must survive even on a second or later child.
 	deeBytes := make([]byte, 0, len(parentDEE)+len(deeIncoming))
 	deeBytes = append(deeBytes, parentDEE...)
 	deeBytes = append(deeBytes, deeIncoming...)
-	if pid != 0 && parentSeqNum != 1 {
-		deeBytes = nil
-	}
 
 	var incomingTTL byte
 	if parentState != nil {

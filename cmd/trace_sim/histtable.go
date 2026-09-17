@@ -52,6 +52,7 @@ var comparisonByteRanges = []byteRange{
 type labeledHistogram struct {
 	label string
 	hist  histogramOutput
+	unit  string
 }
 
 func rebinHistogram(h histogramOutput) ([]uint64, error) {
@@ -95,20 +96,32 @@ func loadLabeledHistogram(spec, metric string) (labeledHistogram, error) {
 		return labeledHistogram{}, err
 	}
 	var h histogramOutput
+	unit := "bytes"
 	switch metric {
 	case "baggage":
 		h = in.BaggageCallBytes
 	case "payload":
 		h = in.BridgePayloadBytes
 	default:
-		return labeledHistogram{}, fmt.Errorf("unknown metric %q (want baggage or payload)", metric)
+		d, ok := in.ReverseHistograms[metric]
+		if !ok {
+			return labeledHistogram{}, fmt.Errorf("unknown or absent metric %q (want baggage, payload, or a reverse_histograms key)", metric)
+		}
+		h = histogramOutput{Count: d.Count, SumBytes: d.Sum, MinBytes: d.Min, MaxBytes: d.Max}
+		unit = d.Unit
+		for _, b := range d.Bins {
+			h.Bins = append(h.Bins, histogramBin{Bytes: b.Value, Count: b.Count})
+		}
 	}
-	return labeledHistogram{label: label, hist: h}, nil
+	return labeledHistogram{label: label, hist: h, unit: unit}, nil
 }
 
 func writeHistogramCSV(w io.Writer, inputs []labeledHistogram, rebinned [][]uint64, precision int) error {
 	cw := csv.NewWriter(w)
 	header := []string{"range", "min_bytes", "max_bytes"}
+	if len(inputs) > 0 && inputs[0].unit != "" && inputs[0].unit != "bytes" {
+		header = []string{"range", "min_" + inputs[0].unit, "max_" + inputs[0].unit}
+	}
 	for _, in := range inputs {
 		header = append(header, in.label)
 	}
@@ -137,7 +150,11 @@ func writeHistogramCSV(w io.Writer, inputs []labeledHistogram, rebinned [][]uint
 }
 
 func writeHistogramMarkdown(w io.Writer, inputs []labeledHistogram, rebinned [][]uint64, precision int) error {
-	if _, err := fmt.Fprint(w, "| Bytes |"); err != nil {
+	unit := "Bytes"
+	if len(inputs) > 0 && inputs[0].unit != "" && inputs[0].unit != "bytes" {
+		unit = inputs[0].unit
+	}
+	if _, err := fmt.Fprintf(w, "| %s |", unit); err != nil {
 		return err
 	}
 	for _, in := range inputs {
@@ -165,7 +182,7 @@ func writeHistogramMarkdown(w io.Writer, inputs []labeledHistogram, rebinned [][
 func runHistogramTable(args []string) {
 	fs := flag.NewFlagSet("histtable", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	metric := fs.String("metric", "baggage", "Histogram metric: baggage or payload")
+	metric := fs.String("metric", "baggage", "Histogram metric: baggage, payload, or any reverse_histograms key (e.g. reverse_encoded_baggage_bytes)")
 	format := fs.String("format", "csv", "Output format: csv or markdown")
 	output := fs.String("output", "", "Output path (default stdout)")
 	precision := fs.Int("precision", 9, "Decimal places for percentages")

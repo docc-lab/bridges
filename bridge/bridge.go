@@ -54,6 +54,11 @@ type StartResult struct {
 type EndResult struct {
 	EmitBytes int
 
+	// Reverse is populated only by ReverseHandler. Payload/EmitBytes retain
+	// their meaning as this span's own _br; the returned-truss envelope and
+	// reverse response traffic are accounted separately here.
+	Reverse *ReverseEndResult
+
 	// DepthBytes is the size of the "_d" attribute (DepthKeyBytes +
 	// varint(absolute depth)) emitted on interior non-checkpoint spans in
 	// EmitDepth mode. 0 when the span carries a _br payload instead, or when

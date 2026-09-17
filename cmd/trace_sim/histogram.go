@@ -18,12 +18,16 @@ type sizeHistograms struct {
 	mu      sync.Mutex
 	baggage map[int]uint64
 	payload map[int]uint64
+	reverse map[string]map[int]uint64
+	routes  map[reverseRouteKey]uint64
 }
 
 func newSizeHistograms() *sizeHistograms {
 	return &sizeHistograms{
 		baggage: make(map[int]uint64),
 		payload: make(map[int]uint64),
+		reverse: make(map[string]map[int]uint64),
+		routes:  make(map[reverseRouteKey]uint64),
 	}
 }
 
@@ -89,6 +93,10 @@ type sizeHistogramFile struct {
 	DEEQueueStats           *bridge.DEEQueueStatsSnapshot `json:"dee_queue_stats,omitempty"`
 	BaggageCallBytes        histogramOutput               `json:"baggage_call_bytes"`
 	BridgePayloadBytes      histogramOutput               `json:"bridge_payload_bytes"`
+	ReverseConfig           *bridge.ReverseConfig         `json:"reverse_config,omitempty"`
+	ReverseAccounting       map[string]string             `json:"reverse_accounting,omitempty"`
+	ReverseHistograms       map[string]distributionOutput `json:"reverse_histograms,omitempty"`
+	ReverseRouteCounts      []reverseRouteCount           `json:"reverse_route_counts,omitempty"`
 }
 
 func writeSizeHistograms(path string, c config, h *sizeHistograms) error {
@@ -103,6 +111,12 @@ func writeSizeHistograms(path string, c config, h *sizeHistograms) error {
 		DEEDequeueOne:           c.deeDequeueOne,
 		BaggageCallBytes:        snapshotHistogram(h.baggage),
 		BridgePayloadBytes:      snapshotHistogram(h.payload),
+	}
+	if c.reverse != nil {
+		out.Schema = "bridges.size_histograms.v3"
+		out.ReverseConfig, out.ReverseAccounting = c.reverse, reverseAccounting
+		out.ReverseHistograms = snapshotReverseHistograms(h.reverse)
+		out.ReverseRouteCounts = snapshotReverseRoutes(h.routes)
 	}
 	if c.deeStats != nil {
 		snapshot := c.deeStats.Snapshot()
@@ -147,15 +161,15 @@ func runHistogramMerge(args []string) {
 			fmt.Fprintf(os.Stderr, "decode %s: %v\n", path, err)
 			os.Exit(1)
 		}
+		if in.ReverseConfig != nil && (in.Schema != "bridges.size_histograms.v3" || in.ReverseAccounting["encoding"] != bridge.ReverseEncoding) {
+			fmt.Fprintf(os.Stderr, "legacy reverse histogram %s cannot be rewritten as native binary measurements\n", path)
+			os.Exit(1)
+		}
 		if i == 0 {
 			base = in
 			hasStats = in.DEEQueueStats != nil
-		} else if in.Schema != base.Schema || in.Mode != base.Mode ||
-			in.CheckpointDistance != base.CheckpointDistance || in.LehmerEE != base.LehmerEE ||
-			!reflect.DeepEqual(in.CheckpointRandomization, base.CheckpointRandomization) ||
-			in.DEEInstanceQueues != base.DEEInstanceQueues || in.DEEDequeueOne != base.DEEDequeueOne ||
-			(in.DEEQueueStats != nil) != hasStats {
-			fmt.Fprintf(os.Stderr, "incompatible histogram %s (schema/mode/cpd/checkpoint-range/seed/lehmer/DEE-instance/dequeue mismatch)\n", path)
+		} else if !compatibleHistogramFiles(in, base) {
+			fmt.Fprintf(os.Stderr, "incompatible histogram %s (schema/mode/cpd/checkpoint-range/seed/lehmer/DEE-instance/dequeue/reverse configuration mismatch)\n", path)
 			os.Exit(1)
 		}
 		for _, b := range in.BaggageCallBytes.Bins {
@@ -164,11 +178,23 @@ func runHistogramMerge(args []string) {
 		for _, b := range in.BridgePayloadBytes.Bins {
 			h.payload[b.Bytes] += b.Count
 		}
+		for metric, dist := range in.ReverseHistograms {
+			if h.reverse[metric] == nil {
+				h.reverse[metric] = make(map[int]uint64)
+			}
+			for _, b := range dist.Bins {
+				h.reverse[metric][b.Value] += b.Count
+			}
+		}
+		for _, r := range in.ReverseRouteCounts {
+			h.routes[r.reverseRouteKey] += r.Count
+		}
 		if in.DEEQueueStats != nil {
 			mergeDEEQueueStats(&mergedStats, *in.DEEQueueStats)
 		}
 	}
 	c := config{mode: base.Mode, checkpointDistance: base.CheckpointDistance, checkpointPolicy: base.CheckpointRandomization, lehmerEE: base.LehmerEE}
+	c.reverse = base.ReverseConfig
 	if base.DEEInstanceQueues {
 		c.deeQueueIDs = "merged"
 	}
@@ -181,6 +207,16 @@ func runHistogramMerge(args []string) {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "Merged %d histogram files into %s\n", len(inputs), outPath)
+}
+
+func compatibleHistogramFiles(a, b sizeHistogramFile) bool {
+	return a.Schema == b.Schema && a.Mode == b.Mode &&
+		a.CheckpointDistance == b.CheckpointDistance && a.LehmerEE == b.LehmerEE &&
+		reflect.DeepEqual(a.CheckpointRandomization, b.CheckpointRandomization) &&
+		a.DEEInstanceQueues == b.DEEInstanceQueues && a.DEEDequeueOne == b.DEEDequeueOne &&
+		(a.DEEQueueStats != nil) == (b.DEEQueueStats != nil) &&
+		reflect.DeepEqual(a.ReverseConfig, b.ReverseConfig) &&
+		reflect.DeepEqual(a.ReverseAccounting, b.ReverseAccounting)
 }
 
 func mergeDEEQueueStats(dst *bridge.DEEQueueStatsSnapshot, src bridge.DEEQueueStatsSnapshot) {

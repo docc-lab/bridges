@@ -88,6 +88,7 @@ type cgpFanout struct {
 // the survivors and their carried evidence, before any bloom guessing.
 type cgpSkeleton struct {
 	checkpoints *checkpointIndex
+	amq         *greedyAMQTracker
 	byID        map[uint64]*Span      // SpanID -> survivor
 	childrenS   map[uint64][]*Span    // surviving-edge children (parent must survive)
 	frags       []*cgpFragment        // connected components

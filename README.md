@@ -2,6 +2,16 @@
 
 This repository contains tools for trace reconstruction and analysis, specifically designed to reconstruct traces with data loss using ancestry data stored within span objects. It supports Bloom filter, hash array, and hybrid ancestry modes for intelligent trace reconnection.
 
+The current Go PB0, CGP0, and SB3 simulator and reconstruction commands are
+described in [the local implementation guide](docs/LOCAL_GUIDE.md).
+[Reverse-truss simulation](docs/reverse_trusses.md) adds leaf-return policies,
+receiver checkpoint promotion, forward/reverse baggage measurements, and
+absolute checkpoint counts. Its size experiment is available now;
+[reverse reconstruction integration](docs/reverse_reconstruction.md) remains
+pending beyond the implemented evidence decoder.
+[Checkpoint pressure accounting](docs/checkpoint_pressure.md) reports per-service
+and modeled-instance checkpoint frequency and byte load for placement ablations.
+
 ## Tools
 
 ### 1. Jaeger Trace Loader (`jaeger_trace_loader.go`)

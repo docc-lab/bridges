@@ -16,6 +16,14 @@ import (
 // repr(): whole-number floats get a trailing ".0", others use the shortest
 // roundtrip representation.
 func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emitDepth, emitOC bool, policies ...*bridge.CheckpointRange) error {
+	c := config{checkpointDistance: checkpointDistance, emitDepth: emitDepth, emitOC: emitOC}
+	if len(policies) > 0 {
+		c.checkpointPolicy = policies[0]
+	}
+	return writeBagsizeJSONWithConfig(path, c, m)
+}
+
+func writeBagsizeJSONWithConfig(path string, c config, m []TraceMetrics) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -26,13 +34,18 @@ func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emi
 
 	w := bw
 	io.WriteString(w, "{\n")
-	fmt.Fprintf(w, "  \"checkpoint_distance\": %d,\n", checkpointDistance)
-	if len(policies) > 0 && policies[0] != nil {
-		raw, err := json.Marshal(policies[0])
+	fmt.Fprintf(w, "  \"checkpoint_distance\": %d,\n", c.checkpointDistance)
+	if c.checkpointPolicy != nil {
+		raw, err := json.Marshal(c.checkpointPolicy)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(w, "  \"checkpoint_randomization\": %s,\n", raw)
+	}
+	if c.reverse != nil {
+		fmt.Fprintf(w, "  \"reverse_config\": %s,\n", reverseConfigJSON(c.reverse))
+		raw, _ := json.Marshal(reverseAccounting)
+		fmt.Fprintf(w, "  \"reverse_accounting\": %s,\n", raw)
 	}
 	fmt.Fprintf(w, "  \"num_traces\": %d,\n", len(m))
 
@@ -58,14 +71,48 @@ func writeBagsizeJSON(path string, checkpointDistance int, m []TraceMetrics, emi
 		}
 		return float64(t.BaggageSum) / float64(t.NumBaggageCalls)
 	}, true)
-	writeIntArr(w, "max_baggage_call", m, func(t TraceMetrics) int { return t.BaggageMax }, emitDepth || emitOC)
-	if emitDepth {
+	writeIntArr(w, "max_baggage_call", m, func(t TraceMetrics) int { return t.BaggageMax }, c.emitDepth || c.emitOC || c.reverse != nil)
+	if c.emitDepth {
 		writeIntArr(w, "num_depth_spans", m, func(t TraceMetrics) int { return t.NumDepthSpans }, true)
-		writeIntArr(w, "depth_overhead_sum", m, func(t TraceMetrics) int { return t.DepthSum }, emitOC)
+		writeIntArr(w, "depth_overhead_sum", m, func(t TraceMetrics) int { return t.DepthSum }, c.emitOC || c.reverse != nil)
 	}
-	if emitOC {
+	if c.emitOC {
 		writeIntArr(w, "num_oc_spans", m, func(t TraceMetrics) int { return t.NumOcSpans }, true)
-		writeIntArr(w, "oc_overhead_sum", m, func(t TraceMetrics) int { return t.OcSum }, false)
+		writeIntArr(w, "oc_overhead_sum", m, func(t TraceMetrics) int { return t.OcSum }, c.reverse != nil)
+	}
+	if c.reverse != nil {
+		for _, col := range reverseMetricColumns {
+			writeIntArr(w, col.name, m, func(t TraceMetrics) int {
+				if t.Reverse == nil {
+					return 0
+				}
+				return *col.ptr(t.Reverse)
+			}, true)
+		}
+		writeFloatArr(w, "avg_reverse_raw_baggage", m, func(t TraceMetrics) float64 {
+			if t.Reverse == nil || t.Reverse.NumReverseReturnEdges == 0 {
+				return 0
+			}
+			return float64(t.Reverse.ReverseRawSum) / float64(t.Reverse.NumReverseReturnEdges)
+		}, true)
+		writeFloatArr(w, "avg_reverse_encoded_baggage", m, func(t TraceMetrics) float64 {
+			if t.Reverse == nil || t.Reverse.NumReverseReturnEdges == 0 {
+				return 0
+			}
+			return float64(t.Reverse.ReverseEncodedSum) / float64(t.Reverse.NumReverseReturnEdges)
+		}, true)
+		writeFloatArr(w, "amortized_combined_checkpoint_payload_by_total", m, func(t TraceMetrics) float64 {
+			if t.Reverse == nil || t.NumSpans == 0 {
+				return 0
+			}
+			return float64(t.Reverse.CombinedCheckpointSum) / float64(t.NumSpans)
+		}, true)
+		writeFloatArr(w, "amortized_combined_checkpoint_payload_by_checkpoint", m, func(t TraceMetrics) float64 {
+			if t.Reverse == nil || t.NumCheckpointSpans == 0 {
+				return 0
+			}
+			return float64(t.Reverse.CombinedCheckpointSum) / float64(t.NumCheckpointSpans)
+		}, false)
 	}
 
 	io.WriteString(w, "}")

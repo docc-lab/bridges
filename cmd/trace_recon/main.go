@@ -82,6 +82,7 @@ type config struct {
 	dumpSurvivors      string // gob-dump each reconstructed trace's survivors+truth+dropped+cfg here (pair with --only-traces to capture one trace for offline replay via cmd/recon_one).
 	dumpOnly           bool   // with --dump-survivors: capture only, skip reconstruction (fast capture of slow traces)
 	traceStore         string // read a per-trace store (cmd/corpus_split output) instead of --corpus, running handler+drop+reconstruct per-trace in PARALLEL (bit-identical to streaming).
+	serialTraces       bool   // finish each stored trace before reading/replaying another; useful for one-core timing
 	perTraceDropSeed   bool   // seed the drop RNG per-trace (from traceID+seed) instead of one global stream, so drops are independent of trace order/partitioning.
 	sampleCount        int    // if >0, process a RANDOM sample of this many traces (seeded) instead of the first traceCount; avoids prefix bias.
 	sampleSeed         int64  // seed for the random sample selection (independent of the drop seed)
@@ -94,6 +95,7 @@ func parseFlags() config {
 	flag.StringVar(&c.corpusDir, "corpus", "", "Read events.bin + meta.bin from this corpus dir")
 	flag.BoolVar(&c.dumpOnly, "dump-only", false, "With --dump-survivors: dump the trace inputs and SKIP reconstruction (fast capture of slow traces for offline replay).")
 	flag.StringVar(&c.traceStore, "trace-store", "", "Read a per-trace store (cmd/corpus_split output) instead of --corpus. Runs handler+drop+reconstruct per-trace in PARALLEL (no single-threaded event streaming); bit-identical results. Needs --corpus too (for meta: trace order + service names).")
+	flag.BoolVar(&c.serialTraces, "serial-traces", false, "With --trace-store and --workers 1: finish reading, replay, reconstruction and scoring of each trace before starting the next; no overlap between traces")
 	flag.StringVar(&c.mode, "mode", "pb", "Bridge mode: pb, pcr, pcrb, pcrs, cgprb, cgp*/pb*, or sb3")
 	flag.BoolVar(&c.cgrp, "cgrp", false, "PCRS+CGP: run the PCRS solver on CGPRB (HA-bearing) payloads, ingesting the hash array so named dropped fan-outs become constraints (carriers hard, bloom-confirmers soft). Requires --mode pcrs.")
 	flag.BoolVar(&c.fullsatPB, "fullsat-pb", false, "PCRS: solve each cluster as a general declarative CP-SAT model (docs/fullsat_shim.md) instead of the Go B&B — the full-SAT parity baseline (no HA). Requires --mode pcrs and the cpsat build tag.")
@@ -149,6 +151,10 @@ func parseFlags() config {
 	flag.BoolVar(&primeM, "prime-m", false, "size blooms with a prime bit count (fixes small-m double-hash clustering; affects emit + recon together)")
 	flag.BoolVar(&primeMByteCap, "prime-m-bytecap", false, "with --prime-m: keep the prime within the raw size's byte budget")
 	flag.Parse()
+	if c.serialTraces && (c.traceStore == "" || c.workers != 1) {
+		fmt.Fprintln(os.Stderr, "error: --serial-traces requires --trace-store and --workers 1")
+		os.Exit(2)
+	}
 	var checkpointErr error
 	c.checkpointPolicy, checkpointErr = bridge.ParseCheckpointRange(checkpointRange, checkpointSeed)
 	if checkpointErr != nil {
@@ -402,6 +408,7 @@ type cgp2acc struct {
 	emptySurvSum, emptyNoDrop, emptyTiny                                                                  int
 	greedyChecked, greedyCandidates, greedyHardOverrides                                                  int64
 	greedyHardConflicts, greedyParentConflicts, greedyHAConflicts                                         int64
+	greedyAMQConflicts, greedyAMQPrunes                                                                   int64
 	sb3                                                                                                   sb3acc
 	scoreComparison                                                                                       scorerComparisonAcc
 	chainEvidence                                                                                         chainEvidenceAcc
@@ -1117,6 +1124,7 @@ type sb3acc struct {
 	fanouts, conflicts                     int64
 	hardConflicts                          int64
 	parentConflicts, haConflicts           int64
+	amqConflicts, amqPrunes                int64
 	structureChecked, structureComplete    int64
 	structureIncomplete                    int64
 	deePlaced, deeAmbiguous, deeNoPlace    int64
@@ -1142,6 +1150,8 @@ func (a *sb3acc) add(r *recon.SB3Result) {
 	a.hardConflicts += int64(r.HardConflicts)
 	a.parentConflicts += int64(r.ParentConflicts)
 	a.haConflicts += int64(r.HAConflicts)
+	a.amqConflicts += int64(r.AMQConflicts)
+	a.amqPrunes += int64(r.AMQPrunes)
 }
 
 func (a *sb3acc) addStructure(r recon.StructureResult, status recon.SBStructureStatus) {
@@ -1295,6 +1305,9 @@ func newHarness(c config) *harness {
 	workers := c.workers
 	if workers <= 0 {
 		workers = runtime.NumCPU()
+	}
+	if c.serialTraces {
+		workers = 0 // the calling goroutine runs ha.process synchronously
 	}
 	ha := &harness{
 		h:              h,
@@ -1505,10 +1518,10 @@ func (ha *harness) drain() {
 		if ha.mode == "sb3" {
 			emitSB3 := func(tag string, s sb3acc) {
 				fmt.Fprintf(os.Stderr,
-					"SB3%s greedy=sb3-greedy checked=%d compatible=%d (%.4f%%) | candidate_evaluations=%d ordinal_overrides=%d hard_overrides=%d explicit_ordinals=%d implicit_first_labels=%d fanouts=%d ordinal_conflicts=%d hard_conflicts=%d (parent=%d ha=%d)\n",
+					"SB3%s greedy=sb3-greedy checked=%d compatible=%d (%.4f%%) | candidate_evaluations=%d ordinal_overrides=%d hard_overrides=%d explicit_ordinals=%d implicit_first_labels=%d fanouts=%d ordinal_conflicts=%d hard_conflicts=%d (parent=%d ha=%d amq=%d) amq_prunes=%d\n",
 					tag, s.checked, s.compatible, pct(int(s.compatible), int(s.checked)),
 					s.candidateEvaluations, s.ordinalOverrides, s.hardOverrides,
-					s.ordinalPlaced, s.implicitOrdinals, s.fanouts, s.conflicts, s.hardConflicts, s.parentConflicts, s.haConflicts)
+					s.ordinalPlaced, s.implicitOrdinals, s.fanouts, s.conflicts, s.hardConflicts, s.parentConflicts, s.haConflicts, s.amqConflicts, s.amqPrunes)
 				if !ha.cfg.SB3TopoOnly {
 					fmt.Fprintf(os.Stderr,
 						"SB3%s structure topo-clean-checked=%d complete=%d (%.4f%%) incomplete=%d | DEE placed=%d ambiguous=%d no_place=%d | event_order=%d (%.4f%%) critical_path=%d (%.4f%%) parent_end_order=%d/%d (%.4f%%)\n",
@@ -1533,9 +1546,9 @@ func (ha *harness) drain() {
 					mode = "legacy-lean"
 				}
 				fmt.Fprintf(os.Stderr,
-					"CGP0%s greedy=%s checked=%d | candidate_evaluations=%d hard_overrides=%d hard_conflicts=%d (parent=%d ha=%d)\n",
+					"CGP0%s greedy=%s checked=%d | candidate_evaluations=%d hard_overrides=%d hard_conflicts=%d (parent=%d ha=%d amq=%d) amq_prunes=%d\n",
 					tag, mode, a.greedyChecked, a.greedyCandidates, a.greedyHardOverrides,
-					a.greedyHardConflicts, a.greedyParentConflicts, a.greedyHAConflicts)
+					a.greedyHardConflicts, a.greedyParentConflicts, a.greedyHAConflicts, a.greedyAMQConflicts, a.greedyAMQPrunes)
 			}
 			if len(ha.mdRates) > 0 {
 				for r := range ha.mdRates {
@@ -1873,12 +1886,12 @@ func (ha *harness) process(j finishJob) {
 			fmt.Fprintf(os.Stderr, "SB3STAGE harness_score elapsed=%s\n", time.Since(scoreStart))
 		}
 		if sb3 != nil && sb3.HardConflicts > 0 && os.Getenv("TRACE_RECON_SB3_HARD_TIDS") != "" {
-			fmt.Fprintf(os.Stderr, "SB3HARTRACE tid=%016x survivors=%d parent_conflicts=%d ha_conflicts=%d\n",
-				tid, len(survivors), sb3.ParentConflicts, sb3.HAConflicts)
+			fmt.Fprintf(os.Stderr, "SB3HARTRACE tid=%016x survivors=%d parent_conflicts=%d ha_conflicts=%d amq_conflicts=%d\n",
+				tid, len(survivors), sb3.ParentConflicts, sb3.HAConflicts, sb3.AMQConflicts)
 		}
 		if ha.mode == "cgp0" && res.GreedyHardConflicts > 0 && os.Getenv("TRACE_RECON_GREEDY_HARD_TIDS") != "" {
-			fmt.Fprintf(os.Stderr, "CGP0HARDTRACE tid=%016x survivors=%d parent_conflicts=%d ha_conflicts=%d\n",
-				tid, len(survivors), res.GreedyParentConflicts, res.GreedyHAConflicts)
+			fmt.Fprintf(os.Stderr, "CGP0HARDTRACE tid=%016x survivors=%d parent_conflicts=%d ha_conflicts=%d amq_conflicts=%d\n",
+				tid, len(survivors), res.GreedyParentConflicts, res.GreedyHAConflicts, res.GreedyAMQConflicts)
 		}
 		ha.mu.Lock()
 		ha.cg2.nt++
@@ -1900,6 +1913,8 @@ func (ha *harness) process(j finishJob) {
 			ha.cg2.greedyHardConflicts += int64(res.GreedyHardConflicts)
 			ha.cg2.greedyParentConflicts += int64(res.GreedyParentConflicts)
 			ha.cg2.greedyHAConflicts += int64(res.GreedyHAConflicts)
+			ha.cg2.greedyAMQConflicts += int64(res.GreedyAMQConflicts)
+			ha.cg2.greedyAMQPrunes += int64(res.GreedyAMQPrunes)
 		}
 		if empty {
 			ha.cg2.empty++
@@ -2127,6 +2142,8 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 		greedyHardConflicts   int
 		greedyParentConflicts int
 		greedyHAConflicts     int
+		greedyAMQConflicts    int
+		greedyAMQPrunes       int
 		greedyChain           recon.GreedyChainStats
 		greedyFanout          recon.GreedyFanoutStats
 		result                recon.Result
@@ -2163,6 +2180,7 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			greedyMode: res.GreedyMode, greedyCandidates: res.GreedyCandidateEvaluations,
 			greedyHardOverrides: res.GreedyHardOverrides, greedyHardConflicts: res.GreedyHardConflicts,
 			greedyParentConflicts: res.GreedyParentConflicts, greedyHAConflicts: res.GreedyHAConflicts,
+			greedyAMQConflicts: res.GreedyAMQConflicts, greedyAMQPrunes: res.GreedyAMQPrunes,
 			greedyChain:  res.GreedyChain,
 			greedyFanout: res.GreedyFanout,
 			result:       res, survivors: survivors,
@@ -2170,12 +2188,12 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 	}
 	for r, c := range cells {
 		if c.sb3 != nil && c.sb3.HardConflicts > 0 && os.Getenv("TRACE_RECON_SB3_HARD_TIDS") != "" {
-			fmt.Fprintf(os.Stderr, "SB3HARTRACE tid=%016x drop=%s survivors=%d parent_conflicts=%d ha_conflicts=%d\n",
-				tid, ha.mdDC[r], c.nsurv, c.sb3.ParentConflicts, c.sb3.HAConflicts)
+			fmt.Fprintf(os.Stderr, "SB3HARTRACE tid=%016x drop=%s survivors=%d parent_conflicts=%d ha_conflicts=%d amq_conflicts=%d\n",
+				tid, ha.mdDC[r], c.nsurv, c.sb3.ParentConflicts, c.sb3.HAConflicts, c.sb3.AMQConflicts)
 		}
 		if ha.mode == "cgp0" && c.greedyHardConflicts > 0 && os.Getenv("TRACE_RECON_GREEDY_HARD_TIDS") != "" {
-			fmt.Fprintf(os.Stderr, "CGP0HARDTRACE tid=%016x drop=%s survivors=%d parent_conflicts=%d ha_conflicts=%d\n",
-				tid, ha.mdDC[r], c.nsurv, c.greedyParentConflicts, c.greedyHAConflicts)
+			fmt.Fprintf(os.Stderr, "CGP0HARDTRACE tid=%016x drop=%s survivors=%d parent_conflicts=%d ha_conflicts=%d amq_conflicts=%d\n",
+				tid, ha.mdDC[r], c.nsurv, c.greedyParentConflicts, c.greedyHAConflicts, c.greedyAMQConflicts)
 		}
 	}
 	ha.mu.Lock()
@@ -2201,6 +2219,8 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			a.greedyHardConflicts += int64(c.greedyHardConflicts)
 			a.greedyParentConflicts += int64(c.greedyParentConflicts)
 			a.greedyHAConflicts += int64(c.greedyHAConflicts)
+			a.greedyAMQConflicts += int64(c.greedyAMQConflicts)
+			a.greedyAMQPrunes += int64(c.greedyAMQPrunes)
 		}
 		if c.empty {
 			a.empty++
@@ -2447,6 +2467,8 @@ type sb3Summary struct {
 	HardConflicts        int64  `json:"hard_conflicts"`
 	ParentConflicts      int64  `json:"parent_conflicts"`
 	HAConflicts          int64  `json:"ha_conflicts"`
+	AMQConflicts         int64  `json:"amq_conflicts"`
+	AMQPrunes            int64  `json:"amq_prunes"`
 	StructureChecked     int64  `json:"structure_checked"`
 	StructureComplete    int64  `json:"structure_complete"`
 	StructureIncomplete  int64  `json:"structure_incomplete"`
@@ -2467,6 +2489,8 @@ type greedySummary struct {
 	HardConflicts        int64                  `json:"hard_conflicts"`
 	ParentConflicts      int64                  `json:"parent_conflicts"`
 	HAConflicts          int64                  `json:"ha_conflicts"`
+	AMQConflicts         int64                  `json:"amq_conflicts"`
+	AMQPrunes            int64                  `json:"amq_prunes"`
 	FanoutEvidence       *fanoutEvidenceSummary `json:"fanout_evidence,omitempty"`
 }
 
@@ -2924,6 +2948,7 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainE
 			Mode: mode, Checked: a.greedyChecked, CandidateEvaluations: a.greedyCandidates,
 			HardOverrides: a.greedyHardOverrides, HardConflicts: a.greedyHardConflicts,
 			ParentConflicts: a.greedyParentConflicts, HAConflicts: a.greedyHAConflicts,
+			AMQConflicts: a.greedyAMQConflicts, AMQPrunes: a.greedyAMQPrunes,
 			FanoutEvidence: summarizeFanoutEvidence(a.fanoutEvidence),
 		}
 	}
@@ -2936,6 +2961,7 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainE
 			HardOverrides: s.hardOverrides, OrdinalPlaced: s.ordinalPlaced,
 			ImplicitOrdinals: s.implicitOrdinals, Fanouts: s.fanouts, Conflicts: s.conflicts,
 			HardConflicts: s.hardConflicts, ParentConflicts: s.parentConflicts, HAConflicts: s.haConflicts,
+			AMQConflicts: s.amqConflicts, AMQPrunes: s.amqPrunes,
 			StructureChecked: s.structureChecked, StructureComplete: s.structureComplete,
 			StructureIncomplete: s.structureIncomplete, DEEPlaced: s.deePlaced,
 			DEEAmbiguous: s.deeAmbiguous, DEENoPlace: s.deeNoPlace,
@@ -2973,6 +2999,7 @@ type output struct {
 	Mode                    string                   `json:"mode"`
 	Corpus                  string                   `json:"corpus,omitempty"`
 	TraceStore              string                   `json:"trace_store,omitempty"`
+	SerialTraces            bool                     `json:"serial_traces,omitempty"`
 	CheckpointDistance      int                      `json:"checkpoint_distance"`
 	CheckpointRandomization *bridge.CheckpointRange  `json:"checkpoint_randomization,omitempty"`
 	DropRate                float64                  `json:"drop_rate,omitempty"`
@@ -3104,6 +3131,7 @@ func main() {
 		Mode:                    c.mode,
 		Corpus:                  c.corpusDir,
 		TraceStore:              c.traceStore,
+		SerialTraces:            c.serialTraces,
 		CheckpointDistance:      c.checkpointDistance,
 		CheckpointRandomization: c.checkpointPolicy,
 		DropRate:                c.dropRate,
@@ -3558,6 +3586,15 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open trace store: %v\n", err)
 		os.Exit(1)
+	}
+	if c.serialTraces {
+		defer r.Close()
+		fmt.Fprintf(os.Stderr, "Trace store: %d traces selected, serial trace execution (no pipeline overlap)\n", len(traceOrder))
+		if err := runSerialTraceStore(r.Next, selected, ha); err != nil {
+			fmt.Fprintf(os.Stderr, "trace store: %v\n", err)
+			os.Exit(1)
+		}
+		return traceOrder
 	}
 
 	nw := c.workers

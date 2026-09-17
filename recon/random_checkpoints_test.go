@@ -119,6 +119,7 @@ func TestRandomCheckpointReconstruction(t *testing.T) {
 								t.Fatalf("SB3 incompatible: %s; structure=%+v", r.Reason, r.StructureStatus)
 							}
 						}
+						assertCarrierAMQs(t, survivors, cfg, result)
 						if result.GreedyHardConflicts != 0 {
 							t.Fatalf("hard conflicts: %d", result.GreedyHardConflicts)
 						}

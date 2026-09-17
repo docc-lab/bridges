@@ -171,6 +171,9 @@ The existing event-order scheme remains semantically unchanged:
 - DEE records retain their owner fingerprint, owner depth, child-count/rank
   information, queue model, optional per-instance queues, optional single-pop
   behavior, and optional Lehmer coding.
+- Inherited DEEs follow only the first-child edge. Fresh records dequeued by
+  the receiving call are retained on every child, including second and later
+  children, until that call or a descendant carrier emits them.
 - Once every recovered fanout has been labeled, the existing merged-event and
   EE/DEE structure reconstruction can run without changing its ordering model.
 

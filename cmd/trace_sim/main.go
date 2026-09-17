@@ -24,36 +24,40 @@ import (
 )
 
 type config struct {
-	inputDir           string
-	corpusDir          string
-	outputPath         string
-	mode               string
-	checkpointDistance int
-	checkpointPolicy   *bridge.CheckpointRange
-	bagsize            bool
-	traceCount         int
-	requireClean       bool
-	logDee             bool
-	deeLogBytes        int
-	emitDepth          bool
-	emitOC             bool
-	topoOnly           bool
-	fpBits             int
-	noOrdinal          bool
-	lehmerEE           bool
-	prefixLen          int
-	bloomFP            float64
-	sampleCount        int    // corpus mode: if >0, simulate a RANDOM sample of this many traces (seeded)
-	sampleSeed         int64  // seed for the random sample
-	first              int    // corpus mode: if >0, simulate only the FIRST N traces (contiguous), stop early
-	progressN          int    // corpus mode: print a PROGRESS line every N completed traces (0 = off)
-	workers            int    // corpus mode: parallel worker count (trace sharding; non-sbridge modes only)
-	streamMetrics      string // corpus mode: stream per-trace metrics CSV here instead of holding all in RAM
-	sizeHistograms     string // exact corpus-wide baggage-call and emitted-payload size histograms
-	deeQueueIDs        string // optional per-event simulated-instance queue IDs for S-Bridge
-	deeDequeueOne      bool   // S-Bridge: pick up one queued DEE quad per call instead of draining all
-	deeStats           *bridge.DEEQueueStats
-	mergedDEEStats     *bridge.DEEQueueStatsSnapshot
+	inputDir            string
+	corpusDir           string
+	outputPath          string
+	mode                string
+	checkpointDistance  int
+	checkpointPolicy    *bridge.CheckpointRange
+	bagsize             bool
+	traceCount          int
+	requireClean        bool
+	logDee              bool
+	deeLogBytes         int
+	emitDepth           bool
+	emitOC              bool
+	topoOnly            bool
+	fpBits              int
+	noOrdinal           bool
+	lehmerEE            bool
+	prefixLen           int
+	bloomFP             float64
+	sampleCount         int    // corpus mode: if >0, simulate a RANDOM sample of this many traces (seeded)
+	sampleSeed          int64  // seed for the random sample
+	first               int    // corpus mode: if >0, simulate only the FIRST N traces (contiguous), stop early
+	progressN           int    // corpus mode: print a PROGRESS line every N completed traces (0 = off)
+	workers             int    // corpus mode: parallel worker count (trace sharding; non-sbridge modes only)
+	streamMetrics       string // corpus mode: stream per-trace metrics CSV here instead of holding all in RAM
+	sizeHistograms      string // exact corpus-wide baggage-call and emitted-payload size histograms
+	deeQueueIDs         string // optional per-event simulated-instance queue IDs for S-Bridge
+	deeDequeueOne       bool   // S-Bridge: pick up one queued DEE quad per call instead of draining all
+	deeStats            *bridge.DEEQueueStats
+	mergedDEEStats      *bridge.DEEQueueStatsSnapshot
+	reverse             *bridge.ReverseConfig
+	checkpointPressure  string // optional per-service and per-instance checkpoint burden
+	pressureInstanceIDs string // attribution sidecar; does not enable DEE queues
+	pressure            *checkpointPressure
 }
 
 func parseFlags() config {
@@ -67,6 +71,15 @@ func parseFlags() config {
 	var checkpointSeed int64
 	flag.StringVar(&checkpointRange, "checkpoint-range", "", "Randomized checkpoint distance, inclusive MIN:MAX (1..256); outgoing TTL is sampled distance minus one")
 	flag.Int64Var(&checkpointSeed, "checkpoint-seed", 42, "Seed for randomized checkpoints, independent of drop and sampling seeds")
+	var reversePolicy, reverseTTLRange string
+	var reverseProbability optionalProbability
+	var leafReject float64
+	var reverseSeed uint64
+	flag.StringVar(&reversePolicy, "reverse-policy", "", "Enable reverse trusses: ttl, probability, inverse_depth, depth_linear, or experimental upstream_pressure")
+	flag.Float64Var(&leafReject, "leaf-reject", 1, "Probability that an unscheduled leaf returns its truss (requires --reverse-policy)")
+	flag.Var(&reverseProbability, "reverse-probability", "Receiver acceptance probability in [0,1]; required only for --reverse-policy probability")
+	flag.Uint64Var(&reverseSeed, "reverse-seed", 42, "Seed for independent leaf rejection, reverse distance and receiver decisions")
+	flag.StringVar(&reverseTTLRange, "reverse-ttl-range", "", "Inclusive reverse distance MIN:MAX for ttl policy; defaults to forward CPD range or fixed CPD")
 	flag.BoolVar(&c.bagsize, "bagsize", false, "Output per-trace bagsize metrics")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
 	flag.IntVar(&c.sampleCount, "sample", 0, "Corpus mode: if >0, simulate a RANDOM sample of this many traces (uniform over the trace order, seeded by --sample-seed). Same seed => same sample (match the recon sweep's --sample/--sample-seed for overhead-vs-accuracy on identical traces).")
@@ -76,6 +89,8 @@ func parseFlags() config {
 	flag.IntVar(&c.workers, "workers", 1, "Corpus mode: parallel workers, sharding traces by tid%workers (1 = single-threaded). Only for modes with no cross-trace state (pb/cgpb/pcr/pcrb/cgprb/vanilla); sbridge is forced to 1 (its DEE queue is cross-trace).")
 	flag.StringVar(&c.streamMetrics, "stream-metrics", "", "Corpus mode: stream per-trace metrics as CSV to this file (one row per trace, written + freed on finalize) instead of holding them all in RAM. Bounds memory to the in-flight trace set; post-process into the bagsize JSON with `trace_sim csv2json <csv> <out.json>`. Replaces -o (no JSON written directly).")
 	flag.StringVar(&c.sizeHistograms, "size-histograms", "", "Write exact overall baggage-call and emitted bridge-payload byte histograms as JSON. Can be used alone without -o/--stream-metrics.")
+	flag.StringVar(&c.checkpointPressure, "checkpoint-pressure", "", "Corpus mode, workers=1: write per-service and modeled-instance checkpoint counts and byte totals as JSON")
+	flag.StringVar(&c.pressureInstanceIDs, "pressure-instance-ids", "", "Per-event instance-ID sidecar for --checkpoint-pressure (DEE queue-ID format); defaults to --dee-queue-ids and does not enable DEE routing")
 	flag.StringVar(&c.deeQueueIDs, "dee-queue-ids", "", "S-Bridge corpus mode: read per-event simulated-instance queue IDs generated by dee_instance_prep. Each instance gets an independent cross-trace DEE queue.")
 	flag.BoolVar(&c.deeDequeueOne, "dee-dequeue-one", false, "S-Bridge: each call dequeues only the oldest queued DEE record instead of draining the entire queue. A final backlog is allowed.")
 	flag.BoolVar(&c.requireClean, "require-clean", false, "Cleanliness filter: drop dirty traces; multi-root traces keep only the biggest root tree (JSON mode only)")
@@ -108,6 +123,18 @@ func parseFlags() config {
 		}
 		c.checkpointDistance = c.checkpointPolicy.MaxDistance()
 	}
+	c.reverse, checkpointErr = parseReverseConfig(c, reversePolicy, leafReject, reverseProbability, reverseTTLRange, reverseSeed)
+	if c.reverse == nil && checkpointErr == nil {
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "leaf-reject" || f.Name == "reverse-seed" {
+				checkpointErr = fmt.Errorf("--%s requires --reverse-policy", f.Name)
+			}
+		})
+	}
+	if checkpointErr != nil {
+		fmt.Fprintln(os.Stderr, "error:", checkpointErr)
+		os.Exit(2)
+	}
 	if c.corpusDir == "" {
 		if flag.NArg() < 1 {
 			fmt.Fprintln(os.Stderr, "error: input_dir or --corpus required")
@@ -132,8 +159,12 @@ func parseFlags() config {
 		fmt.Fprintln(os.Stderr, "error: --dee-dequeue-one is only valid with --mode sbridge or sb3")
 		os.Exit(2)
 	}
-	if c.outputPath == "" && c.streamMetrics == "" && c.sizeHistograms == "" {
-		fmt.Fprintln(os.Stderr, "error: -o/--output required (or use --stream-metrics/--size-histograms)")
+	if err := validatePressureConfig(c); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+	if c.outputPath == "" && c.streamMetrics == "" && c.sizeHistograms == "" && c.checkpointPressure == "" {
+		fmt.Fprintln(os.Stderr, "error: -o/--output required (or use --stream-metrics/--size-histograms/--checkpoint-pressure)")
 		os.Exit(2)
 	}
 	if !c.bagsize {
@@ -150,6 +181,13 @@ func makeHandler(c config, serviceName func(uint16) string, sourceFile func(uint
 	defer func() {
 		if err := bridge.ConfigureCheckpoints(h, c.checkpointPolicy); err != nil {
 			panic(err)
+		}
+		if c.reverse != nil {
+			var err error
+			h, err = bridge.NewReverseHandler(h, *c.reverse)
+			if err != nil {
+				panic(err)
+			}
 		}
 	}()
 	switch c.mode {
@@ -258,7 +296,7 @@ func main() {
 		// Post-process with cmd/bagsize_csv2json to get the bagsize JSON.
 		fmt.Fprintf(os.Stderr, "Streamed per-trace metrics to %s\n", c.streamMetrics)
 	} else if c.outputPath != "" {
-		if err := writeBagsizeJSON(c.outputPath, c.checkpointDistance, metrics, c.emitDepth, c.emitOC, c.checkpointPolicy); err != nil {
+		if err := writeBagsizeJSONWithConfig(c.outputPath, c, metrics); err != nil {
 			fmt.Fprintf(os.Stderr, "write output: %v\n", err)
 			os.Exit(1)
 		}
@@ -315,6 +353,10 @@ func runFromJSON(c config, hist *sizeHistograms) []TraceMetrics {
 }
 
 func runFromCorpus(c config, hist *sizeHistograms) []TraceMetrics {
+	if err := validatePressureConfig(c); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
 	t0 := time.Now()
 	eventsPath, metaPath := corpus.Paths(c.corpusDir)
 	meta, err := corpus.ReadMeta(metaPath)
@@ -351,6 +393,26 @@ func runFromCorpus(c config, hist *sizeHistograms) []TraceMetrics {
 			os.Exit(1)
 		}
 	}
+	var pr *corpus.DEEQueueReader
+	if c.checkpointPressure != "" {
+		instancePath := c.pressureInstanceIDs
+		if instancePath == "" {
+			instancePath = c.deeQueueIDs
+		}
+		if instancePath != "" {
+			if qr != nil && filepath.Clean(instancePath) == filepath.Clean(c.deeQueueIDs) {
+				pr = qr
+			} else {
+				pr, err = openPressureInstanceIDs(instancePath, eventsPath)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "pressure instance IDs:", err)
+					os.Exit(1)
+				}
+				defer pr.Close()
+			}
+		}
+		c.pressure = newCheckpointPressure(meta.Services, instancePath != "")
+	}
 	fmt.Fprintf(os.Stderr, "Opened corpus (%d traces, %d services) in %s\n",
 		len(meta.TraceOrder), len(meta.Services), time.Since(t0).Round(time.Millisecond))
 
@@ -376,7 +438,7 @@ func runFromCorpus(c config, hist *sizeHistograms) []TraceMetrics {
 
 	var stream *streamWriter
 	if c.streamMetrics != "" {
-		sw, err := newStreamWriter(c.streamMetrics, c.checkpointDistance, c.emitDepth, c.emitOC, c.checkpointPolicy)
+		sw, err := newStreamWriterWithConfig(c.streamMetrics, c)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "open stream-metrics file: %v\n", err)
 			os.Exit(1)
@@ -389,13 +451,20 @@ func runFromCorpus(c config, hist *sizeHistograms) []TraceMetrics {
 		fmt.Fprintf(os.Stderr, "sharded: %d workers (parallel across traces)\n", W)
 		metrics = runShardedFromCorpus(er, meta, func() bridge.Handler { return makeHandler(c, svcFn, srcFn) }, c, W, stream, hist)
 	} else {
-		metrics = runInterleavedFromCorpus(er, qr, meta, makeHandler(c, svcFn, srcFn), c, stream, hist)
+		metrics = runInterleavedFromCorpus(er, qr, pr, meta, makeHandler(c, svcFn, srcFn), c, stream, hist)
 	}
 	if stream != nil {
 		if err := stream.close(); err != nil {
 			fmt.Fprintf(os.Stderr, "close stream-metrics file: %v\n", err)
 			os.Exit(1)
 		}
+	}
+	if c.pressure != nil {
+		if err := c.pressure.write(c.checkpointPressure, c); err != nil {
+			fmt.Fprintln(os.Stderr, "write checkpoint pressure:", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Wrote checkpoint pressure to %s\n", c.checkpointPressure)
 	}
 	fmt.Fprintf(os.Stderr, "Simulated in %s\n", time.Since(t1).Round(time.Millisecond))
 	return metrics

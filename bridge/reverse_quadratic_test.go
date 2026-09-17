@@ -10,7 +10,7 @@ import (
 // 0..n-1. Their first-hop value at the immediate parent fixes how quickly a
 // truss is absorbed, and is (k+1)/n asymptotically for weights (d+1)^k.
 func TestDepthWeightedPoliciesAreNormalized(t *testing.T) {
-	for _, policy := range []string{"depth_linear", "depth_quadratic"} {
+	for _, policy := range []string{"depth_linear", "depth_quadratic", "depth_cubic"} {
 		for _, n := range []int{1, 2, 3, 5, 8, 15, 40, 90} {
 			total := 0.0
 			for d := 0; d < n; d++ {
@@ -22,6 +22,40 @@ func TestDepthWeightedPoliciesAreNormalized(t *testing.T) {
 			}
 			if math.Abs(total-1) > 1e-9 {
 				t.Fatalf("%s n=%d: weights sum to %g, want 1", policy, n, total)
+			}
+		}
+	}
+}
+
+// The normalized family is ordered: at the immediate parent each step up in
+// exponent raises acceptance, and at the root it lowers it. First-hop values
+// approach (k+1)/n.
+func TestNormalizedDepthFamilyIsOrdered(t *testing.T) {
+	for _, n := range []int{3, 5, 15, 40} {
+		lin := ReverseAcceptanceProbability("depth_linear", 0, n-1, n)
+		quad := ReverseAcceptanceProbability("depth_quadratic", 0, n-1, n)
+		cub := ReverseAcceptanceProbability("depth_cubic", 0, n-1, n)
+		if !(lin < quad && quad < cub) {
+			t.Fatalf("n=%d: first hop must increase linear<quad<cubic, got %g %g %g", n, lin, quad, cub)
+		}
+		if want := 4 * float64(n) / float64((n+1)*(n+1)); math.Abs(cub-want) > 1e-12 {
+			t.Fatalf("n=%d: cubic first hop %g, want %g", n, cub, want)
+		}
+		if n > 2 {
+			if !(ReverseAcceptanceProbability("depth_cubic", 0, 0, n) <
+				ReverseAcceptanceProbability("depth_quadratic", 0, 0, n)) {
+				t.Fatalf("n=%d: cubic must accept less than quadratic at the root", n)
+			}
+		}
+		for d := 1; d < n; d++ {
+			if ReverseAcceptanceProbability("depth_cubic", 0, d, n) <=
+				ReverseAcceptanceProbability("depth_cubic", 0, d-1, n) {
+				t.Fatalf("n=%d d=%d: cubic must increase with receiver depth", n, d)
+			}
+		}
+		for _, d := range []int{n, n + 1} {
+			if p := ReverseAcceptanceProbability("depth_cubic", 0, d, n); p != 0 {
+				t.Fatalf("n=%d d=%d: expected 0, got %g", n, d, p)
 			}
 		}
 	}

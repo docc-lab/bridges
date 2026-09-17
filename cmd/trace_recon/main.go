@@ -115,10 +115,12 @@ func parseFlags() config {
 	var reversePolicy, reverseTTL string
 	var reverseProbability, leafReject float64
 	var reverseSeed uint64
-	flag.StringVar(&reversePolicy, "reverse-policy", "", "Reverse trusses (pb0/cgp0/sb3): unscheduled leaves return their truss upstream and receivers accept per policy: ttl, probability, inverse_depth, depth_linear, depth_quadratic, upstream_pressure")
+	var reverseExponent float64
+	flag.StringVar(&reversePolicy, "reverse-policy", "", "Reverse trusses (pb0/cgp0/sb3): unscheduled leaves return their truss upstream and receivers accept per policy: ttl, probability, inverse_depth, depth_linear, depth_quadratic, depth_ratio, upstream_pressure")
 	flag.Float64Var(&reverseProbability, "reverse-probability", -1, "Receiver acceptance probability in [0,1]; required exactly for --reverse-policy probability")
 	flag.StringVar(&reverseTTL, "reverse-ttl-range", "", "Inclusive reverse distance MIN:MAX for the ttl policy; defaults to the forward checkpoint range or fixed distance")
 	flag.Uint64Var(&reverseSeed, "reverse-seed", 42, "Seed for reverse leaf rejection, TTL, and acceptance draws")
+	flag.Float64Var(&reverseExponent, "reverse-exponent", 0, "Exponent m in ((d+1)/(n+1))^m; required only for --reverse-policy depth_ratio")
 	flag.Float64Var(&leafReject, "leaf-reject", 1, "Probability that an unscheduled leaf returns its truss (requires --reverse-policy)")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides)")
 	flag.IntVar(&c.fpBits, "fp-bits", 16, "SB3 delayed-end owner fingerprint width in bits")
@@ -182,13 +184,13 @@ func parseFlags() config {
 		c.checkpointDistance = c.checkpointPolicy.MaxDistance()
 	}
 	if reversePolicy != "" {
-		rc, err := parseReverseConfig(c, reversePolicy, reverseProbability, reverseTTL, reverseSeed, leafReject)
+		rc, err := parseReverseConfig(c, reversePolicy, reverseProbability, reverseTTL, reverseSeed, leafReject, reverseExponent)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(2)
 		}
 		c.reverse = rc
-	} else if reverseProbability >= 0 || reverseTTL != "" || leafReject != 1 {
+	} else if reverseProbability >= 0 || reverseTTL != "" || leafReject != 1 || reverseExponent != 0 {
 		fmt.Fprintln(os.Stderr, "error: reverse options require --reverse-policy")
 		os.Exit(2)
 	}

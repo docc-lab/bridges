@@ -13,6 +13,7 @@ type ReverseConfig struct {
 	Policy                string  `json:"policy"`
 	LeafRejectProbability float64 `json:"leaf_reject_probability"`
 	Probability           float64 `json:"probability"`
+	Exponent              float64 `json:"exponent,omitempty"`
 	TTLMin                int     `json:"ttl_min"`
 	TTLMax                int     `json:"ttl_max"`
 	Seed                  uint64  `json:"seed"`
@@ -31,9 +32,16 @@ func (c ReverseConfig) Validate() error {
 		if math.IsNaN(c.Probability) || c.Probability < 0 || c.Probability > 1 {
 			return fmt.Errorf("reverse probability must be finite and in [0,1]")
 		}
+	case "depth_ratio":
+		if math.IsNaN(c.Exponent) || math.IsInf(c.Exponent, 0) || c.Exponent <= 0 {
+			return fmt.Errorf("reverse depth_ratio exponent must be finite and positive")
+		}
 	case "inverse_depth", "depth_linear", "depth_quadratic", "upstream_pressure":
 	default:
 		return fmt.Errorf("unknown reverse policy %q", c.Policy)
+	}
+	if c.Policy != "depth_ratio" && c.Exponent != 0 {
+		return fmt.Errorf("reverse exponent is only valid with the depth_ratio policy")
 	}
 	if c.Policy != "probability" && c.Probability != 0 {
 		return fmt.Errorf("reverse probability is only valid with probability policy")
@@ -45,6 +53,15 @@ func (c ReverseConfig) Validate() error {
 // an ordinary valid ancestor. upstream_pressure is an experimental simulator
 // policy, not an SDK configuration name. Boundary absorption is separate.
 func ReverseAcceptanceProbability(policy string, p float64, receiverDepth, originDepth int) float64 {
+	return reverseAcceptance(policy, p, 0, receiverDepth, originDepth)
+}
+
+// reverseAcceptance carries the depth_ratio exponent. Unlike the normalized
+// depth_linear/depth_quadratic weights, whose first-hop probability falls as
+// (k+1)/n, the depth_ratio family's first-hop probability is (n/(n+1))^m, which
+// RISES with origin depth. It therefore absorbs deep origins early and shallow
+// origins late, the opposite bias, and never reaches 1.
+func reverseAcceptance(policy string, p, exponent float64, receiverDepth, originDepth int) float64 {
 	if originDepth <= 0 || receiverDepth < 0 || receiverDepth >= originDepth {
 		return 0
 	}
@@ -55,6 +72,8 @@ func ReverseAcceptanceProbability(policy string, p float64, receiverDepth, origi
 		return 1 / float64(originDepth)
 	case "depth_linear":
 		return 2 * (float64(receiverDepth) + 1) / (float64(originDepth) * (float64(originDepth) + 1))
+	case "depth_ratio":
+		return math.Pow((float64(receiverDepth)+1)/(float64(originDepth)+1), exponent)
 	case "depth_quadratic":
 		// Weights proportional to (d+1)^2 over the origin's ancestors, normalized
 		// by sum_{j=1..n} j^2 = n(n+1)(2n+1)/6. Steeper than depth_linear, so more
@@ -132,7 +151,7 @@ func RouteReverseSegments(c ReverseConfig, receiver ReverseReceiver, pending []R
 		valid := validReverseCheckpointSegment(segment)
 		p := 0.0
 		if valid {
-			p = ReverseAcceptanceProbability(c.Policy, c.Probability, receiver.Depth, segment.OriginDepth)
+			p = reverseAcceptance(c.Policy, c.Probability, c.Exponent, receiver.Depth, segment.OriginDepth)
 		}
 		if p >= 1 || (p > 0 && reverseUniform(c.Seed, receiver.TraceID, segment.OriginSpanID, receiver.SpanID, reverseAcceptanceStream) < p) {
 			accepted = append(accepted, segment)

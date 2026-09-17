@@ -54,3 +54,60 @@ func TestDepthQuadraticIsSteeperThanLinear(t *testing.T) {
 		}
 	}
 }
+
+// depth_ratio is NOT normalized: it is a per-hop rule whose first-hop value is
+// (n/(n+1))^m. Unlike the normalized weights, that RISES with origin depth, so
+// deep origins are absorbed earlier than shallow ones. The exponent tunes it
+// from near-certain absorption at the parent (m small) down toward zero.
+func TestDepthRatioFirstHopRisesWithOriginDepth(t *testing.T) {
+	for _, m := range []float64{1, 2, 4, 8, 16, 24} {
+		prev := -1.0
+		for _, n := range []int{3, 5, 8, 13, 15, 20, 40} {
+			first := reverseAcceptance("depth_ratio", 0, m, n-1, n)
+			want := math.Pow(float64(n)/float64(n+1), m)
+			if math.Abs(first-want) > 1e-12 {
+				t.Fatalf("m=%g n=%d: first hop %g, want %g", m, n, first, want)
+			}
+			if first <= 0 || first >= 1 {
+				t.Fatalf("m=%g n=%d: probability %g must lie strictly in (0,1)", m, n, first)
+			}
+			if first <= prev {
+				t.Fatalf("m=%g n=%d: first hop %g must exceed the shallower origin's %g", m, n, first, prev)
+			}
+			prev = first
+		}
+	}
+	// Larger exponents absorb less at any fixed receiver, and acceptance still
+	// increases with receiver depth within one origin.
+	for _, n := range []int{5, 15, 40} {
+		for d := 1; d < n; d++ {
+			if reverseAcceptance("depth_ratio", 0, 4, d, n) <= reverseAcceptance("depth_ratio", 0, 4, d-1, n) {
+				t.Fatalf("n=%d d=%d: must increase with receiver depth", n, d)
+			}
+			if reverseAcceptance("depth_ratio", 0, 8, d, n) >= reverseAcceptance("depth_ratio", 0, 4, d, n) {
+				t.Fatalf("n=%d d=%d: larger exponent must lower acceptance", n, d)
+			}
+		}
+		for _, d := range []int{n, n + 1} {
+			if p := reverseAcceptance("depth_ratio", 0, 4, d, n); p != 0 {
+				t.Fatalf("n=%d d=%d: expected 0, got %g", n, d, p)
+			}
+		}
+	}
+}
+
+func TestDepthRatioConfigValidation(t *testing.T) {
+	ok := ReverseConfig{Policy: "depth_ratio", LeafRejectProbability: 1, Exponent: 4}
+	if err := ok.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []ReverseConfig{
+		{Policy: "depth_ratio", LeafRejectProbability: 1},
+		{Policy: "depth_ratio", LeafRejectProbability: 1, Exponent: -1},
+		{Policy: "inverse_depth", LeafRejectProbability: 1, Exponent: 4},
+	} {
+		if err := bad.Validate(); err == nil {
+			t.Fatalf("expected rejection for %+v", bad)
+		}
+	}
+}

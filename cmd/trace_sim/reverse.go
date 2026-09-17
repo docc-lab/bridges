@@ -26,7 +26,7 @@ func (p *optionalProbability) Set(s string) error {
 	return nil
 }
 
-func parseReverseConfig(c config, policy string, q float64, p optionalProbability, ttl string, seed uint64) (*bridge.ReverseConfig, error) {
+func parseReverseConfig(c config, policy string, q float64, p optionalProbability, ttl string, seed uint64, exponent float64) (*bridge.ReverseConfig, error) {
 	if policy == "" {
 		if p.set || ttl != "" {
 			return nil, fmt.Errorf("reverse options require --reverse-policy")
@@ -37,7 +37,7 @@ func parseReverseConfig(c config, policy string, q float64, p optionalProbabilit
 		return nil, fmt.Errorf("--reverse-policy supports pcrb, cgprb and sb3")
 	}
 	switch policy {
-	case "ttl", "probability", "inverse_depth", "depth_linear", "depth_quadratic", "upstream_pressure":
+	case "ttl", "probability", "inverse_depth", "depth_linear", "depth_quadratic", "depth_ratio", "upstream_pressure":
 	default:
 		return nil, fmt.Errorf("unknown reverse policy %q", policy)
 	}
@@ -46,6 +46,9 @@ func parseReverseConfig(c config, policy string, q float64, p optionalProbabilit
 	}
 	if (policy == "probability") != p.set {
 		return nil, fmt.Errorf("--reverse-probability is required exactly for --reverse-policy probability")
+	}
+	if (policy == "depth_ratio") != (exponent > 0) {
+		return nil, fmt.Errorf("--reverse-exponent is required exactly for --reverse-policy depth_ratio")
 	}
 	if ttl != "" && policy != "ttl" {
 		return nil, fmt.Errorf("--reverse-ttl-range is valid only for ttl policy")
@@ -69,7 +72,7 @@ func parseReverseConfig(c config, policy string, q float64, p optionalProbabilit
 	if policy != "ttl" {
 		lo, hi = 0, 0
 	}
-	out := &bridge.ReverseConfig{Policy: policy, LeafRejectProbability: q, Probability: p.value, TTLMin: lo, TTLMax: hi, Seed: seed}
+	out := &bridge.ReverseConfig{Policy: policy, LeafRejectProbability: q, Probability: p.value, Exponent: exponent, TTLMin: lo, TTLMax: hi, Seed: seed}
 	if err := out.Validate(); err != nil {
 		return nil, err
 	}

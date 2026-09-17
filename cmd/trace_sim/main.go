@@ -75,11 +75,13 @@ func parseFlags() config {
 	var reverseProbability optionalProbability
 	var leafReject float64
 	var reverseSeed uint64
-	flag.StringVar(&reversePolicy, "reverse-policy", "", "Enable reverse trusses: ttl, probability, inverse_depth, depth_linear, depth_quadratic, or experimental upstream_pressure")
+	var reverseExponent float64
+	flag.StringVar(&reversePolicy, "reverse-policy", "", "Enable reverse trusses: ttl, probability, inverse_depth, depth_linear, depth_quadratic, depth_ratio, or experimental upstream_pressure")
 	flag.Float64Var(&leafReject, "leaf-reject", 1, "Probability that an unscheduled leaf returns its truss (requires --reverse-policy)")
 	flag.Var(&reverseProbability, "reverse-probability", "Receiver acceptance probability in [0,1]; required only for --reverse-policy probability")
 	flag.Uint64Var(&reverseSeed, "reverse-seed", 42, "Seed for independent leaf rejection, reverse distance and receiver decisions")
 	flag.StringVar(&reverseTTLRange, "reverse-ttl-range", "", "Inclusive reverse distance MIN:MAX for ttl policy; defaults to forward CPD range or fixed CPD")
+	flag.Float64Var(&reverseExponent, "reverse-exponent", 0, "Exponent m in ((d+1)/(n+1))^m; required only for --reverse-policy depth_ratio")
 	flag.BoolVar(&c.bagsize, "bagsize", false, "Output per-trace bagsize metrics")
 	flag.IntVar(&c.traceCount, "trace-count", 0, "Max number of traces to load (0 = all; JSON mode only)")
 	flag.IntVar(&c.sampleCount, "sample", 0, "Corpus mode: if >0, simulate a RANDOM sample of this many traces (uniform over the trace order, seeded by --sample-seed). Same seed => same sample (match the recon sweep's --sample/--sample-seed for overhead-vs-accuracy on identical traces).")
@@ -123,7 +125,7 @@ func parseFlags() config {
 		}
 		c.checkpointDistance = c.checkpointPolicy.MaxDistance()
 	}
-	c.reverse, checkpointErr = parseReverseConfig(c, reversePolicy, leafReject, reverseProbability, reverseTTLRange, reverseSeed)
+	c.reverse, checkpointErr = parseReverseConfig(c, reversePolicy, leafReject, reverseProbability, reverseTTLRange, reverseSeed, reverseExponent)
 	if c.reverse == nil && checkpointErr == nil {
 		flag.Visit(func(f *flag.Flag) {
 			if f.Name == "leaf-reject" || f.Name == "reverse-seed" {

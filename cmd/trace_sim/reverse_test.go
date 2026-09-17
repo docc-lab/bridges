@@ -162,26 +162,26 @@ func TestReverseCSVJSONAndHistogramRoundTrip(t *testing.T) {
 }
 func TestReverseFlagConfiguration(t *testing.T) {
 	c := config{mode: "pcrb", checkpointDistance: 8, checkpointPolicy: &bridge.CheckpointRange{Min: 2, Max: 8}}
-	ttl, err := parseReverseConfig(c, "ttl", 1, optionalProbability{}, "", 42)
+	ttl, err := parseReverseConfig(c, "ttl", 1, optionalProbability{}, "", 42, 0)
 	if err != nil || ttl.TTLMin != 2 || ttl.TTLMax != 8 {
 		t.Fatalf("forward range not inherited: %+v %v", ttl, err)
 	}
-	if _, err := parseReverseConfig(c, "probability", 1, optionalProbability{}, "", 42); err == nil {
+	if _, err := parseReverseConfig(c, "probability", 1, optionalProbability{}, "", 42, 0); err == nil {
 		t.Fatal("constant probability must be explicit")
 	}
-	if _, err := parseReverseConfig(c, "inverse_depth", 1, optionalProbability{set: true}, "", 42); err == nil {
+	if _, err := parseReverseConfig(c, "inverse_depth", 1, optionalProbability{set: true}, "", 42, 0); err == nil {
 		t.Fatal("nonconstant policy accepts probability argument")
 	}
-	if _, err := parseReverseConfig(c, "probability", 1, optionalProbability{set: true}, "", 42); err != nil {
+	if _, err := parseReverseConfig(c, "probability", 1, optionalProbability{set: true}, "", 42, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parseReverseConfig(c, "ttl", 1, optionalProbability{}, "2:9", 42); err != nil {
+	if _, err := parseReverseConfig(c, "ttl", 1, optionalProbability{}, "2:9", 42, 0); err != nil {
 		t.Fatal(err)
 	}
-	if r, err := parseReverseConfig(c, "ttl", 1, optionalProbability{}, "1:256", 42); err != nil || r.TTLMin != 1 || r.TTLMax != 256 {
+	if r, err := parseReverseConfig(c, "ttl", 1, optionalProbability{}, "1:256", 42, 0); err != nil || r.TTLMin != 1 || r.TTLMax != 256 {
 		t.Fatalf("reverse TTL range unnecessarily constrained by forward packed format: %+v %v", r, err)
 	}
-	if _, err := parseReverseConfig(c, "ttl", 1, optionalProbability{}, "1:257", 42); err == nil {
+	if _, err := parseReverseConfig(c, "ttl", 1, optionalProbability{}, "1:257", 42, 0); err == nil {
 		t.Fatal("reverse TTL range exceeds one-byte countdown")
 	}
 }
@@ -219,5 +219,19 @@ func TestReverseShardedHistogramOnly(t *testing.T) {
 	d := snapshotReverseHistograms(h.reverse)
 	if d["checkpoint_spans_per_trace"].Count != 2 || d["checkpoint_spans_per_trace"].Sum != 4 || d["reverse_encoded_baggage_bytes"].Count != 8 {
 		t.Fatalf("sharded histogram totals: %+v", d)
+	}
+}
+
+func TestReverseExponentRequiredExactlyForDepthRatio(t *testing.T) {
+	c := config{mode: "pcrb"}
+	r, err := parseReverseConfig(c, "depth_ratio", 1, optionalProbability{}, "", 42, 4)
+	if err != nil || r.Exponent != 4 {
+		t.Fatalf("depth_ratio with exponent: %v %+v", err, r)
+	}
+	if _, err := parseReverseConfig(c, "depth_ratio", 1, optionalProbability{}, "", 42, 0); err == nil {
+		t.Fatal("depth_ratio without an exponent must be rejected")
+	}
+	if _, err := parseReverseConfig(c, "inverse_depth", 1, optionalProbability{}, "", 42, 4); err == nil {
+		t.Fatal("an exponent on another policy must be rejected")
 	}
 }

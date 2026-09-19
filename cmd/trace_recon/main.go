@@ -53,6 +53,7 @@ type config struct {
 	checkpointDistance int
 	checkpointPolicy   *bridge.CheckpointRange
 	reverse            *bridge.ReverseConfig // non-nil: unscheduled leaf trusses return upstream through bridge.ReverseHandler
+	progressEvery      int                   // >0: print a PROGRESS line to stderr every N finished traces
 	dropRate           float64
 	dropRates          string // comma list: one decode, all rates reconstructed per pass (CGP/PB/SB3 families)
 	seed               int64
@@ -120,6 +121,7 @@ func parseFlags() config {
 	flag.Float64Var(&reverseProbability, "reverse-probability", -1, "Receiver acceptance probability in [0,1]; required exactly for --reverse-policy probability")
 	flag.StringVar(&reverseTTL, "reverse-ttl-range", "", "Inclusive reverse distance MIN:MAX for the ttl policy; defaults to the forward checkpoint range or fixed distance")
 	flag.Uint64Var(&reverseSeed, "reverse-seed", 42, "Seed for reverse leaf rejection, TTL, and acceptance draws")
+	flag.IntVar(&c.progressEvery, "progress", 0, "Print a PROGRESS line to stderr every N finished traces (0 = silent). Works for every mode, including multi-rate runs.")
 	flag.Float64Var(&reverseExponent, "reverse-exponent", 0, "Exponent m in ((d+1)/(n+1))^m; required only for --reverse-policy depth_ratio")
 	flag.Float64Var(&leafReject, "leaf-reject", 1, "Probability that an unscheduled leaf returns its truss (requires --reverse-policy)")
 	flag.Float64Var(&c.bloomFP, "bloom-fp", bridge.DefaultBloomFPRate, "Target bloom false-positive rate (sets bloom geometry on both the emit and reconstruction sides)")
@@ -314,6 +316,11 @@ type harness struct {
 	seed           int64 // base drop seed (for per-trace reseeding)
 	perTraceSeed   bool  // reseed the drop RNG per-trace (order/partition-invariant)
 	compareScorers bool  // emit a controlled canonical-vs-historical score comparison
+
+	progressEvery int
+	progressDone  int
+	progressTotal int
+	progressStart time.Time
 
 	spansByTID map[uint64][]collSpan
 	idxByKey   map[spanKey]int
@@ -1345,6 +1352,8 @@ func newHarness(c config) *harness {
 		seed:           c.seed,
 		perTraceSeed:   c.perTraceDropSeed,
 		compareScorers: c.compareScorers,
+		progressEvery:  c.progressEvery,
+		progressStart:  time.Now(),
 		spansByTID:     make(map[uint64][]collSpan),
 		idxByKey:       make(map[spanKey]int),
 		openByTID:      make(map[uint64]int),
@@ -1782,6 +1791,7 @@ func (ha *harness) finishTrace(tid uint64) {
 
 // process is the per-trace parallel work: decode, reconstruct, score.
 func (ha *harness) process(j finishJob) {
+	defer ha.tickProgress()
 	tid, spans, dropped := j.tid, j.spans, j.dropped
 
 	if ha.inflight != nil {
@@ -2322,6 +2332,30 @@ func (ha *harness) recRecon(tid uint64, nsurv, nspan, ndrop int, feasible bool, 
 	ha.mu.Lock()
 	ha.timingRecs = append(ha.timingRecs, traceTiming{tid, nsurv, nspan, ndrop, feasible, d.Nanoseconds()})
 	ha.mu.Unlock()
+}
+
+// tickProgress emits a cumulative, monitor-friendly PROGRESS line every
+// progressEvery finished traces. It covers every mode, unlike the legacy
+// scoresStore row which only fires for the single-rate PCR family.
+func (ha *harness) tickProgress() {
+	if ha.progressEvery <= 0 {
+		return
+	}
+	ha.mu.Lock()
+	ha.progressDone++
+	n, total := ha.progressDone, ha.progressTotal
+	ha.mu.Unlock()
+	if n%ha.progressEvery != 0 && n != total {
+		return
+	}
+	el := time.Since(ha.progressStart).Seconds()
+	rate := float64(n) / el
+	msg := fmt.Sprintf("PROGRESS traces=%d elapsed=%.0fs rate=%.1f/s", n, el, rate)
+	if total > 0 {
+		eta := float64(total-n) / rate
+		msg += fmt.Sprintf(" of=%d pct=%.1f eta=%.0fs", total, 100*float64(n)/float64(total), eta)
+	}
+	fmt.Fprintln(os.Stderr, msg)
 }
 
 // addTopo accumulates one trace's call-graph-topology verdict (guarded by mu).
@@ -3637,6 +3671,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 	}
 	if c.serialTraces {
 		defer r.Close()
+		ha.progressTotal = len(traceOrder)
 		fmt.Fprintf(os.Stderr, "Trace store: %d traces selected, serial trace execution (no pipeline overlap)\n", len(traceOrder))
 		if err := runSerialTraceStore(r.Next, selected, ha); err != nil {
 			fmt.Fprintf(os.Stderr, "trace store: %v\n", err)
@@ -3649,6 +3684,7 @@ func runFromTraceStore(c config, ha *harness) []uint64 {
 	if nw <= 0 {
 		nw = runtime.NumCPU()
 	}
+	ha.progressTotal = len(traceOrder)
 	fmt.Fprintf(os.Stderr, "Trace store: %d traces selected, %d parallel replay workers\n", len(traceOrder), nw)
 
 	type seqTrace struct {

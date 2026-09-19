@@ -16,6 +16,9 @@ import (
 // HA-preferring greedy choice because sparse-ordinal evidence made another
 // topology strictly more compatible.
 type sb3GreedyStats struct {
+	// CertainRootFallbacks counts units that exhausted every candidate and were
+	// attached to their certain window root instead of being left unrouted.
+	CertainRootFallbacks int
 	CandidateEvaluations int
 	OrdinalOverrides     int
 	HardOverrides        int
@@ -898,6 +901,31 @@ func sb3ApplyFreeFanoutEvidence(sk *cgpSkeleton, units []*sb3RouteUnit, useGroup
 // sb3AssignAnonymousIDs gives every route-unit/depth pair a stable private ID.
 // Candidate trials therefore differ only in topology choices, not allocator
 // order, which keeps ordinal conflict comparisons deterministic.
+// sb3CertainWindowRoot returns the checkpoint root that every resolved member
+// of the unit names exactly, through the prefix carried in its own payload.
+// That root is an ancestor by construction, not a Bloom guess, so attaching to
+// it is always admissible. It is the attachment of last resort that makes
+// "every fragment reaches a certainly-correct ancestor" a property of the
+// algorithm rather than an outcome that usually holds.
+func sb3CertainWindowRoot(u *sb3RouteUnit) *Span {
+	var root *Span
+	for _, e := range u.members {
+		if e == nil || !e.resolved || e.frag == nil || e.frag.anchorCkpt == nil {
+			continue
+		}
+		c := e.frag.anchorCkpt
+		if c.Depth >= u.depth {
+			return nil // no room between the root and this unit's head
+		}
+		if root == nil {
+			root = c
+		} else if root.SpanID != c.SpanID {
+			return nil // members disagree, so no single certain root
+		}
+	}
+	return root
+}
+
 func sb3AssignAnonymousIDs(sk *cgpSkeleton, units []*sb3RouteUnit) {
 	used := make(map[uint64]bool, len(sk.byID)+len(sk.fanouts)+len(units))
 	for id := range sk.byID {
@@ -920,10 +948,16 @@ func sb3AssignAnonymousIDs(sk *cgpSkeleton, units []*sb3RouteUnit) {
 		return id
 	}
 	for _, u := range units {
-		if len(u.anchors) == 0 {
+		minDepth := u.depth
+		if len(u.anchors) > 0 {
+			minDepth = u.anchors[len(u.anchors)-1].Depth
+		}
+		if root := sb3CertainWindowRoot(u); root != nil && root.Depth < minDepth {
+			minDepth = root.Depth
+		}
+		if minDepth >= u.depth {
 			continue
 		}
-		minDepth := u.anchors[len(u.anchors)-1].Depth
 		for d := minDepth + 1; d < u.depth; d++ {
 			u.anonAtDepth[d] = alloc()
 		}
@@ -2306,6 +2340,177 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 	return false
 }
 
+// sb3AttachUnroutedUnits is the closing guarantee of the algorithm: after every
+// unit has had its ordinary turn and pending fanout obligations have been
+// propagated, any unit still without a parent edge is attached to its certain
+// window root. Leaving it unrouted is not a neutral outcome, because the
+// mandatory fanout obligations of OTHER carriers run through that head and are
+// silently broken when it dangles.
+func sb3AttachUnroutedUnits(sk *cgpSkeleton, units []*sb3RouteUnit, ordinals *sb3OrdinalAssignments,
+	ha *sb3HATracker, parent map[uint64]uint64, stats *sb3GreedyStats) {
+	for _, u := range units {
+		if _, routed := parent[u.head()]; routed {
+			continue
+		}
+		if sb3AttachToCertainRoot(sk, u, ordinals, ha, parent) {
+			stats.CertainRootFallbacks++
+		}
+	}
+}
+
+// The last-resort route is attempted in three escalating modes. Each is gated
+// by the same hard trackers that gate an ordinary route, so the fallback can
+// never install evidence the engine has already refused.
+const (
+	// Place every mandatory fanout at its exact depth and let an
+	// already-routed fanout keep the ancestry it was committed with.
+	certainRootKeepFanouts = iota
+	// Same, but give the mandatory fanout a private ancestry up to the
+	// certain root. Needed when the fanout's committed ancestry contains a
+	// named node the newly attached carriers' filters exclude: the fanout is
+	// a true ancestor of both subtrees, so the earlier parent choice, not the
+	// fanout, is what the filters contradict.
+	certainRootRerootFanouts
+	// A wholly anonymous chain. No filter can reject it, because anonymous
+	// ids are never members of the named population, so this mode always
+	// yields a connected head. A mandatory fanout is genuinely unsatisfiable
+	// under the committed prefix here, and the audit reports that rather than
+	// the head being left to dangle and breaking other carriers silently.
+	certainRootAnonymousOnly
+)
+
+// sb3rerootedFanout records a fanout's previous parent so an attempt that the
+// trackers refuse can be undone exactly.
+type sb3rerootedFanout struct {
+	id        uint64
+	hadParent bool
+	oldParent uint64
+	inserted  []uint64
+}
+
+// sb3AttachToCertainRoot installs the last-resort route to the unit's window
+// checkpoint root, which every resolved member names exactly and which is
+// therefore an ancestor by construction rather than a Bloom guess.
+func sb3AttachToCertainRoot(sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3OrdinalAssignments,
+	ha *sb3HATracker, parent map[uint64]uint64) bool {
+	root := sb3CertainWindowRoot(u)
+	if root == nil {
+		return false
+	}
+	for _, mode := range []int{certainRootKeepFanouts, certainRootRerootFanouts, certainRootAnonymousOnly} {
+		if sb3TryCertainRootRoute(sk, u, ordinals, ha, parent, root, mode) {
+			return true
+		}
+	}
+	return false
+}
+
+func sb3TryCertainRootRoute(sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3OrdinalAssignments,
+	ha *sb3HATracker, parent map[uint64]uint64, root *Span, mode int) bool {
+	u.anchor = root
+	for d := u.depth - 1; d > root.Depth; d-- {
+		u.nodeChoice[d] = 0
+		if mode != certainRootAnonymousOnly {
+			if required := u.requiredFanout[d]; required != 0 && sk.byID[required] == nil {
+				u.nodeChoice[d] = required
+				continue
+			}
+		}
+		if u.anonAtDepth[d] == 0 {
+			u.anchor = nil
+			return false // no id reserved for this level; do not emit a partial route
+		}
+	}
+	inserted := sb3ApplyUnitRoute(parent, u)
+	if len(inserted) == 0 {
+		u.anchor = nil
+		return false
+	}
+	var reroot []sb3rerootedFanout
+	if mode == certainRootRerootFanouts {
+		var ok bool
+		if reroot, ok = sb3RerootMandatoryFanout(u, parent, root); !ok {
+			sb3RollbackRoute(parent, inserted)
+			u.anchor = nil
+			return false
+		}
+	}
+	affected := inserted
+	undo := func() {
+		sb3RestoreRerootedFanouts(parent, reroot)
+		sb3RollbackRoute(parent, inserted)
+		u.anchor = nil
+	}
+	for _, r := range reroot {
+		affected = append(append([]uint64{}, affected...), r.inserted...)
+	}
+	if !sb3UnitWindowCompatible(sk, u, parent) {
+		undo()
+		return false
+	}
+	amqTxn, amqOK := sk.amq.tryEdges(affected, parent)
+	if !amqOK {
+		undo()
+		return false
+	}
+	haTxn, haOK := ha.tryEdges(affected, parent)
+	if !haOK {
+		amqTxn.rollback()
+		undo()
+		return false
+	}
+	if !greedyPendingHAAMQCompatible(sk.amq, ha, amqTxn, haTxn) {
+		haTxn.rollback()
+		amqTxn.rollback()
+		undo()
+		return false
+	}
+	ordinals.disableUnit(u)
+	return true
+}
+
+// sb3RerootMandatoryFanout gives the mandatory fanout the unit stopped at a
+// private anonymous ancestry running up to the certain root. Removing a named
+// node from the fanout subtree's ancestry can never create an AMQ rejection,
+// and the trackers still verify that no HA obligation depended on it.
+func sb3RerootMandatoryFanout(u *sb3RouteUnit, parent map[uint64]uint64, root *Span) ([]sb3rerootedFanout, bool) {
+	for d := u.depth - 1; d > root.Depth; d-- {
+		f := u.nodeChoice[d]
+		if f == 0 {
+			continue
+		}
+		r := sb3rerootedFanout{id: f}
+		if p, ok := parent[f]; ok {
+			r.hadParent, r.oldParent = true, p
+		}
+		cur := f
+		for dd := d - 1; dd > root.Depth; dd-- {
+			anon := u.anonAtDepth[dd]
+			if anon == 0 {
+				return nil, false
+			}
+			parent[cur] = anon
+			r.inserted = append(r.inserted, cur)
+			cur = anon
+		}
+		parent[cur] = root.SpanID
+		r.inserted = append(r.inserted, cur)
+		return []sb3rerootedFanout{r}, true
+	}
+	return nil, true // no mandatory fanout on this route; nothing to re-root
+}
+
+func sb3RestoreRerootedFanouts(parent map[uint64]uint64, reroot []sb3rerootedFanout) {
+	for _, r := range reroot {
+		for _, id := range r.inserted {
+			delete(parent, id)
+		}
+		if r.hadParent {
+			parent[r.id] = r.oldParent
+		}
+	}
+}
+
 // reconstructFullEvidenceGreedyTopology is the shared non-SAT PB0/CGP0/SB3
 // topology engine. Bloom evidence enumerates possible routes; surviving
 // ParentID/HA facts, downstream AMQs, and (for SB3) sparse ordinal chains prune impossible ones
@@ -2394,6 +2599,7 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 		sb3SelectGreedyRoute(cfg, sk, u, ordinalAssignments, haTracker, parent, &stats)
 	}
 	sb3ResolvePendingHA(cfg, sk, units, ordinalAssignments, haTracker, parent, &stats)
+	sb3AttachUnroutedUnits(sk, units, ordinalAssignments, haTracker, parent, &stats)
 	stats.Chain.Routes = sb3CollectSelectedRouteEvidence(sk, units)
 	if diag {
 		fmt.Fprintf(os.Stderr, "SB3STAGE ordinal_prune candidates=%d elapsed=%s\n", stats.CandidateEvaluations, time.Since(stage))

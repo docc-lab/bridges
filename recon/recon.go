@@ -386,6 +386,7 @@ type Result struct {
 	GreedyHAConflicts          int
 	GreedyAMQConflicts         int // carrier evidence contradicted by named ancestry; included in HardConflicts
 	GreedyAMQPrunes            int // route trials rejected by downstream AMQs
+	GreedyCertainRootFallbacks int // units attached to their certain window root after exhausting every candidate
 
 	// GreedyChain records how the full-evidence CGP0/PB0/SB3 engine used
 	// nameable ancestor chains.  The reconstructor records evidence only; the

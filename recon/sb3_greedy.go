@@ -2622,6 +2622,7 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 	topo.GreedyHAConflicts = stats.HAConflicts
 	topo.GreedyAMQConflicts = stats.AMQConflicts
 	topo.GreedyAMQPrunes = stats.AMQPrunes
+	topo.GreedyCertainRootFallbacks = stats.CertainRootFallbacks
 	topo.GreedyChain = stats.Chain
 	topo.GreedyFanout = stats.Fanout
 	if stats.HardConflicts > 0 {

@@ -439,6 +439,7 @@ type cgp2acc struct {
 	greedyChecked, greedyCandidates, greedyHardOverrides                                                  int64
 	greedyHardConflicts, greedyParentConflicts, greedyHAConflicts                                         int64
 	greedyAMQConflicts, greedyAMQPrunes                                                                   int64
+	greedyCertainRootFallbacks                                                                            int64
 	sb3                                                                                                   sb3acc
 	scoreComparison                                                                                       scorerComparisonAcc
 	chainEvidence                                                                                         chainEvidenceAcc
@@ -1155,6 +1156,7 @@ type sb3acc struct {
 	hardConflicts                          int64
 	parentConflicts, haConflicts           int64
 	amqConflicts, amqPrunes                int64
+	certainRootFallbacks                   int64
 	structureChecked, structureComplete    int64
 	structureIncomplete                    int64
 	deePlaced, deeAmbiguous, deeNoPlace    int64
@@ -1182,6 +1184,7 @@ func (a *sb3acc) add(r *recon.SB3Result) {
 	a.haConflicts += int64(r.HAConflicts)
 	a.amqConflicts += int64(r.AMQConflicts)
 	a.amqPrunes += int64(r.AMQPrunes)
+	a.certainRootFallbacks += int64(r.CertainRootFallbacks)
 }
 
 func (a *sb3acc) addStructure(r recon.StructureResult, status recon.SBStructureStatus) {
@@ -1962,6 +1965,7 @@ func (ha *harness) process(j finishJob) {
 			ha.cg2.greedyHAConflicts += int64(res.GreedyHAConflicts)
 			ha.cg2.greedyAMQConflicts += int64(res.GreedyAMQConflicts)
 			ha.cg2.greedyAMQPrunes += int64(res.GreedyAMQPrunes)
+			ha.cg2.greedyCertainRootFallbacks += int64(res.GreedyCertainRootFallbacks)
 		}
 		if empty {
 			ha.cg2.empty++
@@ -2191,6 +2195,7 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 		greedyHAConflicts     int
 		greedyAMQConflicts    int
 		greedyAMQPrunes       int
+		greedyCertainRoot     int
 		greedyChain           recon.GreedyChainStats
 		greedyFanout          recon.GreedyFanoutStats
 		result                recon.Result
@@ -2229,9 +2234,10 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			greedyHardOverrides: res.GreedyHardOverrides, greedyHardConflicts: res.GreedyHardConflicts,
 			greedyParentConflicts: res.GreedyParentConflicts, greedyHAConflicts: res.GreedyHAConflicts,
 			greedyAMQConflicts: res.GreedyAMQConflicts, greedyAMQPrunes: res.GreedyAMQPrunes,
-			greedyChain:  res.GreedyChain,
-			greedyFanout: res.GreedyFanout,
-			result:       res, survivors: survivors,
+			greedyCertainRoot: res.GreedyCertainRootFallbacks,
+			greedyChain:       res.GreedyChain,
+			greedyFanout:      res.GreedyFanout,
+			result:            res, survivors: survivors,
 		}
 	}
 	for r, c := range cells {
@@ -2269,6 +2275,7 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			a.greedyHAConflicts += int64(c.greedyHAConflicts)
 			a.greedyAMQConflicts += int64(c.greedyAMQConflicts)
 			a.greedyAMQPrunes += int64(c.greedyAMQPrunes)
+			a.greedyCertainRootFallbacks += int64(c.greedyCertainRoot)
 		}
 		if c.empty {
 			a.empty++
@@ -2290,6 +2297,13 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			a.edgeWrong += c.iso.EdgeWrong
 			a.constraintWrong += c.iso.ConstraintWrong
 			a.totWrong += c.iso.Wrong()
+			// The single-drop path records these; without them the multi-drop
+			// sweep cannot split obligations into survivor-named vs
+			// parent/HA-named, which is what distinguishes the arms.
+			a.survN += c.iso.SurvNodes
+			a.survEx += c.iso.SurvExact
+			a.named += c.iso.NamedSyn
+			a.namedEx += c.iso.NamedExact
 			if c.iso.Clean() {
 				a.clean++
 			}
@@ -2541,6 +2555,7 @@ type sb3Summary struct {
 	HAConflicts          int64  `json:"ha_conflicts"`
 	AMQConflicts         int64  `json:"amq_conflicts"`
 	AMQPrunes            int64  `json:"amq_prunes"`
+	CertainRootFallbacks int64  `json:"certain_root_fallbacks"`
 	StructureChecked     int64  `json:"structure_checked"`
 	StructureComplete    int64  `json:"structure_complete"`
 	StructureIncomplete  int64  `json:"structure_incomplete"`
@@ -2563,6 +2578,7 @@ type greedySummary struct {
 	HAConflicts          int64                  `json:"ha_conflicts"`
 	AMQConflicts         int64                  `json:"amq_conflicts"`
 	AMQPrunes            int64                  `json:"amq_prunes"`
+	CertainRootFallbacks int64                  `json:"certain_root_fallbacks"`
 	FanoutEvidence       *fanoutEvidenceSummary `json:"fanout_evidence,omitempty"`
 }
 
@@ -3021,7 +3037,8 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainE
 			HardOverrides: a.greedyHardOverrides, HardConflicts: a.greedyHardConflicts,
 			ParentConflicts: a.greedyParentConflicts, HAConflicts: a.greedyHAConflicts,
 			AMQConflicts: a.greedyAMQConflicts, AMQPrunes: a.greedyAMQPrunes,
-			FanoutEvidence: summarizeFanoutEvidence(a.fanoutEvidence),
+			CertainRootFallbacks: a.greedyCertainRootFallbacks,
+			FanoutEvidence:       summarizeFanoutEvidence(a.fanoutEvidence),
 		}
 	}
 	var sb3 *sb3Summary
@@ -3034,7 +3051,8 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainE
 			ImplicitOrdinals: s.implicitOrdinals, Fanouts: s.fanouts, Conflicts: s.conflicts,
 			HardConflicts: s.hardConflicts, ParentConflicts: s.parentConflicts, HAConflicts: s.haConflicts,
 			AMQConflicts: s.amqConflicts, AMQPrunes: s.amqPrunes,
-			StructureChecked: s.structureChecked, StructureComplete: s.structureComplete,
+			CertainRootFallbacks: s.certainRootFallbacks,
+			StructureChecked:     s.structureChecked, StructureComplete: s.structureComplete,
 			StructureIncomplete: s.structureIncomplete, DEEPlaced: s.deePlaced,
 			DEEAmbiguous: s.deeAmbiguous, DEENoPlace: s.deeNoPlace,
 			EventOrderOK: s.eventOK, CriticalPathOK: s.criticalPathOK,

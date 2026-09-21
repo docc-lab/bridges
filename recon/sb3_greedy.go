@@ -17,8 +17,15 @@ import (
 // topology strictly more compatible.
 type sb3GreedyStats struct {
 	// CertainRootFallbacks counts units that exhausted every candidate and were
-	// attached to their certain window root instead of being left unrouted.
+	// attached to a certain ancestor instead of being left unrouted.
 	CertainRootFallbacks int
+	// BorrowRetractions counts orphan borrows withdrawn because every route the
+	// exact evidence permits was refused only by the borrowed filter.
+	BorrowRetractions int
+	// UnroutedUnits counts units that had a certain ancestor yet could not be
+	// attached to any of them. That is an invariant failure and is included in
+	// HardConflicts; it is never silent.
+	UnroutedUnits        int
 	CandidateEvaluations int
 	OrdinalOverrides     int
 	HardOverrides        int
@@ -937,16 +944,7 @@ func sb3AssignAnonymousIDs(sk *cgpSkeleton, units []*sb3RouteUnit) {
 	for _, u := range units {
 		used[u.parentID] = true
 	}
-	next := uint64(1)
-	alloc := func() uint64 {
-		for used[next] {
-			next++
-		}
-		id := next
-		used[id] = true
-		next++
-		return id
-	}
+	sk.anonUsed, sk.anonNext = used, 1
 	for _, u := range units {
 		minDepth := u.depth
 		if len(u.anchors) > 0 {
@@ -955,11 +953,37 @@ func sb3AssignAnonymousIDs(sk *cgpSkeleton, units []*sb3RouteUnit) {
 		if root := sb3CertainWindowRoot(u); root != nil && root.Depth < minDepth {
 			minDepth = root.Depth
 		}
-		if minDepth >= u.depth {
+		sb3EnsureAnonDepths(sk, u, minDepth)
+	}
+}
+
+func sb3AllocAnon(sk *cgpSkeleton) uint64 {
+	if sk.anonUsed == nil {
+		sk.anonUsed, sk.anonNext = make(map[uint64]bool), 1
+	}
+	for sk.anonUsed[sk.anonNext] {
+		sk.anonNext++
+	}
+	id := sk.anonNext
+	sk.anonUsed[id] = true
+	sk.anonNext++
+	return id
+}
+
+// sb3EnsureAnonDepths reserves a private node id for every gap level strictly
+// between minDepth and the unit's head that does not have one yet, and
+// registers its depth with the shared registry. A route to any anchor at or
+// above minDepth can then always be applied in full, including anchors added
+// after setup by pending-HA resolution or the certain-ancestor fallback.
+func sb3EnsureAnonDepths(sk *cgpSkeleton, u *sb3RouteUnit, minDepth int) {
+	for d := minDepth + 1; d < u.depth; d++ {
+		if u.anonAtDepth[d] != 0 {
 			continue
 		}
-		for d := minDepth + 1; d < u.depth; d++ {
-			u.anonAtDepth[d] = alloc()
+		id := sb3AllocAnon(sk)
+		u.anonAtDepth[d] = id
+		if sk.nodeDepth != nil {
+			sk.nodeDepth[id] = d
 		}
 	}
 }
@@ -1256,7 +1280,12 @@ func sb3ApplyUnitRoute(parent map[uint64]uint64, u *sb3RouteUnit) []uint64 {
 			node = u.anonAtDepth[d]
 		}
 		if node == 0 {
-			return inserted
+			// No private id is reserved for this level, so the route cannot
+			// be applied in full. A partial chain left dangling here would be
+			// accepted by every incremental check as merely "pending"; refuse
+			// it instead and report nothing applied.
+			sb3RollbackRoute(parent, inserted)
+			return nil
 		}
 		parent[cur] = node
 		inserted = append(inserted, cur)
@@ -1674,10 +1703,11 @@ func sb3NearestSurvivingAncestor(sk *cgpSkeleton, parent map[uint64]uint64, star
 	return nil
 }
 
-func sb3AppendAnchor(u *sb3RouteUnit, anchor *Span) {
+func sb3AppendAnchor(sk *cgpSkeleton, u *sb3RouteUnit, anchor *Span) {
 	if u == nil || anchor == nil || anchor.Depth >= u.depth {
 		return
 	}
+	sb3EnsureAnonDepths(sk, u, anchor.Depth)
 	for _, have := range u.anchors {
 		if have.SpanID == anchor.SpanID {
 			return
@@ -1727,13 +1757,23 @@ func sb3ResolvePendingHA(cfg Config, sk *cgpSkeleton, units []*sb3RouteUnit, ord
 			for c := range ha.waiting[terminal] {
 				if have := u.requiredFanout[c.depth]; have != 0 && have != c.fanout {
 					consistent = false
+					sb3DiagNote(u, "resolvePendingHA: INCONSISTENT required d%d have=%016x want=%016x (carrier %016x)", c.depth, have, c.fanout, c.carrier)
 					break
 				}
 				u.requiredFanout[c.depth] = c.fanout
-				sb3AppendAnchor(u, sb3NearestSurvivingAncestor(sk, parent, c.fanout))
+				nsa := sb3NearestSurvivingAncestor(sk, parent, c.fanout)
+				if nsa != nil {
+					sb3DiagNote(u, "resolvePendingHA: require d%d=%016x (carrier %016x); nearest surviving ancestor of fanout=%016x@%d", c.depth, c.fanout, c.carrier, nsa.SpanID, nsa.Depth)
+				} else {
+					sb3DiagNote(u, "resolvePendingHA: require d%d=%016x (carrier %016x); fanout has NO surviving ancestor (dangling) -> no anchor added", c.depth, c.fanout, c.carrier)
+				}
+				sb3AppendAnchor(sk, u, nsa)
 			}
 			if consistent && len(u.anchors) > 0 {
+				sb3DiagNote(u, "resolvePendingHA: retrying route with %d anchors", len(u.anchors))
 				sb3SelectGreedyRoute(cfg, sk, u, ordinals, ha, parent, stats)
+			} else {
+				sb3DiagNote(u, "resolvePendingHA: NOT retried (consistent=%v anchors=%d)", consistent, len(u.anchors))
 			}
 		}
 		if ha.pending() >= before {
@@ -2182,7 +2222,169 @@ func sb3RouteHasChoice(sk *cgpSkeleton, u *sb3RouteUnit) bool {
 // deepest-anchor, named-fanout-first order. Persistent downstream AMQs, hard
 // facts, and sparse chains are predicates over each candidate: a contradiction
 // prunes that path before commitment.
+// sb3SelectGreedyRoute chooses and installs one route for the unit. Bloom
+// evidence enumerates the candidates; exact evidence prunes them; greedy order
+// breaks ties. If every candidate is refused, the unit's borrowed evidence --
+// a hypothesis admitted on Bloom positives -- is set aside and the search is
+// run once more, since exact evidence outranks it. Only when that too fails is
+// the unit left for the certain-ancestor fallback.
 func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3OrdinalAssignments, ha *sb3HATracker, parent map[uint64]uint64, stats *sb3GreedyStats) bool {
+	sb3DiagUnitState(sk, u, "select", parent)
+	if sb3SelectGreedyRouteOnce(cfg, sk, u, ordinals, ha, parent, stats) {
+		return true
+	}
+	if sb3RetryWithoutBorrowedEvidence(cfg, sk, u, parent, stats, func() bool {
+		return sb3SelectGreedyRouteOnce(cfg, sk, u, ordinals, ha, parent, stats)
+	}) {
+		return true
+	}
+	sb3DiagNote(u, "select EXHAUSTED: every anchor/choice rejected; unit left unrouted")
+	u.anchor = nil
+	return false
+}
+
+// sb3RetryWithoutBorrowedEvidence re-runs attempt with the unit's borrowed
+// Bloom evidence set aside. A borrow admits an orphan fragment on two Bloom
+// positives, so its filter's negatives are only as reliable as that guess.
+// Literal parents, HA witnesses, and the carriers' own filters are not guesses.
+// When every route the exact evidence permits is refused only by borrowed
+// filters, the borrow is what is wrong: it is retracted, the affected members
+// stop supplying candidates and windows, and the route exact evidence permits
+// is installed. If the retry fails as well, everything is restored.
+func sb3RetryWithoutBorrowedEvidence(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, parent map[uint64]uint64, stats *sb3GreedyStats, attempt func() bool) bool {
+	if cfg.GreedyNoBorrowRetraction || sk.amq == nil {
+		return false
+	}
+	roots := make(map[uint64]bool)
+	var borrowed []*sb3FragmentEvidence
+	for _, e := range u.members {
+		if e == nil || e.frag == nil || !e.resolved || e.frag.viaCarrier == 0 || e.frag.borrowRetracted {
+			continue
+		}
+		roots[e.frag.root.SpanID] = true
+		borrowed = append(borrowed, e)
+	}
+	if len(borrowed) == 0 {
+		return false
+	}
+	suspended := sk.amq.suspendBorrowed(roots)
+	savedAnchors, savedAnchor := u.anchors, u.anchor
+	for _, e := range borrowed {
+		e.resolved = false
+	}
+	// The borrowed filters also shaped this unit's candidate set; rebuild it
+	// from the members whose evidence is their own.
+	sb3RecomputeAnchors(sk, u)
+	sb3DiagNote(u, "retry without borrowed evidence: %d filters suspended, %d anchors", len(suspended), len(u.anchors))
+	if attempt() {
+		sk.amq.retract(suspended)
+		for _, e := range borrowed {
+			e.frag.borrowRetracted = true
+		}
+		stats.BorrowRetractions += len(borrowed)
+		sb3DiagNote(u, "borrow RETRACTED for %d member(s); route installed", len(borrowed))
+		return true
+	}
+	sk.amq.restore(suspended)
+	for _, e := range borrowed {
+		e.resolved = true
+	}
+	u.anchors, u.anchor = savedAnchors, savedAnchor
+	return false
+}
+
+// sb3RecomputeAnchors rebuilds a unit's surviving-anchor candidates from its
+// currently resolved members: every anchor or window root all of them name,
+// plus any required fanout that survived, each confirmed by every remaining
+// member filter that covers its depth. Required fanouts and window roots are
+// exact and are not filter-tested.
+func sb3RecomputeAnchors(sk *cgpSkeleton, u *sb3RouteUnit) {
+	resolved := 0
+	count := make(map[uint64]int)
+	byID := make(map[uint64]*Span)
+	isRoot := make(map[uint64]bool)
+	for _, e := range u.members {
+		if e == nil || !e.resolved {
+			continue
+		}
+		resolved++
+		seen := make(map[uint64]bool)
+		for _, a := range e.anchors {
+			if !seen[a.SpanID] {
+				seen[a.SpanID] = true
+				count[a.SpanID]++
+				byID[a.SpanID] = a
+			}
+		}
+		for _, c := range e.checkpoints {
+			isRoot[c.SpanID] = true
+			if !seen[c.SpanID] {
+				seen[c.SpanID] = true
+				count[c.SpanID]++
+				byID[c.SpanID] = c
+			}
+		}
+	}
+	required := make(map[uint64]bool)
+	var anchors []*Span
+	for id, n := range count {
+		if n == resolved && byID[id].Depth < u.depth {
+			anchors = append(anchors, byID[id])
+		}
+	}
+	for _, id := range u.requiredFanout {
+		if s := sk.byID[id]; s != nil && s.Depth < u.depth {
+			required[id] = true
+			dup := false
+			for _, have := range anchors {
+				dup = dup || have.SpanID == id
+			}
+			if !dup {
+				anchors = append(anchors, s)
+			}
+		}
+	}
+	out := make([]*Span, 0, len(anchors))
+	for _, a := range anchors {
+		ok := true
+		if !required[a.SpanID] && !isRoot[a.SpanID] {
+			key := bridge.HexOf(a.SpanID)
+			for _, e := range u.members {
+				if e == nil || !e.resolved {
+					continue
+				}
+				for _, wb := range e.blooms {
+					if wb.depth > a.Depth && !wb.bf.Test(key[:]) {
+						ok = false
+						break
+					}
+				}
+				if !ok {
+					break
+				}
+			}
+		}
+		if ok {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Depth != out[j].Depth {
+			return out[i].Depth > out[j].Depth
+		}
+		return out[i].SpanID < out[j].SpanID
+	})
+	u.anchors, u.anchor = out, nil
+	if len(out) > 0 {
+		u.anchor = out[0]
+		sb3EnsureAnonDepths(sk, u, out[len(out)-1].Depth)
+	}
+	if root := sb3CertainWindowRoot(u); root != nil {
+		sb3EnsureAnonDepths(sk, u, root.Depth)
+	}
+}
+
+func sb3SelectGreedyRouteOnce(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3OrdinalAssignments, ha *sb3HATracker, parent map[uint64]uint64, stats *sb3GreedyStats) bool {
 	if len(u.anchors) == 0 {
 		return false
 	}
@@ -2238,27 +2440,45 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 
 			inserted := sb3ApplyUnitRoute(parent, u)
 			stats.CandidateEvaluations++
-			hardOK := sb3UnitWindowCompatible(sk, u, parent)
+			why := ""
+			hardOK := true
+			if len(inserted) == 0 {
+				if _, joined := parent[u.head()]; !joined {
+					hardOK, why = false, "apply-empty" // the route could not be applied at all
+				}
+			}
+			if hardOK && !sb3UnitWindowCompatible(sk, u, parent) {
+				hardOK, why = false, "window"
+			}
 			var amqTxn *greedyAMQTxn
 			if hardOK {
 				amqTxn, hardOK = sk.amq.tryEdges(inserted, parent)
 				if !hardOK {
 					stats.AMQPrunes++
+					why = "amq"
 				}
 			}
 			var haTxn *sb3HATxn
 			if hardOK {
 				haTxn, hardOK = ha.tryEdges(inserted, parent)
+				if !hardOK {
+					why = "ha"
+				}
 			}
 			if hardOK && !greedyPendingHAAMQCompatible(sk.amq, ha, amqTxn, haTxn) {
 				hardOK = false
 				stats.AMQPrunes++
+				why = "joint-ha-amq"
 			}
 			ordinalOK := true
 			var ordinalTxn *sb3OrdinalTxn
 			if hardOK && !cfg.SB3IgnoreOrdinals {
 				ordinalTxn, ordinalOK = ordinals.tryUnit(u, parent)
+				if !ordinalOK {
+					why = "ordinal"
+				}
 			}
+			sb3DiagCandidate(u, inserted, parent, hardOK && ordinalOK, why)
 			if hardOK && ordinalOK {
 				if ordinalTxn != nil {
 					ordinals.accept(ordinalTxn, u)
@@ -2303,6 +2523,12 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 			u.nodeChoice[d] = id
 		}
 		inserted := sb3ApplyUnitRoute(parent, u)
+		if len(inserted) == 0 {
+			if _, joined := parent[u.head()]; !joined {
+				u.anchor = nil
+				return false
+			}
+		}
 		if !sb3UnitWindowCompatible(sk, u, parent) {
 			sb3RollbackRoute(parent, inserted)
 			u.anchor = nil
@@ -2346,16 +2572,55 @@ func sb3SelectGreedyRoute(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals
 // window root. Leaving it unrouted is not a neutral outcome, because the
 // mandatory fanout obligations of OTHER carriers run through that head and are
 // silently broken when it dangles.
-func sb3AttachUnroutedUnits(sk *cgpSkeleton, units []*sb3RouteUnit, ordinals *sb3OrdinalAssignments,
+func sb3AttachUnroutedUnits(cfg Config, sk *cgpSkeleton, units []*sb3RouteUnit, ordinals *sb3OrdinalAssignments,
 	ha *sb3HATracker, parent map[uint64]uint64, stats *sb3GreedyStats) {
 	for _, u := range units {
 		if _, routed := parent[u.head()]; routed {
 			continue
 		}
-		if sb3AttachToCertainRoot(sk, u, ordinals, ha, parent) {
+		sb3DiagUnitState(sk, u, "attach-unrouted", parent)
+		if sb3AttachToCertainRoot(cfg, sk, u, ordinals, ha, parent, stats) {
 			stats.CertainRootFallbacks++
+			continue
 		}
+		if len(sb3CertainAnchors(sk, u)) > 0 {
+			// The unit knows an ancestor for certain and still could not reach
+			// it: the evidence it holds is self-contradictory. Count it as the
+			// invariant failure it is rather than letting it dangle silently.
+			stats.UnroutedUnits++
+		}
+		sb3DiagNote(u, "attach-unrouted: certain-ancestor attach FAILED; unit remains dangling")
 	}
+}
+
+// sb3CertainAnchors lists the ancestors this unit knows for certain, deepest
+// first: every required fanout that survived (exact by HA) and the window root
+// its resolved members name through their own checkpoint prefixes. Attaching
+// to any of them is admissible by construction, never by a Bloom guess.
+func sb3CertainAnchors(sk *cgpSkeleton, u *sb3RouteUnit) []*Span {
+	var out []*Span
+	add := func(s *Span) {
+		if s == nil || s.Depth >= u.depth {
+			return
+		}
+		for _, have := range out {
+			if have.SpanID == s.SpanID {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	for _, id := range u.requiredFanout {
+		add(sk.byID[id])
+	}
+	add(sb3CertainWindowRoot(u))
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Depth != out[j].Depth {
+			return out[i].Depth > out[j].Depth
+		}
+		return out[i].SpanID < out[j].SpanID
+	})
+	return out
 }
 
 // The last-resort route is attempted in three escalating modes. Each is gated
@@ -2391,18 +2656,28 @@ type sb3rerootedFanout struct {
 // sb3AttachToCertainRoot installs the last-resort route to the unit's window
 // checkpoint root, which every resolved member names exactly and which is
 // therefore an ancestor by construction rather than a Bloom guess.
-func sb3AttachToCertainRoot(sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3OrdinalAssignments,
-	ha *sb3HATracker, parent map[uint64]uint64) bool {
-	root := sb3CertainWindowRoot(u)
-	if root == nil {
+func sb3AttachToCertainRoot(cfg Config, sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3OrdinalAssignments,
+	ha *sb3HATracker, parent map[uint64]uint64, stats *sb3GreedyStats) bool {
+	attempt := func() bool {
+		roots := sb3CertainAnchors(sk, u)
+		if len(roots) == 0 {
+			sb3DiagCertain(u, nil, -1, "no-certain-root")
+			return false
+		}
+		for _, root := range roots {
+			sb3EnsureAnonDepths(sk, u, root.Depth)
+			for _, mode := range []int{certainRootKeepFanouts, certainRootRerootFanouts, certainRootAnonymousOnly} {
+				if sb3TryCertainRootRoute(sk, u, ordinals, ha, parent, root, mode) {
+					return true
+				}
+			}
+		}
 		return false
 	}
-	for _, mode := range []int{certainRootKeepFanouts, certainRootRerootFanouts, certainRootAnonymousOnly} {
-		if sb3TryCertainRootRoute(sk, u, ordinals, ha, parent, root, mode) {
-			return true
-		}
+	if attempt() {
+		return true
 	}
-	return false
+	return sb3RetryWithoutBorrowedEvidence(cfg, sk, u, parent, stats, attempt)
 }
 
 func sb3TryCertainRootRoute(sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3OrdinalAssignments,
@@ -2417,12 +2692,14 @@ func sb3TryCertainRootRoute(sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3Ordin
 			}
 		}
 		if u.anonAtDepth[d] == 0 {
+			sb3DiagCertain(u, root, mode, fmt.Sprintf("no-anon-id-at-d%d", d))
 			u.anchor = nil
 			return false // no id reserved for this level; do not emit a partial route
 		}
 	}
 	inserted := sb3ApplyUnitRoute(parent, u)
 	if len(inserted) == 0 {
+		sb3DiagCertain(u, root, mode, "apply-empty")
 		u.anchor = nil
 		return false
 	}
@@ -2430,6 +2707,7 @@ func sb3TryCertainRootRoute(sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3Ordin
 	if mode == certainRootRerootFanouts {
 		var ok bool
 		if reroot, ok = sb3RerootMandatoryFanout(u, parent, root); !ok {
+			sb3DiagCertain(u, root, mode, "reroot-failed")
 			sb3RollbackRoute(parent, inserted)
 			u.anchor = nil
 			return false
@@ -2445,26 +2723,31 @@ func sb3TryCertainRootRoute(sk *cgpSkeleton, u *sb3RouteUnit, ordinals *sb3Ordin
 		affected = append(append([]uint64{}, affected...), r.inserted...)
 	}
 	if !sb3UnitWindowCompatible(sk, u, parent) {
+		sb3DiagCertain(u, root, mode, "window")
 		undo()
 		return false
 	}
 	amqTxn, amqOK := sk.amq.tryEdges(affected, parent)
 	if !amqOK {
+		sb3DiagCertain(u, root, mode, "amq")
 		undo()
 		return false
 	}
 	haTxn, haOK := ha.tryEdges(affected, parent)
 	if !haOK {
+		sb3DiagCertain(u, root, mode, "ha")
 		amqTxn.rollback()
 		undo()
 		return false
 	}
 	if !greedyPendingHAAMQCompatible(sk.amq, ha, amqTxn, haTxn) {
+		sb3DiagCertain(u, root, mode, "joint-ha-amq")
 		haTxn.rollback()
 		amqTxn.rollback()
 		undo()
 		return false
 	}
+	sb3DiagCertain(u, root, mode, "ACCEPTED")
 	ordinals.disableUnit(u)
 	return true
 }
@@ -2562,6 +2845,7 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 	}
 	sb3AssignAnonymousIDs(sk, units)
 	nodeDepth := sb3BuildNodeDepth(sk, units)
+	sk.nodeDepth = nodeDepth
 	if diag {
 		fmt.Fprintf(os.Stderr, "SB3STAGE fanout_groups units=%d elapsed=%s\n", len(units), time.Since(stage))
 	}
@@ -2599,7 +2883,7 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 		sb3SelectGreedyRoute(cfg, sk, u, ordinalAssignments, haTracker, parent, &stats)
 	}
 	sb3ResolvePendingHA(cfg, sk, units, ordinalAssignments, haTracker, parent, &stats)
-	sb3AttachUnroutedUnits(sk, units, ordinalAssignments, haTracker, parent, &stats)
+	sb3AttachUnroutedUnits(cfg, sk, units, ordinalAssignments, haTracker, parent, &stats)
 	stats.Chain.Routes = sb3CollectSelectedRouteEvidence(sk, units)
 	if diag {
 		fmt.Fprintf(os.Stderr, "SB3STAGE ordinal_prune candidates=%d elapsed=%s\n", stats.CandidateEvaluations, time.Since(stage))
@@ -2613,7 +2897,7 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 	topo := sb3EmitGreedyTopology(sk, units, parent)
 	stats.ParentConflicts, stats.HAConflicts, _ = sb3CheckHardEvidenceForMode(survivors, topo, !cfg.NoFanout)
 	stats.AMQConflicts = sk.amq.conflicts(parent)
-	stats.HardConflicts = stats.ParentConflicts + stats.HAConflicts + stats.AMQConflicts
+	stats.HardConflicts = stats.ParentConflicts + stats.HAConflicts + stats.AMQConflicts + stats.UnroutedUnits
 	topo.GreedyMode = "full-evidence"
 	topo.GreedyCandidateEvaluations = stats.CandidateEvaluations
 	topo.GreedyHardOverrides = stats.HardOverrides
@@ -2623,6 +2907,8 @@ func reconstructFullEvidenceGreedyTopology(survivors []Span, cfg Config) (Result
 	topo.GreedyAMQConflicts = stats.AMQConflicts
 	topo.GreedyAMQPrunes = stats.AMQPrunes
 	topo.GreedyCertainRootFallbacks = stats.CertainRootFallbacks
+	topo.GreedyBorrowRetractions = stats.BorrowRetractions
+	topo.GreedyUnroutedUnits = stats.UnroutedUnits
 	topo.GreedyChain = stats.Chain
 	topo.GreedyFanout = stats.Fanout
 	if stats.HardConflicts > 0 {

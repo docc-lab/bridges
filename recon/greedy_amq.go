@@ -1,11 +1,15 @@
 package recon
 
 import (
+	"fmt"
+	"os"
 	"sort"
 
 	"bridges/bloom"
 	"bridges/bridge"
 )
+
+var amqDiag = os.Getenv("TRACE_RECON_SB3UNIT") != ""
 
 // greedyAMQConstraint follows one carrier's ancestry evidence upward. A
 // missing parent suspends the check; it does not discard the filter. The
@@ -18,6 +22,16 @@ type greedyAMQConstraint struct {
 	floor        int
 	bf           *bloom.Filter
 	state        greedyAMQState
+
+	// borrowed marks a filter that reached start through a probabilistic
+	// borrow (cgpResolveEvidence admitting an orphan on Bloom positives), not
+	// through the carrier's own connected record. Its negatives are only as
+	// reliable as that borrow, so exact evidence may suspend it during a retry
+	// and retract it for good. root is the borrowing fragment's root.
+	borrowed  bool
+	root      uint64
+	suspended bool
+	retracted bool
 }
 
 type greedyAMQState struct {
@@ -54,10 +68,10 @@ func newGreedyAMQTracker(sk *cgpSkeleton, cfg Config, parent map[uint64]uint64) 
 		}
 	}
 	seen := make(map[[2]uint64]bool)
-	add := func(carrier *Span, start uint64, depth, floor int, bf *bloom.Filter) {
+	add := func(carrier *Span, start uint64, depth, floor int, bf *bloom.Filter) *greedyAMQConstraint {
 		key := [2]uint64{carrier.SpanID, start}
 		if depth <= floor || seen[key] {
-			return
+			return nil
 		}
 		seen[key] = true
 		c := &greedyAMQConstraint{
@@ -71,6 +85,7 @@ func newGreedyAMQTracker(sk *cgpSkeleton, cfg Config, parent map[uint64]uint64) 
 		if t.advance(c, parent) {
 			t.addWaiting(c)
 		}
+		return c
 	}
 	ids := make([]uint64, 0, len(sk.byID))
 	for id := range sk.byID {
@@ -100,11 +115,52 @@ func newGreedyAMQTracker(sk *cgpSkeleton, cfg Config, parent map[uint64]uint64) 
 	for _, f := range sk.frags {
 		if f.viaCarrier != 0 && f.anchorCkpt != nil && f.bf != nil {
 			// Evidence borrowed to admit an orphan must remain applicable as
-			// its own unresolved upstream path is subsequently reconstructed.
-			add(f.carrier, f.root.SpanID, f.root.Depth, f.anchorCkpt.Depth, f.bf)
+			// its own unresolved upstream path is subsequently reconstructed --
+			// for as long as the borrow itself stands. Unlike a carrier's own
+			// filter, this one is a hypothesis: see suspendBorrowed.
+			if c := add(f.carrier, f.root.SpanID, f.root.Depth, f.anchorCkpt.Depth, f.bf); c != nil {
+				c.borrowed, c.root = true, f.root.SpanID
+			}
 		}
 	}
 	return t
+}
+
+// suspendBorrowed takes every active borrowed filter whose borrowing fragment
+// root is in roots out of the waiting index and returns them. The caller then
+// either retracts them (exact evidence contradicted the borrow) or restores
+// them (the retry failed for another reason).
+func (t *greedyAMQTracker) suspendBorrowed(roots map[uint64]bool) []*greedyAMQConstraint {
+	if t == nil || len(roots) == 0 {
+		return nil
+	}
+	var out []*greedyAMQConstraint
+	for _, c := range t.all {
+		if !c.borrowed || c.suspended || c.retracted || !roots[c.root] {
+			continue
+		}
+		t.removeWaiting(c)
+		c.suspended = true
+		out = append(out, c)
+	}
+	return out
+}
+
+func (t *greedyAMQTracker) restore(cs []*greedyAMQConstraint) {
+	for _, c := range cs {
+		c.suspended = false
+		t.addWaiting(c)
+	}
+}
+
+// retract withdraws suspended borrowed filters permanently. A retracted filter
+// never re-enters the waiting index and is excluded from the final audit: the
+// borrow it rested on has been shown false by exact evidence, so its negatives
+// say nothing about the fragment's true ancestry.
+func (t *greedyAMQTracker) retract(cs []*greedyAMQConstraint) {
+	for _, c := range cs {
+		c.suspended, c.retracted = false, true
+	}
 }
 
 func (t *greedyAMQTracker) addWaiting(c *greedyAMQConstraint) {
@@ -136,6 +192,10 @@ func (t *greedyAMQTracker) advance(c *greedyAMQConstraint, parent map[uint64]uin
 		if c.state.depth < c.carrierDepth && t.named[id] {
 			key := bridge.HexOf(id)
 			if !c.bf.Test(key[:]) {
+				if amqDiag {
+					fmt.Fprintf(os.Stderr, "AMQREJECT carrier=%016x(depth %d, floor %d) rejects id=%016x at depth %d (constraint start=%016x@%d)\n",
+						c.carrier, c.carrierDepth, c.floor, id, c.state.depth, c.start, c.startDepth)
+				}
 				return false
 			}
 		}
@@ -200,6 +260,9 @@ func (t *greedyAMQTracker) conflicts(parent map[uint64]uint64) int {
 	}
 	bad := make(map[uint64]bool)
 	for _, c := range t.all {
+		if c.retracted {
+			continue
+		}
 		for id, depth := c.start, c.startDepth; id != 0 && depth > c.floor; depth-- {
 			if depth < c.carrierDepth && t.named[id] {
 				key := bridge.HexOf(id)

@@ -218,6 +218,12 @@ The unit and harness tests above cover chain and unequal-depth fanouts,
 lost-origin and paired-origin cases, partial sibling acceptance, several
 origins per owner, promoted receivers as admissible ancestors, unknown parents
 that stay unknown until inferred, and duplicate HA from a promoted snapshot plus
-a descendant truss. Full-corpus reverse reconstruction accuracy and timing
-sweeps have not yet been run; results below the tests' negligible-FPR regime
-are the next measurement.
+a descendant truss. Reverse reconstruction accuracy and timing have since been measured on real
+data: first a 100,000-trace day-1 cohort at random CPD 2:8 with the
+`inverse_depth` policy (2026-09-17), then the full day-1 and day-2 corpora at
+random CPD 1:9 with `depth_cubic`. In every cell the reverse arm reconstructs
+fewer traces correctly than forward-only, ties only for PB0 at total loss,
+and costs 1.15-2x reconstruction time; the conditional clean rate can rise at
+low loss only because reverse adds easy obligations to the denominator, so
+absolute correct-trace counts are the like-for-like measure. The sweep
+results and their provenance live with the run outputs, not in this document.

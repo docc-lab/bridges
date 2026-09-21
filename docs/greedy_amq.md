@@ -39,11 +39,73 @@ AMQ consistency does not guarantee recovery of the true topology. Unresolved
 checkpoint identities retain the existing unresolved-window behavior.
 Legacy and solver reconstructors are unchanged.
 
+## Borrowed evidence is defeasible
+
+An orphan fragment carries no window evidence of its own. `cgpResolveEvidence`
+admits it by *borrowing* a deeper carrier whose filter tests positive for both
+the orphan root and its named parent. That two-hit corroboration is a
+probabilistic inference, not a fact: with the default 1e-4 query FPR it fails
+at roughly 1e-8 per candidate carrier, and a full day of Uber traces offers
+enough candidates for it to fail. When it does, the borrowed filter describes
+an unrelated branch, and its negatives say nothing about the orphan's
+ancestry.
+
+The engine therefore treats a borrow as a hypothesis at two points.
+
+**At borrow time**, every candidate carrier must also accept each ancestor the
+trace already knows exactly for the orphan's parent: the HA witnesses carried
+inside sibling fragments whose roots literally name that same parent, at
+depths inside the candidate's window. A filter that rejects such an ancestor
+cannot belong to a descendant of the orphan, because a Bloom has no false
+negatives. This is an exact rejection. It moves the borrow to the next
+admissible carrier, which in the observed failure was the orphan's true
+descendant.
+
+**At routing time**, borrowed AMQ constraints are tagged. If a route unit
+exhausts every candidate, the engine sets aside its members' borrowed
+filters, rebuilds their candidate anchors from the members whose evidence is
+their own, and searches once more. Exact evidence -- literal parents, HA
+witnesses, and the carriers' own filters -- still applies in full. If a route
+is then found, the borrow is **retracted**: the filter never re-enters the
+tracker and is excluded from the final audit, the fragment stops supplying
+candidates or a window, and `borrow_retractions` is incremented. If the
+retry also fails, everything is restored. The same retry protects the
+certain-ancestor fallback below.
+
+Retraction is deliberately conservative. It fires only when a borrowed filter
+is the sole reason no exact-evidence-compatible route exists; a borrow that is
+merely wrong but not contradicted continues to shape routing and is measured
+as ordinary Bloom false-positive error. `--greedy-no-borrow-retraction`
+restores the historical behavior for ablation.
+
+## The certain-ancestor fallback is a guarantee, and its failure is counted
+
+After every unit has had its turn and pending fanout obligations have
+propagated, a unit still without a parent edge is attached to the deepest
+ancestor it knows for certain: a required HA fanout that survived, or the
+window root every resolved member names through its own checkpoint prefix.
+Both are exact; attaching to either is admissible by construction. Earlier
+the fallback knew only the window root and could not pass through a
+surviving required fanout, so an exact HA fact defeated the last resort.
+
+Routes are never applied partially. A candidate that cannot reserve a private
+node for every gap level is refused rather than installed as a dangling
+chain, and private nodes are reserved on demand for anchors discovered after
+setup, with their depths registered for the hard checks.
+
+If a unit knows a certain ancestor and still cannot reach it, the evidence it
+holds is self-contradictory. That is counted in `unrouted_units` and included
+in `hard_conflicts`. A run reporting zero hard conflicts therefore also
+asserts that no such unit was left dangling.
+
 The final parent map is audited separately from the incremental tracker.
 `amq_conflicts` counts carriers with contradictory named ancestry, including
 invalid literal input evidence, and is included in `hard_conflicts` alongside
-parent and HA conflicts. `amq_prunes` counts route trials rejected by these
-AMQ checks. Both fields are included in the PB0/CGP0 and SB3 JSON summaries.
+parent and HA conflicts and `unrouted_units`. `amq_prunes` counts route trials
+rejected by these AMQ checks; `borrow_retractions` counts orphan borrows
+withdrawn because exact evidence contradicted them. All are included in the
+PB0/CGP0 and SB3 JSON summaries. Retracted borrows are excluded from the
+final AMQ audit.
 Older results without these checks cannot establish global AMQ consistency
 from their zero parent/HA conflict counts.
 

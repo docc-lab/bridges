@@ -196,6 +196,13 @@ type Config struct {
 	// admissible candidate.
 	GreedyNoRouteFallback bool
 
+	// GreedyNoBorrowRetraction keeps a borrowed orphan filter in force even
+	// when it alone refuses every route the exact evidence permits. By default
+	// such a borrow is retracted, because it rests on Bloom positives while
+	// literal parents, HA witnesses, and the carriers' own filters do not.
+	// This is an evidence ablation, never the default.
+	GreedyNoBorrowRetraction bool
+
 	// NoOrdinal: place severed survivors by (depth, own-fp, parent-fp) only,
 	// dropping the ordinal discriminator (own-fp distinguishes siblings). Pairs
 	// with the handler's OmitOrdinal emission.
@@ -386,7 +393,9 @@ type Result struct {
 	GreedyHAConflicts          int
 	GreedyAMQConflicts         int // carrier evidence contradicted by named ancestry; included in HardConflicts
 	GreedyAMQPrunes            int // route trials rejected by downstream AMQs
-	GreedyCertainRootFallbacks int // units attached to their certain window root after exhausting every candidate
+	GreedyCertainRootFallbacks int // units attached to a certain ancestor after exhausting every candidate
+	GreedyBorrowRetractions    int // orphan borrows withdrawn because exact evidence contradicted their filter
+	GreedyUnroutedUnits        int // units with a certain ancestor that still could not attach; included in HardConflicts
 
 	// GreedyChain records how the full-evidence CGP0/PB0/SB3 engine used
 	// nameable ancestor chains.  The reconstructor records evidence only; the

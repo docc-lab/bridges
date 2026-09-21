@@ -58,6 +58,12 @@ type cgpFragment struct {
 	viaCarrier  uint64        // span the prefix/bloom was borrowed from (0 = own)
 	anchorCkpt  *Span         // prefix-matched window-top checkpoint (the routing ceiling); nil if unresolved
 	anchorAmbig bool          // >1 checkpoint matched the prefix
+
+	// borrowRetracted records that the borrow above was contradicted by exact
+	// evidence during routing and withdrawn; the fragment then contributes no
+	// candidates, window, or filter of its own and is placed by its exact
+	// parent alone.
+	borrowRetracted bool
 }
 
 // isOrphan reports whether the fragment contains no periodic or leaf checkpoint,
@@ -93,7 +99,19 @@ type cgpSkeleton struct {
 	childrenS   map[uint64][]*Span    // surviving-edge children (parent must survive)
 	frags       []*cgpFragment        // connected components
 	fanouts     map[uint64]*cgpFanout // HA-witnessed dropped fan-outs, by id
+
+	// Private anonymous-node allocator and the depth registry shared with the
+	// HA tracker, so gap ids reserved after setup (for anchors discovered
+	// during routing) are as fully known to every hard check as the originals.
+	anonUsed  map[uint64]bool
+	anonNext  uint64
+	nodeDepth map[uint64]int
 }
+
+// greedyBorrowValidation gates the exact-ancestry check applied to borrow
+// candidates in cgpResolveEvidence. It exists so tests can exercise the
+// downstream retraction path on real data; it is always on in production.
+var greedyBorrowValidation = true
 
 // cgpParse performs Phase 1: it partitions the survivors into fragments,
 // classifies each as orphan or carrier-bearing, and extracts the HA-witnessed
@@ -293,6 +311,37 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 			return carriersByDepth[d][i].SpanID < carriersByDepth[d][j].SpanID
 		})
 	}
+	// Exact ancestry of each dropped parent, taken from HA witnesses carried
+	// inside fragments whose roots literally name that parent. Such a fanout is
+	// a certain ancestor of every orphan naming the same parent, so a borrow
+	// candidate whose filter rejects it cannot descend from that orphan: a
+	// Bloom has no false negatives. This is an exact rejection, and it lets the
+	// two-hit corroboration below be strengthened by every hard fact the trace
+	// already holds instead of standing alone.
+	type exactAncestor struct {
+		id    uint64
+		depth int
+	}
+	siblingHA := make(map[uint64][]exactAncestor)
+	if greedyBorrowValidation && !cfg.NoFanout {
+		for _, f := range sk.frags {
+			p := f.root.ParentID
+			if p == 0 || f.root.ParentUnknown {
+				continue
+			}
+			if _, survived := sk.byID[p]; survived {
+				continue
+			}
+			pDepth := f.root.Depth - 1
+			for _, s := range f.spans {
+				for _, h := range s.HA {
+					if d := h.Depth - 1; d < pDepth {
+						siblingHA[p] = append(siblingHA[p], exactAncestor{id: h.ParentID, depth: d})
+					}
+				}
+			}
+		}
+	}
 	for _, f := range orphans {
 		r := f.root
 		rk := bridge.HexOf(r.SpanID)
@@ -302,8 +351,10 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 		if cfg.RandomizedCheckpoints {
 			wbot = r.Depth + cfg.CPD - 1
 		}
+		facts := siblingHA[r.ParentID]
 		for d := r.Depth + 1; d <= wbot && f.carrier == nil; d++ {
 			for _, c := range carriersByDepth[d] {
+				floor := ((d - 1) / max(1, cfg.CPD)) * max(1, cfg.CPD)
 				if cfg.RandomizedCheckpoints {
 					hits := sk.checkpoints.matches(c)
 					if !commonCheckpointDepth(hits) || hits[0].Depth >= r.Depth-1 {
@@ -312,6 +363,7 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 					if !sk.checkpoints.allows(r.SpanID, hits) || !sk.checkpoints.allows(r.ParentID, hits) {
 						continue
 					}
+					floor = hits[0].Depth
 				}
 				bf := cgpSpanBloom(c, cfg)
 				if !bf.Test(rk[:]) {
@@ -319,6 +371,20 @@ func cgpResolveEvidence(sk *cgpSkeleton, cfg Config) {
 				}
 				if haveMF && !bf.Test(mk[:]) {
 					continue
+				}
+				consistent := true
+				for _, a := range facts {
+					if a.depth <= floor {
+						continue // the window root itself is outside the filter
+					}
+					ak := bridge.HexOf(a.id)
+					if !bf.Test(ak[:]) {
+						consistent = false
+						break
+					}
+				}
+				if !consistent {
+					continue // provably not a descendant of this orphan
 				}
 				if cfg.RandomizedCheckpoints {
 					sk.checkpoints.bindBorrowed(r.SpanID, sk.checkpoints.matches(c))

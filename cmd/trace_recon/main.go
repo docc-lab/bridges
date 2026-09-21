@@ -40,54 +40,55 @@ import (
 )
 
 type config struct {
-	inputDir           string
-	corpusDir          string
-	outputPath         string
-	mode               string // "pb" or "pcr"
-	cgrp               bool   // pcrs + HA: run the PCRS solver on CGPRB (HA-bearing) payloads, with named dropped fan-outs as constraints
-	fullsatPB          bool   // pcrs: solve each cluster as a general declarative CP-SAT model (full-SAT parity baseline; no HA)
-	fullsatCGPB        bool   // pcrs + HA: full-SAT model with named-synthetic identities (CGP) injected into the cluster occupancy
-	fullsatEngine      bool   // pcrs: the single-pass ReconstructFullSAT engine (anchoring + all rules as one CP-SAT model)
-	noParents          bool   // ablation: ignore the intrinsic ParentID naming (no sibling coalescing) even though it is available
-	timingPath         string // non-empty: write per-trace reconstruction timing CSV here
-	checkpointDistance int
-	checkpointPolicy   *bridge.CheckpointRange
-	reverse            *bridge.ReverseConfig // non-nil: unscheduled leaf trusses return upstream through bridge.ReverseHandler
-	progressEvery      int                   // >0: print a PROGRESS line to stderr every N finished traces
-	dropRate           float64
-	dropRates          string // comma list: one decode, all rates reconstructed per pass (CGP/PB/SB3 families)
-	seed               int64
-	traceCount         int
-	requireClean       bool
-	bottomUp           bool
-	bloomFP            float64
-	fpBits             int  // SB3 DEE-owner fingerprint width
-	topoOnly           bool // SB3: omit EE/DEE while retaining sparse ordinals
-	lehmerEE           bool // SB3: Lehmer-code EE/DEE groups
-	sb3IgnoreOrdinals  bool // SB3 ablation: reconstruct without ordinal-guided choices
-	cgp0Legacy         bool // CGP0 ablation: original first-match/anonymous-gap implementation
-	pb0Legacy          bool // PB0 ablation: original first-deepest-match implementation
-	greedyNoGrouped    bool // greedy ablation: no exact-parent/HA-group Bloom intersection
-	greedyNoHardHA     bool // greedy ablation: HA is optional naming evidence, not a hard carrier constraint
-	greedyNoFallback   bool // greedy ablation: evaluate only the ordinary first route
-	chainCheck         bool
-	prefixLen          int    // PCR truncated checkpoint-root ID length
-	classifyWrong      string // JSONL dump path for wrong-edge classification (pcr/pcrb)
-	stopOnGap          bool   // PCRB: stop threading at first zero-candidate level
-	tiePolicy          string // PCRS: thread-item tie resolution (aware|id|stop)
-	workers            int    // reconstruction worker goroutines (0 = NumCPU)
-	scoreAudit         bool   // fault-injection sensitivity audit of the scorer
-	compareScorers     bool   // CGP0 diagnostic: evaluate canonical and historical score/denominator contracts together
-	dumpRecon          string // serialize per-trace reconstruction artifacts (JSONL.gz) for recon_verify
-	verifyInline       bool   // run the independent checker in-process after every reconstruction
-	onlyTraces         string // comma-separated hex trace IDs: reconstruct ONLY these (drop RNG still advances for all -> exact survivors). Diagnostic.
-	dumpSurvivors      string // gob-dump each reconstructed trace's survivors+truth+dropped+cfg here (pair with --only-traces to capture one trace for offline replay via cmd/recon_one).
-	dumpOnly           bool   // with --dump-survivors: capture only, skip reconstruction (fast capture of slow traces)
-	traceStore         string // read a per-trace store (cmd/corpus_split output) instead of --corpus, running handler+drop+reconstruct per-trace in PARALLEL (bit-identical to streaming).
-	serialTraces       bool   // finish each stored trace before reading/replaying another; useful for one-core timing
-	perTraceDropSeed   bool   // seed the drop RNG per-trace (from traceID+seed) instead of one global stream, so drops are independent of trace order/partitioning.
-	sampleCount        int    // if >0, process a RANDOM sample of this many traces (seeded) instead of the first traceCount; avoids prefix bias.
-	sampleSeed         int64  // seed for the random sample selection (independent of the drop seed)
+	inputDir                 string
+	corpusDir                string
+	outputPath               string
+	mode                     string // "pb" or "pcr"
+	cgrp                     bool   // pcrs + HA: run the PCRS solver on CGPRB (HA-bearing) payloads, with named dropped fan-outs as constraints
+	fullsatPB                bool   // pcrs: solve each cluster as a general declarative CP-SAT model (full-SAT parity baseline; no HA)
+	fullsatCGPB              bool   // pcrs + HA: full-SAT model with named-synthetic identities (CGP) injected into the cluster occupancy
+	fullsatEngine            bool   // pcrs: the single-pass ReconstructFullSAT engine (anchoring + all rules as one CP-SAT model)
+	noParents                bool   // ablation: ignore the intrinsic ParentID naming (no sibling coalescing) even though it is available
+	timingPath               string // non-empty: write per-trace reconstruction timing CSV here
+	checkpointDistance       int
+	checkpointPolicy         *bridge.CheckpointRange
+	reverse                  *bridge.ReverseConfig // non-nil: unscheduled leaf trusses return upstream through bridge.ReverseHandler
+	progressEvery            int                   // >0: print a PROGRESS line to stderr every N finished traces
+	dropRate                 float64
+	dropRates                string // comma list: one decode, all rates reconstructed per pass (CGP/PB/SB3 families)
+	seed                     int64
+	traceCount               int
+	requireClean             bool
+	bottomUp                 bool
+	bloomFP                  float64
+	fpBits                   int  // SB3 DEE-owner fingerprint width
+	topoOnly                 bool // SB3: omit EE/DEE while retaining sparse ordinals
+	lehmerEE                 bool // SB3: Lehmer-code EE/DEE groups
+	sb3IgnoreOrdinals        bool // SB3 ablation: reconstruct without ordinal-guided choices
+	cgp0Legacy               bool // CGP0 ablation: original first-match/anonymous-gap implementation
+	pb0Legacy                bool // PB0 ablation: original first-deepest-match implementation
+	greedyNoGrouped          bool // greedy ablation: no exact-parent/HA-group Bloom intersection
+	greedyNoHardHA           bool // greedy ablation: HA is optional naming evidence, not a hard carrier constraint
+	greedyNoFallback         bool // greedy ablation: evaluate only the ordinary first route
+	greedyNoBorrowRetraction bool
+	chainCheck               bool
+	prefixLen                int    // PCR truncated checkpoint-root ID length
+	classifyWrong            string // JSONL dump path for wrong-edge classification (pcr/pcrb)
+	stopOnGap                bool   // PCRB: stop threading at first zero-candidate level
+	tiePolicy                string // PCRS: thread-item tie resolution (aware|id|stop)
+	workers                  int    // reconstruction worker goroutines (0 = NumCPU)
+	scoreAudit               bool   // fault-injection sensitivity audit of the scorer
+	compareScorers           bool   // CGP0 diagnostic: evaluate canonical and historical score/denominator contracts together
+	dumpRecon                string // serialize per-trace reconstruction artifacts (JSONL.gz) for recon_verify
+	verifyInline             bool   // run the independent checker in-process after every reconstruction
+	onlyTraces               string // comma-separated hex trace IDs: reconstruct ONLY these (drop RNG still advances for all -> exact survivors). Diagnostic.
+	dumpSurvivors            string // gob-dump each reconstructed trace's survivors+truth+dropped+cfg here (pair with --only-traces to capture one trace for offline replay via cmd/recon_one).
+	dumpOnly                 bool   // with --dump-survivors: capture only, skip reconstruction (fast capture of slow traces)
+	traceStore               string // read a per-trace store (cmd/corpus_split output) instead of --corpus, running handler+drop+reconstruct per-trace in PARALLEL (bit-identical to streaming).
+	serialTraces             bool   // finish each stored trace before reading/replaying another; useful for one-core timing
+	perTraceDropSeed         bool   // seed the drop RNG per-trace (from traceID+seed) instead of one global stream, so drops are independent of trace order/partitioning.
+	sampleCount              int    // if >0, process a RANDOM sample of this many traces (seeded) instead of the first traceCount; avoids prefix bias.
+	sampleSeed               int64  // seed for the random sample selection (independent of the drop seed)
 }
 
 func parseFlags() config {
@@ -134,6 +135,7 @@ func parseFlags() config {
 	flag.BoolVar(&c.greedyNoGrouped, "greedy-no-grouped-evidence", false, "CGP0/SB3 ablation: do not intersect Bloom evidence across exact-parent or HA fanout groups")
 	flag.BoolVar(&c.greedyNoHardHA, "greedy-no-hard-ha", false, "CGP0/SB3 ablation: do not use HA carrier ancestry as a hard candidate constraint")
 	flag.BoolVar(&c.greedyNoFallback, "greedy-no-route-fallback", false, "CGP0/SB3 ablation: evaluate only the ordinary first deepest/named greedy route")
+	flag.BoolVar(&c.greedyNoBorrowRetraction, "greedy-no-borrow-retraction", false, "PB0/CGP0/SB3 ablation: keep a borrowed orphan filter in force even when it alone refuses every route the exact evidence permits")
 	flag.Float64Var(&c.dropRate, "drop-rate", 1.0, "Probability of dropping each non-checkpoint span (1.0 = drop all)")
 	flag.StringVar(&c.dropRates, "drop-rates", "", "Comma-separated drop rates run on one decoded trace per pass for CGP/PB/SB3 family modes. Drops are per-trace-seeded and bit-identical to separate runs. --timing must contain {dc}.")
 	order := ""
@@ -218,7 +220,7 @@ func parseFlags() config {
 		fmt.Fprintf(os.Stderr, "error: --pb0-legacy requires --mode pb0 (got %q)\n", c.mode)
 		os.Exit(2)
 	}
-	if (c.greedyNoGrouped || c.greedyNoFallback) && c.mode != "cgp0" && c.mode != "pb0" && c.mode != "sb3" {
+	if (c.greedyNoGrouped || c.greedyNoFallback || c.greedyNoBorrowRetraction) && c.mode != "cgp0" && c.mode != "pb0" && c.mode != "sb3" {
 		fmt.Fprintf(os.Stderr, "error: grouped-evidence/route-fallback ablations require --mode cgp0, pb0, or sb3 (got %q)\n", c.mode)
 		os.Exit(2)
 	}
@@ -440,6 +442,7 @@ type cgp2acc struct {
 	greedyHardConflicts, greedyParentConflicts, greedyHAConflicts                                         int64
 	greedyAMQConflicts, greedyAMQPrunes                                                                   int64
 	greedyCertainRootFallbacks                                                                            int64
+	greedyBorrowRetractions, greedyUnroutedUnits                                                          int64
 	sb3                                                                                                   sb3acc
 	scoreComparison                                                                                       scorerComparisonAcc
 	chainEvidence                                                                                         chainEvidenceAcc
@@ -1157,6 +1160,7 @@ type sb3acc struct {
 	parentConflicts, haConflicts           int64
 	amqConflicts, amqPrunes                int64
 	certainRootFallbacks                   int64
+	borrowRetractions, unroutedUnits       int64
 	structureChecked, structureComplete    int64
 	structureIncomplete                    int64
 	deePlaced, deeAmbiguous, deeNoPlace    int64
@@ -1185,6 +1189,8 @@ func (a *sb3acc) add(r *recon.SB3Result) {
 	a.amqConflicts += int64(r.AMQConflicts)
 	a.amqPrunes += int64(r.AMQPrunes)
 	a.certainRootFallbacks += int64(r.CertainRootFallbacks)
+	a.borrowRetractions += int64(r.BorrowRetractions)
+	a.unroutedUnits += int64(r.UnroutedUnits)
 }
 
 func (a *sb3acc) addStructure(r recon.StructureResult, status recon.SBStructureStatus) {
@@ -1281,6 +1287,7 @@ func makeHandler(c config) (h bridge.Handler, cfg recon.Config) {
 		pcrbCfg.PB0Legacy = c.pb0Legacy
 		pcrbCfg.GreedyNoGroupedEvidence = c.greedyNoGrouped
 		pcrbCfg.GreedyNoRouteFallback = c.greedyNoFallback
+		pcrbCfg.GreedyNoBorrowRetraction = c.greedyNoBorrowRetraction
 		return ph, pcrbCfg
 	case "cgprb", "cgp2", "cgp1", "cgp0":
 		// Call-graph-preserving: PCRB payload + window-local hash array. Same
@@ -1298,6 +1305,7 @@ func makeHandler(c config) (h bridge.Handler, cfg recon.Config) {
 		pcrbCfg.GreedyNoGroupedEvidence = c.greedyNoGrouped
 		pcrbCfg.GreedyNoHardHA = c.greedyNoHardHA
 		pcrbCfg.GreedyNoRouteFallback = c.greedyNoFallback
+		pcrbCfg.GreedyNoBorrowRetraction = c.greedyNoBorrowRetraction
 		return ph, pcrbCfg
 	case "sb3":
 		// SB3 carries the same CGPRB topology substrate plus sparse branch
@@ -1315,6 +1323,7 @@ func makeHandler(c config) (h bridge.Handler, cfg recon.Config) {
 		pcrbCfg.GreedyNoGroupedEvidence = c.greedyNoGrouped
 		pcrbCfg.GreedyNoHardHA = c.greedyNoHardHA
 		pcrbCfg.GreedyNoRouteFallback = c.greedyNoFallback
+		pcrbCfg.GreedyNoBorrowRetraction = c.greedyNoBorrowRetraction
 		return ph, pcrbCfg
 	default: // pb
 		pb := bridge.NewPathBridgeHandler(c.checkpointDistance, c.bloomFP)
@@ -1966,6 +1975,8 @@ func (ha *harness) process(j finishJob) {
 			ha.cg2.greedyAMQConflicts += int64(res.GreedyAMQConflicts)
 			ha.cg2.greedyAMQPrunes += int64(res.GreedyAMQPrunes)
 			ha.cg2.greedyCertainRootFallbacks += int64(res.GreedyCertainRootFallbacks)
+			ha.cg2.greedyBorrowRetractions += int64(res.GreedyBorrowRetractions)
+			ha.cg2.greedyUnroutedUnits += int64(res.GreedyUnroutedUnits)
 		}
 		if empty {
 			ha.cg2.empty++
@@ -2179,27 +2190,28 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 		decoded[i] = ha.decodeSpan(tid, s)
 	}
 	type cell struct {
-		empty                 bool
-		emitted               bool
-		iso                   recon.CGP2Iso
-		historical            recon.CGP2Iso
-		sb3                   *recon.SB3Result
-		structure             *recon.StructureResult
-		nsurv, ndrop          int
-		ns                    int64
-		greedyMode            string
-		greedyCandidates      int
-		greedyHardOverrides   int
-		greedyHardConflicts   int
-		greedyParentConflicts int
-		greedyHAConflicts     int
-		greedyAMQConflicts    int
-		greedyAMQPrunes       int
-		greedyCertainRoot     int
-		greedyChain           recon.GreedyChainStats
-		greedyFanout          recon.GreedyFanoutStats
-		result                recon.Result
-		survivors             []recon.Span
+		empty                                        bool
+		emitted                                      bool
+		iso                                          recon.CGP2Iso
+		historical                                   recon.CGP2Iso
+		sb3                                          *recon.SB3Result
+		structure                                    *recon.StructureResult
+		nsurv, ndrop                                 int
+		ns                                           int64
+		greedyMode                                   string
+		greedyCandidates                             int
+		greedyHardOverrides                          int
+		greedyHardConflicts                          int
+		greedyParentConflicts                        int
+		greedyHAConflicts                            int
+		greedyAMQConflicts                           int
+		greedyAMQPrunes                              int
+		greedyCertainRoot                            int
+		greedyBorrowRetractions, greedyUnroutedUnits int
+		greedyChain                                  recon.GreedyChainStats
+		greedyFanout                                 recon.GreedyFanoutStats
+		result                                       recon.Result
+		survivors                                    []recon.Span
 	}
 	cells := make([]cell, len(ha.mdRates))
 	for r := range ha.mdRates {
@@ -2234,10 +2246,11 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			greedyHardOverrides: res.GreedyHardOverrides, greedyHardConflicts: res.GreedyHardConflicts,
 			greedyParentConflicts: res.GreedyParentConflicts, greedyHAConflicts: res.GreedyHAConflicts,
 			greedyAMQConflicts: res.GreedyAMQConflicts, greedyAMQPrunes: res.GreedyAMQPrunes,
-			greedyCertainRoot: res.GreedyCertainRootFallbacks,
-			greedyChain:       res.GreedyChain,
-			greedyFanout:      res.GreedyFanout,
-			result:            res, survivors: survivors,
+			greedyCertainRoot:       res.GreedyCertainRootFallbacks,
+			greedyBorrowRetractions: res.GreedyBorrowRetractions, greedyUnroutedUnits: res.GreedyUnroutedUnits,
+			greedyChain:  res.GreedyChain,
+			greedyFanout: res.GreedyFanout,
+			result:       res, survivors: survivors,
 		}
 	}
 	for r, c := range cells {
@@ -2276,6 +2289,8 @@ func (ha *harness) processMulti(j finishJob, truth []recon.TruthSpan) {
 			a.greedyAMQConflicts += int64(c.greedyAMQConflicts)
 			a.greedyAMQPrunes += int64(c.greedyAMQPrunes)
 			a.greedyCertainRootFallbacks += int64(c.greedyCertainRoot)
+			a.greedyBorrowRetractions += int64(c.greedyBorrowRetractions)
+			a.greedyUnroutedUnits += int64(c.greedyUnroutedUnits)
 		}
 		if c.empty {
 			a.empty++
@@ -2556,6 +2571,8 @@ type sb3Summary struct {
 	AMQConflicts         int64  `json:"amq_conflicts"`
 	AMQPrunes            int64  `json:"amq_prunes"`
 	CertainRootFallbacks int64  `json:"certain_root_fallbacks"`
+	BorrowRetractions    int64  `json:"borrow_retractions"`
+	UnroutedUnits        int64  `json:"unrouted_units"`
 	StructureChecked     int64  `json:"structure_checked"`
 	StructureComplete    int64  `json:"structure_complete"`
 	StructureIncomplete  int64  `json:"structure_incomplete"`
@@ -2579,6 +2596,8 @@ type greedySummary struct {
 	AMQConflicts         int64                  `json:"amq_conflicts"`
 	AMQPrunes            int64                  `json:"amq_prunes"`
 	CertainRootFallbacks int64                  `json:"certain_root_fallbacks"`
+	BorrowRetractions    int64                  `json:"borrow_retractions"`
+	UnroutedUnits        int64                  `json:"unrouted_units"`
 	FanoutEvidence       *fanoutEvidenceSummary `json:"fanout_evidence,omitempty"`
 }
 
@@ -3006,7 +3025,7 @@ func evidenceProfile(c config) string {
 	profile := "model-default"
 	if c.mode == "cgp0" || c.mode == "pb0" || c.mode == "sb3" {
 		profile = "maximal"
-		if c.cgp0Legacy || c.pb0Legacy || c.sb3IgnoreOrdinals || c.greedyNoGrouped || c.greedyNoHardHA || c.greedyNoFallback || c.topoOnly {
+		if c.cgp0Legacy || c.pb0Legacy || c.sb3IgnoreOrdinals || c.greedyNoGrouped || c.greedyNoHardHA || c.greedyNoFallback || c.greedyNoBorrowRetraction || c.topoOnly {
 			profile = "ablation"
 		}
 	}
@@ -3038,6 +3057,8 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainE
 			ParentConflicts: a.greedyParentConflicts, HAConflicts: a.greedyHAConflicts,
 			AMQConflicts: a.greedyAMQConflicts, AMQPrunes: a.greedyAMQPrunes,
 			CertainRootFallbacks: a.greedyCertainRootFallbacks,
+			BorrowRetractions:    a.greedyBorrowRetractions,
+			UnroutedUnits:        a.greedyUnroutedUnits,
 			FanoutEvidence:       summarizeFanoutEvidence(a.fanoutEvidence),
 		}
 	}
@@ -3052,6 +3073,8 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainE
 			HardConflicts: s.hardConflicts, ParentConflicts: s.parentConflicts, HAConflicts: s.haConflicts,
 			AMQConflicts: s.amqConflicts, AMQPrunes: s.amqPrunes,
 			CertainRootFallbacks: s.certainRootFallbacks,
+			BorrowRetractions:    s.borrowRetractions,
+			UnroutedUnits:        s.unroutedUnits,
 			StructureChecked:     s.structureChecked, StructureComplete: s.structureComplete,
 			StructureIncomplete: s.structureIncomplete, DEEPlaced: s.deePlaced,
 			DEEAmbiguous: s.deeAmbiguous, DEENoPlace: s.deeNoPlace,
@@ -3086,62 +3109,63 @@ func summariesFor(c config, a cgp2acc) (topologySummary, *greedySummary, *chainE
 
 // output is the per-trace score arrays, in trace load order.
 type output struct {
-	Mode                    string                   `json:"mode"`
-	Corpus                  string                   `json:"corpus,omitempty"`
-	TraceStore              string                   `json:"trace_store,omitempty"`
-	SerialTraces            bool                     `json:"serial_traces,omitempty"`
-	CheckpointDistance      int                      `json:"checkpoint_distance"`
-	CheckpointRandomization *bridge.CheckpointRange  `json:"checkpoint_randomization,omitempty"`
-	Reverse                 *bridge.ReverseConfig    `json:"reverse,omitempty"`
-	DropRate                float64                  `json:"drop_rate,omitempty"`
-	DropRates               []float64                `json:"drop_rates,omitempty"`
-	RateSummaries           []rateSummary            `json:"rate_summaries,omitempty"`
-	BloomFP                 float64                  `json:"bloom_fp,omitempty"`
-	PrimeM                  bool                     `json:"prime_m,omitempty"`
-	PrimeMByteCap           bool                     `json:"prime_m_bytecap,omitempty"`
-	PrefixLen               int                      `json:"prefix_len,omitempty"`
-	FPBits                  int                      `json:"fp_bits,omitempty"`
-	LehmerEE                bool                     `json:"lehmer_ee,omitempty"`
-	TopoOnly                bool                     `json:"topo_only,omitempty"`
-	SB3IgnoreOrdinals       bool                     `json:"sb3_ignore_ordinals,omitempty"`
-	CGP0Legacy              bool                     `json:"cgp0_legacy,omitempty"`
-	PB0Legacy               bool                     `json:"pb0_legacy,omitempty"`
-	GreedyNoGrouped         bool                     `json:"greedy_no_grouped_evidence,omitempty"`
-	GreedyNoHardHA          bool                     `json:"greedy_no_hard_ha,omitempty"`
-	GreedyNoFallback        bool                     `json:"greedy_no_route_fallback,omitempty"`
-	PerTraceDropSeed        bool                     `json:"per_trace_drop_seed,omitempty"`
-	Order                   string                   `json:"order"`
-	Consistency             string                   `json:"consistency"`
-	Seed                    int64                    `json:"seed"`
-	Sample                  int                      `json:"sample,omitempty"`
-	SampleSeed              int64                    `json:"sample_seed,omitempty"`
-	NumTraces               int                      `json:"num_traces"`
-	NumSpans                []int                    `json:"num_spans,omitempty"`
-	NumDropped              []int                    `json:"num_dropped,omitempty"`
-	NumOrphans              []int                    `json:"num_orphans,omitempty"`
-	NumReconnected          []int                    `json:"num_reconnected,omitempty"`
-	NumAnchorCorrect        []int                    `json:"num_anchor_correct,omitempty"`
-	NumAnchorAncestor       []int                    `json:"num_anchor_ancestor,omitempty"`
-	NumGapCorrect           []int                    `json:"num_gap_correct,omitempty"`
-	NumMisattached          []int                    `json:"num_misattached,omitempty"`
-	NumUnanchored           []int                    `json:"num_unanchored,omitempty"`
-	NumSynthetic            []int                    `json:"num_synthetic,omitempty"`
-	NumBorrowed             []int                    `json:"num_borrowed_bloom,omitempty"`
-	NumFragmentsLost        []int                    `json:"num_fragments_lost,omitempty"`    // PCR only
-	NumSpansLost            []int                    `json:"num_spans_lost,omitempty"`        // PCR only
-	NumAncestorsSkip        []int                    `json:"num_ancestors_skipped,omitempty"` // PCR only
-	NumSpansInSkipped       []int                    `json:"num_spans_in_skipped,omitempty"`  // PCR only
-	NumOpenEnds             []int                    `json:"num_open_ends,omitempty"`         // PCRB only
-	NumOpenEndsMatched      []int                    `json:"num_open_ends_matched,omitempty"` // PCRB only
-	NumForcedMatches        []int                    `json:"num_forced_matches,omitempty"`    // PCRB only
-	NumOrphansPlaced        []int                    `json:"num_orphans_placed,omitempty"`    // PCRB only
-	NumOrphanOpenEnds       []int                    `json:"num_orphan_open_ends,omitempty"`  // PCRB only
-	TopologySummary         *topologySummary         `json:"topology_summary,omitempty"`
-	GreedySummary           *greedySummary           `json:"greedy_summary,omitempty"`
-	ChainEvidence           *chainEvidenceSummary    `json:"chain_evidence_summary,omitempty"`
-	SB3Summary              *sb3Summary              `json:"sb3_summary,omitempty"`
-	ScorerComparison        *scorerComparisonSummary `json:"scorer_comparison,omitempty"`
-	CompareScorers          bool                     `json:"compare_scorers,omitempty"`
+	Mode                     string                   `json:"mode"`
+	Corpus                   string                   `json:"corpus,omitempty"`
+	TraceStore               string                   `json:"trace_store,omitempty"`
+	SerialTraces             bool                     `json:"serial_traces,omitempty"`
+	CheckpointDistance       int                      `json:"checkpoint_distance"`
+	CheckpointRandomization  *bridge.CheckpointRange  `json:"checkpoint_randomization,omitempty"`
+	Reverse                  *bridge.ReverseConfig    `json:"reverse,omitempty"`
+	DropRate                 float64                  `json:"drop_rate,omitempty"`
+	DropRates                []float64                `json:"drop_rates,omitempty"`
+	RateSummaries            []rateSummary            `json:"rate_summaries,omitempty"`
+	BloomFP                  float64                  `json:"bloom_fp,omitempty"`
+	PrimeM                   bool                     `json:"prime_m,omitempty"`
+	PrimeMByteCap            bool                     `json:"prime_m_bytecap,omitempty"`
+	PrefixLen                int                      `json:"prefix_len,omitempty"`
+	FPBits                   int                      `json:"fp_bits,omitempty"`
+	LehmerEE                 bool                     `json:"lehmer_ee,omitempty"`
+	TopoOnly                 bool                     `json:"topo_only,omitempty"`
+	SB3IgnoreOrdinals        bool                     `json:"sb3_ignore_ordinals,omitempty"`
+	CGP0Legacy               bool                     `json:"cgp0_legacy,omitempty"`
+	PB0Legacy                bool                     `json:"pb0_legacy,omitempty"`
+	GreedyNoGrouped          bool                     `json:"greedy_no_grouped_evidence,omitempty"`
+	GreedyNoHardHA           bool                     `json:"greedy_no_hard_ha,omitempty"`
+	GreedyNoFallback         bool                     `json:"greedy_no_route_fallback,omitempty"`
+	GreedyNoBorrowRetraction bool                     `json:"greedy_no_borrow_retraction,omitempty"`
+	PerTraceDropSeed         bool                     `json:"per_trace_drop_seed,omitempty"`
+	Order                    string                   `json:"order"`
+	Consistency              string                   `json:"consistency"`
+	Seed                     int64                    `json:"seed"`
+	Sample                   int                      `json:"sample,omitempty"`
+	SampleSeed               int64                    `json:"sample_seed,omitempty"`
+	NumTraces                int                      `json:"num_traces"`
+	NumSpans                 []int                    `json:"num_spans,omitempty"`
+	NumDropped               []int                    `json:"num_dropped,omitempty"`
+	NumOrphans               []int                    `json:"num_orphans,omitempty"`
+	NumReconnected           []int                    `json:"num_reconnected,omitempty"`
+	NumAnchorCorrect         []int                    `json:"num_anchor_correct,omitempty"`
+	NumAnchorAncestor        []int                    `json:"num_anchor_ancestor,omitempty"`
+	NumGapCorrect            []int                    `json:"num_gap_correct,omitempty"`
+	NumMisattached           []int                    `json:"num_misattached,omitempty"`
+	NumUnanchored            []int                    `json:"num_unanchored,omitempty"`
+	NumSynthetic             []int                    `json:"num_synthetic,omitempty"`
+	NumBorrowed              []int                    `json:"num_borrowed_bloom,omitempty"`
+	NumFragmentsLost         []int                    `json:"num_fragments_lost,omitempty"`    // PCR only
+	NumSpansLost             []int                    `json:"num_spans_lost,omitempty"`        // PCR only
+	NumAncestorsSkip         []int                    `json:"num_ancestors_skipped,omitempty"` // PCR only
+	NumSpansInSkipped        []int                    `json:"num_spans_in_skipped,omitempty"`  // PCR only
+	NumOpenEnds              []int                    `json:"num_open_ends,omitempty"`         // PCRB only
+	NumOpenEndsMatched       []int                    `json:"num_open_ends_matched,omitempty"` // PCRB only
+	NumForcedMatches         []int                    `json:"num_forced_matches,omitempty"`    // PCRB only
+	NumOrphansPlaced         []int                    `json:"num_orphans_placed,omitempty"`    // PCRB only
+	NumOrphanOpenEnds        []int                    `json:"num_orphan_open_ends,omitempty"`  // PCRB only
+	TopologySummary          *topologySummary         `json:"topology_summary,omitempty"`
+	GreedySummary            *greedySummary           `json:"greedy_summary,omitempty"`
+	ChainEvidence            *chainEvidenceSummary    `json:"chain_evidence_summary,omitempty"`
+	SB3Summary               *sb3Summary              `json:"sb3_summary,omitempty"`
+	ScorerComparison         *scorerComparisonSummary `json:"scorer_comparison,omitempty"`
+	CompareScorers           bool                     `json:"compare_scorers,omitempty"`
 }
 
 // slowReconMS: if >0 (set via TRACE_RECON_SLOW=<ms>), log any single cgprb
@@ -3219,30 +3243,31 @@ func main() {
 		orderName = "bottom-up"
 	}
 	out := output{
-		Mode:                    c.mode,
-		Corpus:                  c.corpusDir,
-		TraceStore:              c.traceStore,
-		SerialTraces:            c.serialTraces,
-		CheckpointDistance:      c.checkpointDistance,
-		CheckpointRandomization: c.checkpointPolicy,
-		Reverse:                 c.reverse,
-		DropRate:                c.dropRate,
-		PrimeM:                  bloom.PrimeM,
-		PrimeMByteCap:           bloom.PrimeMByteCap,
-		PerTraceDropSeed:        c.perTraceDropSeed,
-		TopoOnly:                c.topoOnly,
-		SB3IgnoreOrdinals:       c.sb3IgnoreOrdinals,
-		CGP0Legacy:              c.cgp0Legacy,
-		PB0Legacy:               c.pb0Legacy,
-		GreedyNoGrouped:         c.greedyNoGrouped,
-		GreedyNoHardHA:          c.greedyNoHardHA,
-		GreedyNoFallback:        c.greedyNoFallback,
-		CompareScorers:          c.compareScorers,
-		Order:                   orderName,
-		Consistency:             map[bool]string{true: "chain", false: "none"}[c.chainCheck],
-		Seed:                    c.seed,
-		Sample:                  c.sampleCount,
-		NumTraces:               len(traceOrder),
+		Mode:                     c.mode,
+		Corpus:                   c.corpusDir,
+		TraceStore:               c.traceStore,
+		SerialTraces:             c.serialTraces,
+		CheckpointDistance:       c.checkpointDistance,
+		CheckpointRandomization:  c.checkpointPolicy,
+		Reverse:                  c.reverse,
+		DropRate:                 c.dropRate,
+		PrimeM:                   bloom.PrimeM,
+		PrimeMByteCap:            bloom.PrimeMByteCap,
+		PerTraceDropSeed:         c.perTraceDropSeed,
+		TopoOnly:                 c.topoOnly,
+		SB3IgnoreOrdinals:        c.sb3IgnoreOrdinals,
+		CGP0Legacy:               c.cgp0Legacy,
+		PB0Legacy:                c.pb0Legacy,
+		GreedyNoGrouped:          c.greedyNoGrouped,
+		GreedyNoHardHA:           c.greedyNoHardHA,
+		GreedyNoFallback:         c.greedyNoFallback,
+		GreedyNoBorrowRetraction: c.greedyNoBorrowRetraction,
+		CompareScorers:           c.compareScorers,
+		Order:                    orderName,
+		Consistency:              map[bool]string{true: "chain", false: "none"}[c.chainCheck],
+		Seed:                     c.seed,
+		Sample:                   c.sampleCount,
+		NumTraces:                len(traceOrder),
 	}
 	if c.sampleCount > 0 {
 		out.SampleSeed = c.sampleSeed

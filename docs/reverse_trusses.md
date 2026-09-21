@@ -124,11 +124,13 @@ Converters refuse to relabel old modeled-envelope results as native binary data.
 
 ## Evaluation scope
 
-Size/count measurements occur before collection loss. The origin-evidence
-decoder consumes actual emitted binary bundles; reverse evidence is not yet
-integrated into the topology reconstruction engines. See
-[reverse_reconstruction.md](reverse_reconstruction.md) for the remaining work.
-Do not claim reverse reconstruction accuracy from this size evaluation.
+Size/count measurements occur before collection loss. Reverse evidence is
+consumed by the shared PB0/CGP0/SB3 topology engine under the
+intended-checkpoint model; see
+[reverse_reconstruction.md](reverse_reconstruction.md) for that contract and
+for the reconstruction accuracy and timing sweeps. This size evaluation
+measures bytes and checkpoint counts only; reconstruction accuracy comes from
+the reconstruction harness, never from these size runs.
 
 The matched workload is 100,000 day-1 traces (91,945,996 spans), selected by
 first root start in the original chronological stream, with all selected traces

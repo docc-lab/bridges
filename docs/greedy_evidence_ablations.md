@@ -28,6 +28,7 @@ No CP-SAT or other solver is involved.
 | `--greedy-no-grouped-evidence` | CGP0, SB3 | Lets one deterministic member nominate a shared route instead of intersecting the proven group's Blooms. Exact parents and hard HA remain active. |
 | `--greedy-no-hard-ha` | CGP0, SB3 | Keeps HA identities as optional Bloom-confirmed fanout names but does not require carriers to route through them. Final hard-conflict telemetry remains active. |
 | `--greedy-no-route-fallback` | CGP0, SB3 | Evaluates only the first deepest/named-first route. A hard contradiction leaves the unit unresolved instead of trying the next candidate. |
+| `--greedy-no-borrow-retraction` | PB0, CGP0, SB3 | Keeps a borrowed orphan filter in force even when it alone refuses every route the exact evidence permits. By default such a borrow is retracted, since it rests on Bloom positives and the contradicting evidence does not. Borrow-time validation against sibling HA ancestry remains active. |
 | `--sb3-ignore-ordinals` | SB3 | Excludes sparse ordinals from topology candidate pruning while retaining every non-ordinal mechanism above. Ignored ordinal incompatibility is not charged to topology accuracy. |
 
 Flags may be combined for factorial accuracy/runtime experiments. CGP0 JSON
@@ -39,6 +40,10 @@ reports the same counters.
 
 `--cgp0-legacy` is the historical speed baseline; it is not the production
 default. The fine-grained flags isolate specific mechanisms inside the shared
-engine. In all default runs, `hard_conflicts` must be zero. A nonzero value is
-an invariant failure, while a nonzero value under `--greedy-no-hard-ha` is an
-expected measurement of what that ablation sacrificed.
+engine. In all default runs, `hard_conflicts` must be zero. It sums parent,
+HA, and AMQ conflicts with `unrouted_units`, the count of route units that
+knew a certain ancestor yet could not be attached to one. A nonzero value is
+an invariant failure, while a nonzero value under `--greedy-no-hard-ha` or
+`--greedy-no-borrow-retraction` is an expected measurement of what that
+ablation sacrificed. `borrow_retractions` reports how often the default
+engine had to withdraw a borrowed filter; it is telemetry, not an error.

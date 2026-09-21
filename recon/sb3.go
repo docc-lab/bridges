@@ -63,6 +63,8 @@ type SB3Result struct {
 	AMQConflicts         int
 	AMQPrunes            int
 	CertainRootFallbacks int
+	BorrowRetractions    int
+	UnroutedUnits        int
 	GreedyMode           string // always "sb3-greedy"; never a PB/CGP or SAT engine
 	OrdinalGuidance      bool
 	CandidateEvaluations int
@@ -96,6 +98,8 @@ func ReconstructSB3WithDEE(survivors []Span, dees []bridge.DEEQuad, cfg Config) 
 	out.AMQConflicts = stats.AMQConflicts
 	out.AMQPrunes = stats.AMQPrunes
 	out.CertainRootFallbacks = stats.CertainRootFallbacks
+	out.BorrowRetractions = stats.BorrowRetractions
+	out.UnroutedUnits = stats.UnroutedUnits
 	if stats.HardConflicts > 0 {
 		out.Compatible = false
 		if out.Reason == "" {

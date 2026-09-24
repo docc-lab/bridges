@@ -26,9 +26,9 @@ func (p *optionalProbability) Set(s string) error {
 	return nil
 }
 
-func parseReverseConfig(c config, policy string, q float64, p optionalProbability, ttl string, seed uint64, exponent float64) (*bridge.ReverseConfig, error) {
+func parseReverseConfig(c config, policy string, q float64, p optionalProbability, ttl string, seed uint64, exponent float64, passCheckpoints bool) (*bridge.ReverseConfig, error) {
 	if policy == "" {
-		if p.set || ttl != "" {
+		if p.set || ttl != "" || passCheckpoints {
 			return nil, fmt.Errorf("reverse options require --reverse-policy")
 		}
 		return nil, nil
@@ -72,7 +72,7 @@ func parseReverseConfig(c config, policy string, q float64, p optionalProbabilit
 	if policy != "ttl" {
 		lo, hi = 0, 0
 	}
-	out := &bridge.ReverseConfig{Policy: policy, LeafRejectProbability: q, Probability: p.value, Exponent: exponent, TTLMin: lo, TTLMax: hi, Seed: seed}
+	out := &bridge.ReverseConfig{Policy: policy, LeafRejectProbability: q, Probability: p.value, Exponent: exponent, TTLMin: lo, TTLMax: hi, Seed: seed, PassCheckpoints: passCheckpoints}
 	if err := out.Validate(); err != nil {
 		return nil, err
 	}

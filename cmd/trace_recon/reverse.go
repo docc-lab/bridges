@@ -12,7 +12,7 @@ import (
 
 // parseReverseConfig mirrors the simulator's reverse options. The reverse TTL
 // range defaults to the forward checkpoint range or fixed distance.
-func parseReverseConfig(c config, policy string, p float64, ttl string, seed uint64, q float64, exponent float64) (*bridge.ReverseConfig, error) {
+func parseReverseConfig(c config, policy string, p float64, ttl string, seed uint64, q float64, exponent float64, passCheckpoints bool) (*bridge.ReverseConfig, error) {
 	if c.mode != "pb0" && c.mode != "cgp0" && c.mode != "sb3" {
 		return nil, fmt.Errorf("--reverse-policy supports pb0, cgp0 and sb3")
 	}
@@ -39,7 +39,7 @@ func parseReverseConfig(c config, policy string, p float64, ttl string, seed uin
 			return nil, fmt.Errorf("reverse TTL range must contain integer distances")
 		}
 	}
-	rc := &bridge.ReverseConfig{Policy: policy, LeafRejectProbability: q, Exponent: exponent, TTLMin: lo, TTLMax: hi, Seed: seed}
+	rc := &bridge.ReverseConfig{Policy: policy, LeafRejectProbability: q, Exponent: exponent, TTLMin: lo, TTLMax: hi, Seed: seed, PassCheckpoints: passCheckpoints}
 	if (policy == "depth_ratio") != (exponent > 0) {
 		return nil, fmt.Errorf("--reverse-exponent is required exactly for --reverse-policy depth_ratio")
 	}

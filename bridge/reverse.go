@@ -17,6 +17,15 @@ type ReverseConfig struct {
 	TTLMin                int     `json:"ttl_min"`
 	TTLMax                int     `json:"ttl_max"`
 	Seed                  uint64  `json:"seed"`
+
+	// PassCheckpoints lets a returning truss travel THROUGH a scheduled
+	// checkpoint instead of being absorbed there unconditionally. The default
+	// (false) caps every truss at the first scheduled checkpoint above its
+	// origin, which bounds the acceptance policy to the window the leaf started
+	// in and therefore concentrates absorption near the leaves. With this set,
+	// only the trace root remains a forced absorber and the policy alone
+	// decides how far a truss climbs.
+	PassCheckpoints bool `json:"pass_checkpoints,omitempty"`
 }
 
 func (c ReverseConfig) Validate() error {
@@ -144,7 +153,7 @@ func RouteReverseSegments(c ReverseConfig, receiver ReverseReceiver, pending []R
 			forwarded = append(forwarded, segment)
 			continue
 		}
-		if receiver.OriginalCheckpoint || receiver.ReturnBoundary {
+		if receiver.ReturnBoundary || (receiver.OriginalCheckpoint && !c.PassCheckpoints) {
 			accepted = append(accepted, segment)
 			continue
 		}
@@ -429,7 +438,7 @@ func (h *ReverseHandler) OnEnd(ev *Event) EndResult {
 			if origin := h.state[stateKey{ev.TraceID, segment.OriginSpanID}]; origin != nil {
 				originalDepth = origin.originalDepth
 			}
-			rr.Routes = append(rr.Routes, ReverseRoute{OriginSpanID: segment.OriginSpanID, OriginDepth: segment.OriginDepth, ReceiverSpanID: ev.SpanID, ReceiverDepth: s.depth, OriginalCheckpointDepth: originalDepth, Distance: segment.OriginDepth - s.depth, Mandatory: s.original || s.parent == nil})
+			rr.Routes = append(rr.Routes, ReverseRoute{OriginSpanID: segment.OriginSpanID, OriginDepth: segment.OriginDepth, ReceiverSpanID: ev.SpanID, ReceiverDepth: s.depth, OriginalCheckpointDepth: originalDepth, Distance: segment.OriginDepth - s.depth, Mandatory: s.parent == nil || (s.original && !h.config.PassCheckpoints)})
 		}
 	}
 	if len(rr.Returned) > 0 {

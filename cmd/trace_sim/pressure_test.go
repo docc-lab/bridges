@@ -39,7 +39,7 @@ func pressureInstanceFor(e streamEvent) uint32 {
 func runPressureTest(c config) (*checkpointPressure, []TraceMetrics) {
 	traces := pressureTraces()
 	s := newSimState([]uint64{123, 124}, []int{5, 1}, nil, false, nil)
-	p := newCheckpointPressure([]string{"root", "middle", "terminal"}, true)
+	p := newCheckpointPressure([]string{"root", "middle", "terminal"}, true, true)
 	s.pressure = p
 	h := makeHandler(c, nil, nil)
 	for _, e := range buildAndSortEvents(traces) {
@@ -123,7 +123,7 @@ func TestPressureBaselineStartEmissionAndQZeroParity(t *testing.T) {
 }
 
 func TestPressureIdentityValidation(t *testing.T) {
-	p := newCheckpointPressure([]string{"svc"}, true)
+	p := newCheckpointPressure([]string{"svc"}, true, true)
 	e := streamEvent{traceID: 1, spanID: 1, pressureInstanceID: 7}
 	p.onStart(e, bridge.StartResult{})
 	e.pressureInstanceID = 8
@@ -226,5 +226,200 @@ func TestPressureCorpusSidecarAndStandaloneOutput(t *testing.T) {
 	if r, err := openPressureInstanceIDs(badPath, eventsPath); err == nil {
 		r.Close()
 		t.Fatal("sidecar with wrong event count accepted")
+	}
+}
+
+// The joint (service, depth) cells must reproduce both marginals exactly. If
+// they did not, the service-level depth analysis would silently disagree with
+// the service and depth tables printed from the same run.
+func TestServiceDepthCellsReproduceBothMarginals(t *testing.T) {
+	for _, mode := range []string{"pcrb", "cgprb", "sb3"} {
+		for _, q := range []float64{0, 1} {
+			t.Run(mode+formatPythonFloat(q), func(t *testing.T) {
+				p, _ := runPressureTest(reverseTestConfig(mode, q, 1))
+				if len(p.serviceDepths) == 0 {
+					t.Fatal("no joint cells accumulated")
+				}
+				bySvc := map[uint16]uint64{}
+				byDepth := map[int]uint64{}
+				var spans, bytes uint64
+				for k, c := range p.serviceDepths {
+					bySvc[k.serviceID] += c.NumCheckpointSpans
+					byDepth[int(k.depth)] += c.NumCheckpointSpans
+					spans += c.NumSpans
+					bytes += c.CombinedCheckpointPayloadBytes
+				}
+				for id, want := range p.services {
+					if got := bySvc[id]; got != want.NumCheckpointSpans {
+						t.Errorf("service %d: joint cells give %d checkpoint spans, marginal says %d",
+							id, got, want.NumCheckpointSpans)
+					}
+				}
+				for d, want := range p.depths {
+					if got := byDepth[d]; got != want.NumCheckpointSpans {
+						t.Errorf("depth %d: joint cells give %d checkpoint spans, marginal says %d",
+							d, got, want.NumCheckpointSpans)
+					}
+				}
+				if spans != p.totals.NumSpans {
+					t.Errorf("joint cells cover %d spans, totals say %d", spans, p.totals.NumSpans)
+				}
+				if bytes != p.totals.CombinedCheckpointPayloadBytes {
+					t.Errorf("joint cells give %d payload bytes, totals say %d",
+						bytes, p.totals.CombinedCheckpointPayloadBytes)
+				}
+			})
+		}
+	}
+}
+
+// Without the flag the joint map stays empty and the JSON omits the array, so
+// existing pressure outputs are unchanged.
+func TestServiceDepthCellsAreOptIn(t *testing.T) {
+	s := newSimState([]uint64{123, 124}, []int{5, 1}, nil, false, nil)
+	p := newCheckpointPressure([]string{"root", "middle", "terminal"}, true, false)
+	s.pressure = p
+	h := makeHandler(reverseTestConfig("pcrb", 1, 1), nil, nil)
+	for _, e := range buildAndSortEvents(pressureTraces()) {
+		e.pressureInstanceID = pressureInstanceFor(e)
+		s.onEvent(h, e)
+	}
+	s.finalize()
+	if len(p.serviceDepths) != 0 {
+		t.Fatalf("joint cells accumulated without the flag: %d", len(p.serviceDepths))
+	}
+	if p.totals.NumSpans == 0 {
+		t.Fatal("fixture produced no spans, so the check is vacuous")
+	}
+}
+
+// The depth moments must be plain sums over the same spans every other counter
+// covers, so a mean computed from any row matches the spans that row aggregates.
+func TestSpanDepthMomentsMatchSpans(t *testing.T) {
+	p, _ := runPressureTest(reverseTestConfig("pcrb", 1, 1))
+	var sum, sq, n uint64
+	for d, c := range p.depths {
+		if c.SpanDepthSum != uint64(d)*c.NumSpans {
+			t.Errorf("depth %d: sum %d, want %d", d, c.SpanDepthSum, uint64(d)*c.NumSpans)
+		}
+		if c.SpanDepthSqSum != uint64(d*d)*c.NumSpans {
+			t.Errorf("depth %d: sq sum %d, want %d", d, c.SpanDepthSqSum, uint64(d*d)*c.NumSpans)
+		}
+		sum += c.SpanDepthSum
+		sq += c.SpanDepthSqSum
+		n += c.NumSpans
+	}
+	if sum != p.totals.SpanDepthSum || sq != p.totals.SpanDepthSqSum || n != p.totals.NumSpans {
+		t.Fatalf("depth marginal gives (%d,%d,%d), totals say (%d,%d,%d)",
+			sum, sq, n, p.totals.SpanDepthSum, p.totals.SpanDepthSqSum, p.totals.NumSpans)
+	}
+	var isum, in uint64
+	for _, c := range p.instances {
+		isum += c.SpanDepthSum
+		in += c.NumSpans
+	}
+	if isum != sum || in != n {
+		t.Fatalf("instance marginal gives (%d,%d), depth marginal says (%d,%d)", isum, in, sum, n)
+	}
+}
+
+// Height must be the longest path down to a leaf, so relative path position is
+// 0 at the root and exactly 1 at every leaf whatever the trace shape. Those two
+// endpoints are what make the coordinate readable, so they are pinned.
+func TestRelativePositionEndpoints(t *testing.T) {
+	p, _ := runPressureTest(reverseTestConfig("pcrb", 1, 1))
+	var leafSpans, rootSpans uint64
+	for d, c := range p.depths {
+		if d == 0 {
+			rootSpans += c.NumSpans
+			if c.RelPathSum != 0 || c.RelTraceSum != 0 {
+				t.Errorf("root depth cell has nonzero relative position: path %d trace %d",
+					c.RelPathSum, c.RelTraceSum)
+			}
+		}
+		leafSpans += c.NumLeafSpans
+	}
+	if rootSpans == 0 || leafSpans == 0 {
+		t.Fatal("fixture has no root or no leaf spans, so the check is vacuous")
+	}
+	// Every leaf sits at path position 1.0 except a single-span trace, whose one
+	// span is both root and leaf and is reported at 0.
+	for _, c := range p.instances {
+		if c.RelPathSum > c.NumSpans*relScale {
+			t.Fatalf("relative path position exceeds 1.0: sum %d over %d spans",
+				c.RelPathSum, c.NumSpans)
+		}
+		if c.RelPathSqSum > c.NumSpans*relScale*relScale {
+			t.Fatalf("squared position exceeds 1.0: sum %d over %d spans",
+				c.RelPathSqSum, c.NumSpans)
+		}
+	}
+	// The deepest spans in a trace can only be leaves, so their path position is
+	// pinned at exactly 1.0. That is the endpoint the coordinate is read against.
+	deepest := -1
+	for d := range p.depths {
+		if d > deepest {
+			deepest = d
+		}
+	}
+	if c := p.depths[deepest]; c.RelPathSum != c.NumSpans*relScale {
+		t.Fatalf("deepest cell (depth %d): path sum %d over %d spans, want %d",
+			deepest, c.RelPathSum, c.NumSpans, c.NumSpans*relScale)
+	}
+	// Marginals must agree, as for every other counter.
+	var dsum, isum uint64
+	for _, c := range p.depths {
+		dsum += c.RelPathSum
+	}
+	for _, c := range p.instances {
+		isum += c.RelPathSum
+	}
+	if dsum != isum || dsum != p.totals.RelPathSum {
+		t.Fatalf("relative position marginals disagree: depths %d instances %d totals %d",
+			dsum, isum, p.totals.RelPathSum)
+	}
+}
+
+// The whole point of binning spans rather than instances is that the endpoints
+// are exact: bin 0 holds the trace roots, which always checkpoint, and the last
+// bin holds every leaf. An instance-level mean blends positions and loses this.
+func TestRelPathBinsAreExactAtTheEndpoints(t *testing.T) {
+	p, _ := runPressureTest(reverseTestConfig("pcrb", 1, 1))
+	root := p.relPathBins[0]
+	if root == nil {
+		t.Fatal("no root bin accumulated")
+	}
+	if root.NumRootSpans != p.totals.NumRootSpans {
+		t.Errorf("bin 0 holds %d root spans, trace has %d", root.NumRootSpans, p.totals.NumRootSpans)
+	}
+	if root.NumRootCheckpointSpans != root.NumRootSpans {
+		t.Errorf("a trace root must always checkpoint: %d of %d in bin 0",
+			root.NumRootCheckpointSpans, root.NumRootSpans)
+	}
+	last := p.relPathBins[relPathBinCount-1]
+	if last == nil {
+		t.Fatal("no leaf bin accumulated")
+	}
+	if last.NumLeafSpans != last.NumSpans {
+		t.Errorf("the last bin must be all leaves: %d leaves of %d spans",
+			last.NumLeafSpans, last.NumSpans)
+	}
+	// Every leaf in the trace lands there, except a single-span trace whose one
+	// span is root and leaf at once and is binned at 0.
+	var leaves uint64
+	for _, c := range p.depths {
+		leaves += c.NumLeafSpans
+	}
+	if last.NumLeafSpans+root.NumLeafSpans != leaves {
+		t.Errorf("leaves split across bins: last %d + root %d != %d",
+			last.NumLeafSpans, root.NumLeafSpans, leaves)
+	}
+	// And the marginal must cover the same population as every other one.
+	var spans uint64
+	for _, c := range p.relPathBins {
+		spans += c.NumSpans
+	}
+	if spans != p.totals.NumSpans {
+		t.Fatalf("rel-path bins cover %d spans, totals say %d", spans, p.totals.NumSpans)
 	}
 }

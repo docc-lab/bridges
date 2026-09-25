@@ -32,7 +32,27 @@ type pressureCounters struct {
 	NumReverseReturnEdges          uint64 `json:"num_reverse_return_edges"`
 	ReverseRawBaggageBytes         uint64 `json:"reverse_raw_baggage_bytes"`
 	ReverseEncodedBaggageBytes     uint64 `json:"reverse_encoded_baggage_bytes"`
+	// Span-depth moments, so any row (service, instance, depth cell) can report
+	// the mean and spread of the tree positions it saw. An instance serves a
+	// characteristic mix of positions, and that mix is the only channel through
+	// which an absorption rule can move load between instances.
+	SpanDepthSum   uint64 `json:"span_depth_sum"`
+	SpanDepthSqSum uint64 `json:"span_depth_sq_sum"`
+	// Relative position, scaled by relScale so it fits an integer counter.
+	// Absolute depth conflates a span halfway down a deep trace with one at the
+	// bottom of a shallow one, so both normalizations are recorded:
+	//   path  depth/(depth+height), height = longest path to a leaf below it.
+	//         Root is 0, every leaf is exactly 1, so this subsumes leaf share.
+	//   trace depth/(deepest span anywhere in the trace).
+	RelPathSum    uint64 `json:"rel_path_sum"`
+	RelPathSqSum  uint64 `json:"rel_path_sq_sum"`
+	RelTraceSum   uint64 `json:"rel_trace_sum"`
+	RelTraceSqSum uint64 `json:"rel_trace_sq_sum"`
 }
+
+// Relative positions are fractions; counters are integers. 1000 keeps three
+// decimal places, and the squares stay far inside uint64 at corpus scale.
+const relScale = 1000
 
 func (a *pressureCounters) add(b pressureCounters) {
 	a.NumSpans += b.NumSpans
@@ -54,11 +74,25 @@ func (a *pressureCounters) add(b pressureCounters) {
 	a.NumReverseReturnEdges += b.NumReverseReturnEdges
 	a.ReverseRawBaggageBytes += b.ReverseRawBaggageBytes
 	a.ReverseEncodedBaggageBytes += b.ReverseEncodedBaggageBytes
+	a.SpanDepthSum += b.SpanDepthSum
+	a.SpanDepthSqSum += b.SpanDepthSqSum
+	a.RelPathSum += b.RelPathSum
+	a.RelPathSqSum += b.RelPathSqSum
+	a.RelTraceSum += b.RelTraceSum
+	a.RelTraceSqSum += b.RelTraceSqSum
 }
 
 type pressureInstanceKey struct {
 	serviceID  uint16
 	instanceID uint32
+}
+
+// A service is the unit that actually gets overloaded, and the same service
+// appears at many depths across traces. The service and depth marginals cannot
+// be crossed after the fact, so the joint cell is accumulated directly.
+type pressureServiceDepthKey struct {
+	serviceID uint16
+	depth     int32
 }
 
 type pressureSpan struct {
@@ -67,6 +101,7 @@ type pressureSpan struct {
 	parentID                                                uint64
 	depth                                                   int
 	hasChildren, ended                                      bool
+	height                                                  int
 	original, forced, promoted, baggageFound                bool
 	ownBRBytes, rawCheckpointBytes, combinedCheckpointBytes uint64
 	forwardBytes, reverseRawBytes, reverseEncodedBytes      uint64
@@ -81,12 +116,18 @@ type checkpointPressure struct {
 	services      map[uint16]*pressureCounters
 	instances     map[pressureInstanceKey]*pressureCounters
 	depths        map[int]*pressureCounters
+	relPathBins   map[int]*pressureCounters
+	serviceDepths map[pressureServiceDepthKey]*pressureCounters
+	withSvcDepths bool
 }
 
-func newCheckpointPressure(services []string, withInstances bool) *checkpointPressure {
+func newCheckpointPressure(services []string, withInstances, withServiceDepths bool) *checkpointPressure {
 	return &checkpointPressure{serviceNames: append([]string(nil), services...), withInstances: withInstances,
-		active: make(map[uint64]map[uint64]*pressureSpan), services: make(map[uint16]*pressureCounters),
-		instances: make(map[pressureInstanceKey]*pressureCounters), depths: make(map[int]*pressureCounters)}
+		withSvcDepths: withServiceDepths,
+		active:        make(map[uint64]map[uint64]*pressureSpan), services: make(map[uint16]*pressureCounters),
+		instances: make(map[pressureInstanceKey]*pressureCounters), depths: make(map[int]*pressureCounters),
+		serviceDepths: make(map[pressureServiceDepthKey]*pressureCounters),
+		relPathBins:   make(map[int]*pressureCounters)}
 }
 
 func validatePressureConfig(c config) error {
@@ -214,6 +255,26 @@ func (p *checkpointPressure) finishTrace(tid uint64, expectedSpans int) {
 			panic(fmt.Sprintf("checkpoint pressure: root span %x has nonzero depth", sid))
 		}
 	}
+	// Height is the longest path from a span down to a leaf in its subtree. Walk
+	// depth-descending so every child is final before its parent is read.
+	maxDepth := 0
+	for _, s := range t {
+		if s.depth > maxDepth {
+			maxDepth = s.depth
+		}
+	}
+	byDepth := make([][]*pressureSpan, maxDepth+1)
+	for _, s := range t {
+		s.height = 0
+		byDepth[s.depth] = append(byDepth[s.depth], s)
+	}
+	for d := maxDepth; d > 0; d-- {
+		for _, s := range byDepth[d] {
+			if parent := t[s.parentID]; parent != nil && s.height+1 > parent.height {
+				parent.height = s.height + 1
+			}
+		}
+	}
 	for _, s := range t {
 		c := pressureCounters{
 			NumSpans:                     1,
@@ -226,6 +287,18 @@ func (p *checkpointPressure) finishTrace(tid uint64, expectedSpans int) {
 			// Same denominator in every arm, including reverse-disabled zero-byte returns.
 			NumReverseReturnEdges:  uint64(btoi(s.parentID != 0)),
 			ReverseRawBaggageBytes: s.reverseRawBytes, ReverseEncodedBaggageBytes: s.reverseEncodedBytes,
+		}
+		c.SpanDepthSum = uint64(s.depth)
+		c.SpanDepthSqSum = uint64(s.depth * s.depth)
+		// A single-span trace has no extent under either normalization; it is the
+		// root and the leaf at once, and is reported at 0 rather than invented.
+		if n := s.depth + s.height; n > 0 {
+			rp := uint64(s.depth * relScale / n)
+			c.RelPathSum, c.RelPathSqSum = rp, rp*rp
+		}
+		if maxDepth > 0 {
+			rt := uint64(s.depth * relScale / maxDepth)
+			c.RelTraceSum, c.RelTraceSqSum = rt, rt*rt
 		}
 		c.NumRootSpans = uint64(btoi(s.parentID == 0))
 		c.NumLeafSpans = uint64(btoi(!s.hasChildren))
@@ -259,6 +332,22 @@ func (p *checkpointPressure) finishTrace(tid uint64, expectedSpans int) {
 			p.depths[s.depth] = &pressureCounters{}
 		}
 		p.depths[s.depth].add(c)
+		// Spans binned by call-path position. The instance and service rows carry
+		// only a MEAN position, and aggregating a rate over an instance blends the
+		// positions it serves -- an instance hosting roots also serves near-root
+		// spans, so its pooled rate is below the 1.0 that roots actually have.
+		// This marginal bins the spans themselves, so each bin is exact.
+		if p.relPathBins[relPathBin(s)] == nil {
+			p.relPathBins[relPathBin(s)] = &pressureCounters{}
+		}
+		p.relPathBins[relPathBin(s)].add(c)
+		if p.withSvcDepths {
+			key := pressureServiceDepthKey{s.serviceID, int32(s.depth)}
+			if p.serviceDepths[key] == nil {
+				p.serviceDepths[key] = &pressureCounters{}
+			}
+			p.serviceDepths[key].add(c)
+		}
 	}
 	p.numTraces++
 	delete(p.active, tid)
@@ -277,8 +366,38 @@ type pressureInstanceRow struct {
 	pressureCounters
 }
 
+// relPathBinCount buckets [0,1] into equal bins; a leaf at exactly 1.0 belongs
+// to the last one, not to a bin of its own.
+const relPathBinCount = 20
+
+func relPathBin(s *pressureSpan) int {
+	n := s.depth + s.height
+	if n == 0 {
+		return 0
+	}
+	b := s.depth * relPathBinCount / n
+	if b >= relPathBinCount {
+		b = relPathBinCount - 1
+	}
+	return b
+}
+
+type pressureRelPathRow struct {
+	Bin  int     `json:"bin"`
+	From float64 `json:"from"`
+	To   float64 `json:"to"`
+	pressureCounters
+}
+
 type pressureDepthRow struct {
 	Depth int `json:"depth"`
+	pressureCounters
+}
+
+type pressureServiceDepthRow struct {
+	ServiceID   uint16 `json:"service_id"`
+	ServiceName string `json:"service_name"`
+	Depth       int32  `json:"depth"`
 	pressureCounters
 }
 
@@ -298,6 +417,9 @@ type checkpointPressureFile struct {
 	Services                []pressureServiceRow    `json:"services"`
 	Instances               []pressureInstanceRow   `json:"instances"`
 	Depths                  []pressureDepthRow      `json:"depths"`
+
+	ServiceDepths []pressureServiceDepthRow `json:"service_depths,omitempty"`
+	RelPathBins   []pressureRelPathRow      `json:"rel_path_bins"`
 }
 
 func (p *checkpointPressure) write(path string, c config) error {
@@ -324,6 +446,8 @@ func (p *checkpointPressure) write(path string, c config) error {
 			"num_reverse_return_edges":          "every non-root span-return edge, including zero-byte returns and reverse-disabled baseline",
 			"reverse_raw_baggage_bytes":         "return bytes attributed to returning child owner; origin ID/depth, exact truss and optional TTL; excludes binary framing",
 			"reverse_encoded_baggage_bytes":     "actual binary return-bundle value, including version and record framing; excludes external RPC/OTLP encoding",
+			"rel_path_bins":                     "spans binned by depth/(depth+height); bin 0 holds the trace root, the last bin holds every leaf",
+			"service_depths":                    "joint (service, depth) cells, emitted only under --pressure-service-depths; a service spans many depths, so neither marginal implies this",
 			"transport_scope":                   "logical recorded span edges, not verified physical RPC response hops",
 		},
 	}
@@ -339,6 +463,14 @@ func (p *checkpointPressure) write(path string, c config) error {
 	for depth, counters := range p.depths {
 		out.Depths = append(out.Depths, pressureDepthRow{depth, *counters})
 	}
+	for bin, counters := range p.relPathBins {
+		out.RelPathBins = append(out.RelPathBins, pressureRelPathRow{
+			bin, float64(bin) / relPathBinCount, float64(bin+1) / relPathBinCount, *counters})
+	}
+	for key, counters := range p.serviceDepths {
+		out.ServiceDepths = append(out.ServiceDepths,
+			pressureServiceDepthRow{key.serviceID, p.serviceNames[key.serviceID], key.depth, *counters})
+	}
 	sort.Slice(out.Services, func(i, j int) bool { return out.Services[i].ServiceID < out.Services[j].ServiceID })
 	sort.Slice(out.Instances, func(i, j int) bool {
 		a, b := out.Instances[i], out.Instances[j]
@@ -348,6 +480,14 @@ func (p *checkpointPressure) write(path string, c config) error {
 		return a.InstanceID < b.InstanceID
 	})
 	sort.Slice(out.Depths, func(i, j int) bool { return out.Depths[i].Depth < out.Depths[j].Depth })
+	sort.Slice(out.RelPathBins, func(i, j int) bool { return out.RelPathBins[i].Bin < out.RelPathBins[j].Bin })
+	sort.Slice(out.ServiceDepths, func(i, j int) bool {
+		a, b := out.ServiceDepths[i], out.ServiceDepths[j]
+		if a.ServiceID != b.ServiceID {
+			return a.ServiceID < b.ServiceID
+		}
+		return a.Depth < b.Depth
+	})
 	f, err := os.Create(path)
 	if err != nil {
 		return err

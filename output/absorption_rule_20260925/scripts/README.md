@@ -15,6 +15,8 @@ never share a physical core, and never a hyperthread sibling, with a live sim.
 | `recon_times.py` | reconstruction time per bridge, per drop rate and pooled over all six |
 | `density_sweep.py` | six policies × {stop, pass} at CPD 1:9 and 1:21 |
 | `headtohead.py` | shipped (`cubic`+stop) against candidate (`upstream`+pass), both densities |
+| `absorption_decomposition.py` | trusses per new emitter, the count x weight conservation identity, and the byte transfer onto root-hosting instances |
+| `position_correlations.py` | which structural coordinate predicts where passing hurts, and how homogeneous instances are in it |
 | `goloc.py` | non-blank non-comment Go line counter (comments, raw strings, rune literals) |
 | `reach.py` | attributes recon lines per bridge by transitive call closure from each entry point |
 

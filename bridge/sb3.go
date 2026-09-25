@@ -51,7 +51,7 @@ type SB3Handler struct {
 }
 
 type sb3State struct {
-	ttl         byte
+	ttl         uint16
 	depth       int
 	ckpt        [8]byte
 	bloomBytes  []byte // propagated ancestor bloom (inherited + self)
@@ -212,7 +212,7 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	deeBytes = append(deeBytes, parentDEE...)
 	deeBytes = append(deeBytes, deeIncoming...)
 
-	var incomingTTL byte
+	var incomingTTL uint16
 	if parentState != nil {
 		incomingTTL = parentState.ttl
 	}
@@ -227,10 +227,10 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	var payload []byte
 	if isCheckpoint {
 		body := sb3BodySize(depth, h.prefixLen, len(inherited), ha, branches, deeBytes, h.LehmerEE)
-		emitBytes = BRPropertyNameOverheadBytes + 1 + body
+		emitBytes = BRPropertyNameOverheadBytes + 1 + h.checkpoints.PayloadDistanceWidth() + body
 		if h.Capture || h.EmitSink != nil {
 			payload = packSB3Payload(depth, ckpt, h.prefixLen, inherited, ha, branches, deeBytes, h.LehmerEE)
-			h.checkpoints.tagPayload(payload, incomingTTL)
+			payload = h.checkpoints.tagPayload(payload, incomingTTL)
 			if h.EmitSink != nil {
 				h.EmitSink(tid, sid, payload)
 			}
@@ -262,7 +262,7 @@ func (h *SB3Handler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		baggageBytes = BaggageKeyBytes + baggageBody
 	}
 	if baggageFound && h.checkpoints != nil {
-		baggageBytes++
+		baggageBytes += CheckpointContextBytes
 	}
 
 	h.state[stateKey{tid, sid}] = &sb3State{
@@ -308,11 +308,11 @@ func (h *SB3Handler) OnEnd(ev *Event) EndResult {
 	var emitBytes, depthBytes int
 	var payload []byte
 	if isLeaf && !ps.emitted {
-		emitBytes = BRPropertyNameOverheadBytes + 1 + ps.payloadBody
+		emitBytes = BRPropertyNameOverheadBytes + 1 + h.checkpoints.PayloadDistanceWidth() + ps.payloadBody
 		ps.emitted = true
 		if h.Capture || h.EmitSink != nil {
 			payload = packSB3Payload(ps.depth, ps.ckpt, h.prefixLen, ps.inherited, ps.ha, ps.branches, ps.deeBytes, h.LehmerEE)
-			h.checkpoints.tagPayload(payload, ps.ttl)
+			payload = h.checkpoints.tagPayload(payload, ps.ttl)
 			if h.checkpoints != nil {
 				payload[0] |= LeafPayloadFlag
 			}

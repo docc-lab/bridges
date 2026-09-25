@@ -29,7 +29,7 @@ func DecodeSB3SpanPayloadFull(p []byte, cfg Config) (depth int, prefix, bits []b
 	if fpBits <= 0 {
 		fpBits = 16
 	}
-	d, err := bridge.DecodeSB3Payload(p, cfg.PrefixLen, bloomLen, fpBits, cfg.SBridgeLehmer)
+	d, err := bridge.DecodeSB3Payload(p, payloadBodyOffset(cfg)-1, cfg.PrefixLen, bloomLen, fpBits, cfg.SBridgeLehmer)
 	if err != nil {
 		return 0, nil, nil, nil, nil, nil, err
 	}

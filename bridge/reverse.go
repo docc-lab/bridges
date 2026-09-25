@@ -26,6 +26,13 @@ type ReverseConfig struct {
 	// only the trace root remains a forced absorber and the policy alone
 	// decides how far a truss climbs.
 	PassCheckpoints bool `json:"pass_checkpoints,omitempty"`
+
+	// PayloadDistanceBytes is the assigned-distance field the forward handler
+	// writes after the type byte in randomized-checkpoint mode, which the
+	// segment validator must skip to reach the depth varint. NewReverseHandler
+	// sets it from the forward handler; callers do not, and it is a property of
+	// the checkpoint configuration recorded there, so it is not serialized.
+	PayloadDistanceBytes int `json:"-"`
 }
 
 func (c ReverseConfig) Validate() error {
@@ -167,7 +174,7 @@ func RouteReverseSegments(c ReverseConfig, receiver ReverseReceiver, pending []R
 			}
 			continue
 		}
-		valid := validReverseCheckpointSegment(segment)
+		valid := validReverseCheckpointSegment(segment, c.PayloadDistanceBytes)
 		p := 0.0
 		if valid {
 			p = reverseAcceptance(c.Policy, c.Probability, c.Exponent, receiver.Depth, segment.OriginDepth)
@@ -213,12 +220,15 @@ func reverseKind(payload []byte) string {
 // at least a one-byte checkpoint prefix and one-byte Bloom body. Full geometry
 // validation belongs to their decoder; the router at least rejects truncated
 // headers and inconsistent origin metadata instead of accepting them at p=1.
-func validReverseCheckpointSegment(s ReverseSegment) bool {
-	if len(s.Payload) < 4 || reverseKind(s.Payload) != s.Kind || s.Kind == "" {
+// distanceBytes is the assigned-distance field width the emitting handler
+// prepended; the depth varint follows it.
+func validReverseCheckpointSegment(s ReverseSegment, distanceBytes int) bool {
+	off := 1 + distanceBytes
+	if len(s.Payload) < off+3 || reverseKind(s.Payload) != s.Kind || s.Kind == "" {
 		return false
 	}
-	depth, n := binary.Uvarint(s.Payload[1:])
-	return n > 0 && len(s.Payload) >= 1+n+2 && s.OriginDepth >= 0 && depth == uint64(s.OriginDepth)
+	depth, n := binary.Uvarint(s.Payload[off:])
+	return n > 0 && len(s.Payload) >= off+n+2 && s.OriginDepth >= 0 && depth == uint64(s.OriginDepth)
 }
 
 // ReverseRoute records final acceptance once, before modeled collection loss.
@@ -299,16 +309,22 @@ func NewReverseHandler(base Handler, c ReverseConfig) (*ReverseHandler, error) {
 	if !ok {
 		return nil, fmt.Errorf("reverse trusses require a checkpoint payload snapshot handler")
 	}
+	// The segment validator has to skip the assigned-distance field the forward
+	// handler writes, so it is taken from that handler rather than asked of the
+	// caller; a caller that forgot would see every segment silently rejected.
 	switch h := base.(type) {
 	case *PCRBBridgeHandler:
 		h.Capture = true
+		c.PayloadDistanceBytes = h.checkpoints.PayloadDistanceWidth()
 	case *CGPRBBridgeHandler:
 		h.Capture = true
+		c.PayloadDistanceBytes = h.checkpoints.PayloadDistanceWidth()
 	case *SB3Handler:
 		if h.EmitSink != nil {
 			return nil, fmt.Errorf("reverse trusses require collecting final outputs through ReverseHandler, not SB3 EmitSink")
 		}
 		h.Capture = true
+		c.PayloadDistanceBytes = h.checkpoints.PayloadDistanceWidth()
 	}
 	return &ReverseHandler{base: base, snapshot: snapshot, config: c, state: make(map[stateKey]*reverseSpanState), counts: make(map[uint64]*reverseTraceCounts)}, nil
 }

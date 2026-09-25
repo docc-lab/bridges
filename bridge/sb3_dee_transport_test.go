@@ -59,15 +59,17 @@ func TestSB3KeepsFreshDEEsOnNonFirstChildren(t *testing.T) {
 						t.Fatalf("payload accounting=%d, serialized attribute=%d", counted, BRPropertyNameOverheadBytes+len(payload))
 					}
 					bloomLen := h.bloomLen
+					distBytes := 0
 					if geometry.random {
-						distance, err := PayloadDistance(payload[0], 2, 8)
+						distBytes = PayloadDistanceBytes
+						distance, err := PayloadDistance(payload[1], 2, 8)
 						if err != nil {
 							t.Fatal(err)
 						}
 						m, _ := bloom.EstimateParameters(PCRBBloomCapacity(distance), DefaultBloomFPRate)
 						bloomLen = int((m + 7) / 8)
 					}
-					decoded, err := DecodeSB3Payload(payload, 8, bloomLen, 64, lehmer)
+					decoded, err := DecodeSB3Payload(payload, distBytes, 8, bloomLen, 64, lehmer)
 					if err != nil {
 						t.Fatal(err)
 					}

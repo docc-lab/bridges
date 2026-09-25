@@ -48,14 +48,15 @@ var stealMeasure = os.Getenv("TRACE_RECON_STEALMEASURE") == "1"
 // remainder: a sequence of entries, each big-endian 8-byte branch-parent id
 // followed by varint(child depth).
 func DecodeCGPRBPayload(p []byte, cfg Config) (depth int, prefix, bloomBits []byte, ha []HAEntry, err error) {
-	if len(p) < 2 || bridge.PayloadType(p[0]) != byte(bridge.CGPRBBridgeTypeID) {
+	if len(p) < payloadBodyOffset(cfg)+1 || bridge.PayloadType(p[0]) != byte(bridge.CGPRBBridgeTypeID) {
 		return 0, nil, nil, nil, errors.New("recon: not a CGPRB payload")
 	}
-	d, n := binary.Uvarint(p[1:])
+	off := payloadBodyOffset(cfg)
+	d, n := binary.Uvarint(p[off:])
 	if n <= 0 {
 		return 0, nil, nil, nil, errors.New("recon: bad depth varint")
 	}
-	rest := p[1+n:]
+	rest := p[off+n:]
 	_, bm, _, err := DecodeBloomGeometry(p, cfg)
 	if err != nil {
 		return 0, nil, nil, nil, err

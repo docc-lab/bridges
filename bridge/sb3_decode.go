@@ -23,7 +23,11 @@ type SB3Payload struct {
 // DecodeSB3Payload parses the combined CGPRB + sparse-ordinal payload. Bloom
 // and checkpoint-prefix widths are deployment configuration; HA is explicitly
 // length-framed and trailing bytes are ordinary S-Bridge DEE quads.
-func DecodeSB3Payload(b []byte, prefixLen, bloomLen, fpBits int, lehmer bool) (SB3Payload, error) {
+//
+// distanceBytes is the assigned-distance field that follows the type byte in
+// randomized-checkpoint mode, and zero in fixed mode. The caller has already
+// read it to size the Bloom, so it is skipped here.
+func DecodeSB3Payload(b []byte, distanceBytes, prefixLen, bloomLen, fpBits int, lehmer bool) (SB3Payload, error) {
 	var out SB3Payload
 	if prefixLen < 1 || prefixLen > 8 {
 		return out, errors.New("SB3 prefixLen must be in 1..8")
@@ -35,6 +39,11 @@ func DecodeSB3Payload(b []byte, prefixLen, bloomLen, fpBits int, lehmer bool) (S
 	tag := c.take(1)
 	if c.err != nil || len(tag) != 1 || PayloadType(tag[0]) != byte(SB3BridgeTypeID) {
 		return out, errors.New("not an SB3 payload")
+	}
+	if distanceBytes > 0 {
+		if c.take(distanceBytes); c.err != nil {
+			return out, errors.New("SB3 payload missing assigned-distance byte")
+		}
 	}
 	out.Depth = c.uvarint()
 	out.CkptPrefix = append([]byte(nil), c.take(prefixLen)...)

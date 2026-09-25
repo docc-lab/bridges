@@ -1266,14 +1266,15 @@ func coveringPCRBPayload(o *Span, children map[uint64][]*Span, cfg Config) (int,
 // DecodePCRBPayload parses a PCRB _br value:
 // type(1) || varint(depth) || ckptK || bloom bits.
 func DecodePCRBPayload(p []byte, cfg Config) (depth int, prefix, bloomBits []byte, err error) {
-	if len(p) < 2 || bridge.PayloadType(p[0]) != byte(bridge.PCRBBridgeTypeID) {
+	if len(p) < payloadBodyOffset(cfg)+1 || bridge.PayloadType(p[0]) != byte(bridge.PCRBBridgeTypeID) {
 		return 0, nil, nil, errors.New("recon: not a PCRB payload")
 	}
-	d, n := binary.Uvarint(p[1:])
+	off := payloadBodyOffset(cfg)
+	d, n := binary.Uvarint(p[off:])
 	if n <= 0 {
 		return 0, nil, nil, errors.New("recon: bad depth varint")
 	}
-	rest := p[1+n:]
+	rest := p[off+n:]
 	_, m, _, err := DecodeBloomGeometry(p, cfg)
 	if err != nil {
 		return 0, nil, nil, err

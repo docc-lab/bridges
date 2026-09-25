@@ -17,7 +17,7 @@ func TestSB3EmitsOrdinalsOnlyForSecondAndLaterChildren(t *testing.T) {
 	h.OnEnd(&Event{TraceID: tid, SpanID: root})
 
 	decode := func(sid uint64) SB3Payload {
-		p, err := DecodeSB3Payload(payloads[sid], h.prefixLen, h.bloomLen, h.FPBits, false)
+		p, err := DecodeSB3Payload(payloads[sid], 0, h.prefixLen, h.bloomLen, h.FPBits, false)
 		if err != nil {
 			t.Fatalf("decode %x: %v", sid, err)
 		}
@@ -57,7 +57,7 @@ func TestSB3LehmerRoundTrip(t *testing.T) {
 		h.OnStart(&Event{TraceID: tid, SpanID: sid, ParentID: root}, i+1)
 		r := h.OnEnd(&Event{TraceID: tid, SpanID: sid, ParentID: root})
 		if i == 1 {
-			p, err := DecodeSB3Payload(r.Payload, h.prefixLen, h.bloomLen, h.FPBits, true)
+			p, err := DecodeSB3Payload(r.Payload, 0, h.prefixLen, h.bloomLen, h.FPBits, true)
 			if err != nil {
 				t.Fatal(err)
 			}

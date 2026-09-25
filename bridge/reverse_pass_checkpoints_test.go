@@ -22,7 +22,7 @@ func validSegment(originDepth int) ReverseSegment {
 // trace root remains a forced absorber.
 func TestPassCheckpointsControlsMandatoryAbsorption(t *testing.T) {
 	seg := []ReverseSegment{validSegment(9)}
-	if !validReverseCheckpointSegment(seg[0]) {
+	if !validReverseCheckpointSegment(seg[0], 0) {
 		t.Fatal("fixture segment must be valid, or the policy path is never reached")
 	}
 	// Probability 0 means the policy never accepts, so anything absorbed here

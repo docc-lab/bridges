@@ -50,7 +50,7 @@ type CGPRBBridgeHandler struct {
 }
 
 type cgprbState struct {
-	ttl         byte
+	ttl         uint16
 	ckpt        [8]byte
 	bloomBytes  []byte // propagated bloom (inherited + self; checkpoints: empty)
 	inherited   []byte // pre-self bloom — what this span emits in its own payload
@@ -122,7 +122,7 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 		ha = next
 	}
 
-	var incomingTTL byte
+	var incomingTTL uint16
 	if parentState != nil {
 		incomingTTL = parentState.ttl
 	}
@@ -139,11 +139,11 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	if isCheckpoint {
 		// Checkpoint payload closes the window above: previous checkpoint
 		// prefix + the inherited window bloom + the window's HA. Then reset.
-		emitBytes = BRPropertyNameOverheadBytes + cgprbTypeTagBytes +
+		emitBytes = BRPropertyNameOverheadBytes + cgprbTypeTagBytes + h.checkpoints.PayloadDistanceWidth() +
 			VarintLen(int(depth)) + h.prefixLen + len(inherited) + len(ha)
 		if h.Capture {
 			payload = packCGPRBPayload(int(depth), ckpt, h.prefixLen, inherited, ha)
-			h.checkpoints.tagPayload(payload, incomingTTL)
+			payload = h.checkpoints.tagPayload(payload, incomingTTL)
 		}
 		// Re-root and reset bloom AND ha for the new window.
 		ckpt = BigEndian8(ev.SpanID)
@@ -171,7 +171,7 @@ func (h *CGPRBBridgeHandler) OnStart(ev *Event, parentSeqNum int) StartResult {
 	}
 
 	if baggageFound && h.checkpoints != nil {
-		baggageBytes++
+		baggageBytes += CheckpointContextBytes
 	}
 
 	h.state[stateKey{ev.TraceID, ev.SpanID}] = &cgprbState{
@@ -205,11 +205,11 @@ func (h *CGPRBBridgeHandler) OnEnd(ev *Event) EndResult {
 	var payload []byte
 	if isLeaf && !ps.emitted {
 		// Leaf payload: inherited (pre-self) bloom + this span's window HA.
-		emitBytes = BRPropertyNameOverheadBytes + cgprbTypeTagBytes +
+		emitBytes = BRPropertyNameOverheadBytes + cgprbTypeTagBytes + h.checkpoints.PayloadDistanceWidth() +
 			VarintLen(int(ps.depth)) + h.prefixLen + len(ps.inherited) + len(ps.ha)
 		if h.Capture {
 			payload = packCGPRBPayload(int(ps.depth), ps.ckpt, h.prefixLen, ps.inherited, ps.ha)
-			h.checkpoints.tagPayload(payload, ps.ttl)
+			payload = h.checkpoints.tagPayload(payload, ps.ttl)
 		}
 		if h.checkpoints != nil && len(payload) > 0 {
 			payload[0] |= LeafPayloadFlag

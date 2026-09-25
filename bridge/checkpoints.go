@@ -10,9 +10,15 @@ import (
 )
 
 // CheckpointRange samples an inclusive checkpoint distance in parent-child
-// edges. Its context packs the assigned-distance index and a distance-1
-// countdown into one byte. A span receiving a zero countdown checkpoints.
-// Sampling depends only on seed and span identity, not event/worker ordering.
+// edges. Its context packs the assigned-distance index above a distance-1
+// countdown. A span receiving a zero countdown checkpoints. Sampling depends
+// only on seed and span identity, not event/worker ordering.
+//
+// The context always occupies CheckpointContextBytes baggage bytes. A width that
+// varied with the configured range would be a varint in all but name, and would
+// make byte totals incomparable between ranges; a fixed width keeps the
+// accounting one constant. Two bytes covers every range the design allows, since
+// Max is capped at 256.
 type CheckpointRange struct {
 	Min    int   `json:"distance_min"`
 	Max    int   `json:"distance_max"`
@@ -43,10 +49,32 @@ func (r CheckpointRange) Validate() error {
 	if r.Min < 1 || r.Max > 256 || r.Min > r.Max {
 		return fmt.Errorf("checkpoint distance range must satisfy 1 <= MIN <= MAX <= 256")
 	}
-	if bits.Len(uint(r.Max-1))+bits.Len(uint(r.Max-r.Min)) > 8 {
-		return fmt.Errorf("checkpoint range %d:%d needs more than one byte for assigned distance and remaining TTL", r.Min, r.Max)
+	if r.contextBits() > 8*CheckpointContextBytes {
+		return fmt.Errorf("checkpoint range %d:%d needs %d bits for assigned distance and remaining TTL, more than the %d-byte context holds",
+			r.Min, r.Max, r.contextBits(), CheckpointContextBytes)
+	}
+	if n := r.Max - r.Min + 1; n > payloadDistanceLimit {
+		return fmt.Errorf("checkpoint range %d:%d offers %d distinct distances; the payload advertises at most %d",
+			r.Min, r.Max, n, payloadDistanceLimit)
 	}
 	return nil
+}
+
+const (
+	// CheckpointContextBytes is the fixed baggage width of the packed context.
+	CheckpointContextBytes = 2
+	// PayloadDistanceBytes is the payload width that advertises the assigned
+	// distance to reconstruction, which needs it to size the window Bloom before
+	// it can parse the filter. It sits immediately after the type byte, so the
+	// type and early-leaf flags stay where they were.
+	PayloadDistanceBytes = 1
+	// payloadDistanceLimit is how many DISTINCT distances a range may offer,
+	// bounded by that width, independently of the context width.
+	payloadDistanceLimit = 1 << (8 * PayloadDistanceBytes)
+)
+
+func (r CheckpointRange) contextBits() int {
+	return bits.Len(uint(r.Max-1)) + bits.Len(uint(r.Max-r.Min))
 }
 
 func (r CheckpointRange) MaxDistance() int { return r.Max }
@@ -54,36 +82,50 @@ func (r CheckpointRange) MaxDistance() int { return r.Max }
 // One context byte contains an assigned-distance index above the countdown.
 // For 2:8 each field uses three bits. Singleton ranges need no index bits.
 func (r CheckpointRange) ttlBits() uint { return uint(bits.Len(uint(r.Max - 1))) }
-func (r CheckpointRange) RemainingTTL(context byte) byte {
-	return context & byte((uint16(1)<<r.ttlBits())-1)
+func (r CheckpointRange) RemainingTTL(context uint16) uint16 {
+	return context & ((uint16(1) << r.ttlBits()) - 1)
 }
-func (r CheckpointRange) AssignedDistance(context byte) int {
-	return r.Min + int(uint16(context)>>r.ttlBits())
+func (r CheckpointRange) AssignedDistance(context uint16) int {
+	return r.Min + int(context>>r.ttlBits())
 }
-func (r CheckpointRange) context(ttl byte) byte {
-	return byte(uint16(int(ttl)+1-r.Min)<<r.ttlBits()) | ttl
+func (r CheckpointRange) context(ttl uint16) uint16 {
+	return uint16(int(ttl)+1-r.Min)<<r.ttlBits() | ttl
 }
 
-func (r *CheckpointRange) bloom(context byte, m, k uint32) checkpointBloom {
+func (r *CheckpointRange) bloom(context uint16, m, k uint32) checkpointBloom {
 	if r == nil {
 		return checkpointBloom{m, k}
 	}
-	return r.blooms[int(uint16(context)>>r.ttlBits())]
+	return r.blooms[int(context>>r.ttlBits())]
 }
 
-// Bits 3..6 of the existing type byte identify the assigned distance; bit 7
-// continues to identify an early leaf. The one-byte context constraint above
-// limits the range to at most 16 choices, so no extra payload byte is needed.
-func (r *CheckpointRange) tagPayload(payload []byte, context byte) {
-	if r != nil && len(payload) > 0 {
-		payload[0] |= byte(int(uint16(context)>>r.ttlBits()) << 3)
+// tagPayload inserts the assigned-distance index after the type byte. In
+// fixed-distance mode there is no distance to advertise and the payload is
+// returned untouched, so those payloads are unchanged.
+func (r *CheckpointRange) tagPayload(payload []byte, context uint16) []byte {
+	if r == nil || len(payload) == 0 {
+		return payload
 	}
+	out := make([]byte, 0, len(payload)+PayloadDistanceBytes)
+	out = append(out, payload[0])
+	out = append(out, byte(int(context>>r.ttlBits())))
+	return append(out, payload[1:]...)
 }
 
-func PayloadDistance(tag byte, min, max int) (int, error) {
-	d := min + int((tag&0x78)>>3)
+// PayloadDistanceWidth is how many bytes tagPayload adds. Nil is fixed-distance
+// mode, which adds none.
+func (r *CheckpointRange) PayloadDistanceWidth() int {
+	if r == nil {
+		return 0
+	}
+	return PayloadDistanceBytes
+}
+
+// PayloadDistance decodes the byte tagPayload wrote.
+func PayloadDistance(b byte, min, max int) (int, error) {
+	d := min + int(b)
 	if min < 1 || d > max {
-		return 0, fmt.Errorf("invalid checkpoint distance index in payload tag")
+		return 0, fmt.Errorf("invalid checkpoint distance %d in payload, outside %d:%d", d, min, max)
 	}
 	return d, nil
 }
@@ -94,17 +136,17 @@ func checkpointMix(x uint64) uint64 {
 	return x ^ (x >> 31)
 }
 
-func (r CheckpointRange) sample(ev *Event) byte {
+func (r CheckpointRange) sample(ev *Event) uint16 {
 	x := checkpointMix(uint64(r.Seed) ^ checkpointMix(ev.TraceID) ^ checkpointMix(ev.SpanID+0x9e3779b97f4a7c15))
 	n := uint64(r.Max - r.Min + 1)
 	// Rejection avoids modulo bias for ranges that do not divide 2^64.
 	for x < -n%n {
 		x = checkpointMix(x + 0x9e3779b97f4a7c15)
 	}
-	return byte(r.Min + int(x%n) - 1)
+	return uint16(r.Min + int(x%n) - 1)
 }
 
-func (r *CheckpointRange) next(ev *Event, hasParent bool, incoming byte, depth, cpd int) (bool, byte) {
+func (r *CheckpointRange) next(ev *Event, hasParent bool, incoming uint16, depth, cpd int) (bool, uint16) {
 	if r == nil {
 		return depth%cpd == 0, 0
 	}

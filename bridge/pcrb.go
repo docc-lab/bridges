@@ -42,7 +42,7 @@ type PCRBBridgeHandler struct {
 }
 
 type pcrbState struct {
-	ttl         byte
+	ttl         uint16
 	ckpt        [8]byte
 	bloomBytes  []byte // propagated bloom (inherited + self; checkpoints: empty)
 	inherited   []byte // pre-self bloom — what this span emits in its own payload
@@ -116,7 +116,7 @@ func (h *PCRBBridgeHandler) OnStart(ev *Event, _ int) StartResult {
 		inherited = parentState.bloomBytes
 	}
 
-	var incomingTTL byte
+	var incomingTTL uint16
 	if parentState != nil {
 		incomingTTL = parentState.ttl
 	}
@@ -134,11 +134,11 @@ func (h *PCRBBridgeHandler) OnStart(ev *Event, _ int) StartResult {
 		// Checkpoint payload: previous checkpoint's prefix + the INHERITED
 		// window bloom — ancestors strictly between the two checkpoints,
 		// exactly <= cpd-1 entries (see PCRBBloomCapacity).
-		emitBytes = BRPropertyNameOverheadBytes + pcrbTypeTagBytes +
+		emitBytes = BRPropertyNameOverheadBytes + pcrbTypeTagBytes + h.checkpoints.PayloadDistanceWidth() +
 			VarintLen(int(depth)) + h.prefixLen + len(inherited)
 		if h.Capture {
 			payload = packPCRBPayload(int(depth), ckpt, h.prefixLen, inherited)
-			h.checkpoints.tagPayload(payload, incomingTTL)
+			payload = h.checkpoints.tagPayload(payload, incomingTTL)
 		}
 		// Re-root and reset. The checkpoint does NOT add itself: threading
 		// never tests the anchor (the prefix names it), so its entry would
@@ -166,7 +166,7 @@ func (h *PCRBBridgeHandler) OnStart(ev *Event, _ int) StartResult {
 	}
 
 	if baggageFound && h.checkpoints != nil {
-		baggageBytes++
+		baggageBytes += CheckpointContextBytes
 	}
 
 	h.state[stateKey{ev.TraceID, ev.SpanID}] = &pcrbState{
@@ -199,11 +199,11 @@ func (h *PCRBBridgeHandler) OnEnd(ev *Event) EndResult {
 	var payload []byte
 	if isLeaf && !ps.emitted {
 		// Inherited (pre-self) bloom: a payload's own span is never tested.
-		emitBytes = BRPropertyNameOverheadBytes + pcrbTypeTagBytes +
+		emitBytes = BRPropertyNameOverheadBytes + pcrbTypeTagBytes + h.checkpoints.PayloadDistanceWidth() +
 			VarintLen(int(ps.depth)) + h.prefixLen + len(ps.inherited)
 		if h.Capture {
 			payload = packPCRBPayload(int(ps.depth), ps.ckpt, h.prefixLen, ps.inherited)
-			h.checkpoints.tagPayload(payload, ps.ttl)
+			payload = h.checkpoints.tagPayload(payload, ps.ttl)
 		}
 		if h.checkpoints != nil && len(payload) > 0 {
 			payload[0] |= LeafPayloadFlag

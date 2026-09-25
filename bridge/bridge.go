@@ -36,10 +36,11 @@ const (
 // StartResult is the data the simulator needs from OnStart to drive its
 // per-trace metric accumulators (matching trace_simulator.py run_traces).
 type StartResult struct {
-	// CheckpointTTL is the packed outgoing baggage byte in randomized mode:
+	// CheckpointTTL is the packed outgoing baggage context in randomized mode:
 	// assigned-distance index in its high bits, remaining TTL in its low bits.
-	// CheckpointRange.RemainingTTL and AssignedDistance decode those fields.
-	CheckpointTTL byte
+	// CheckpointRange.RemainingTTL and AssignedDistance decode those fields. It
+	// occupies CheckpointRange.ContextBytes bytes on the wire, one or two.
+	CheckpointTTL uint16
 	BaggageFound  bool // parent had handler state -> count this as a baggage call
 	BaggageBytes  int  // 3 + len(packed_br) when BaggageFound, else 0
 	EmitBytes     int  // EMIT_PAYLOAD_BYTES set in this OnStart, 0 if none

@@ -15,7 +15,7 @@ func (h *PCRBBridgeHandler) CheckpointPayload(ev *Event) []byte {
 		return nil
 	}
 	payload := packPCRBPayload(int(ps.depth), ps.ckpt, h.prefixLen, ps.inherited)
-	h.checkpoints.tagPayload(payload, ps.ttl)
+	payload = h.checkpoints.tagPayload(payload, ps.ttl)
 	if h.checkpoints != nil {
 		payload[0] |= LeafPayloadFlag
 	}
@@ -29,7 +29,7 @@ func (h *CGPRBBridgeHandler) CheckpointPayload(ev *Event) []byte {
 		return nil
 	}
 	payload := packCGPRBPayload(int(ps.depth), ps.ckpt, h.prefixLen, ps.inherited, ps.ha)
-	h.checkpoints.tagPayload(payload, ps.ttl)
+	payload = h.checkpoints.tagPayload(payload, ps.ttl)
 	if h.checkpoints != nil {
 		payload[0] |= LeafPayloadFlag
 	}
@@ -45,7 +45,7 @@ func (h *SB3Handler) CheckpointPayload(ev *Event) []byte {
 	}
 	payload := packSB3Payload(ps.depth, ps.ckpt, h.prefixLen, ps.inherited, ps.ha,
 		ps.branches, ps.deeBytes, h.LehmerEE)
-	h.checkpoints.tagPayload(payload, ps.ttl)
+	payload = h.checkpoints.tagPayload(payload, ps.ttl)
 	if h.checkpoints != nil {
 		payload[0] |= LeafPayloadFlag
 	}

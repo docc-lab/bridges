@@ -58,10 +58,10 @@ func TestPackBR(t *testing.T) {
 
 func TestHAAppendEntry(t *testing.T) {
 	type step struct {
-		sid     string
-		depth   int
-		want    string // empty want means HAAppendEntry should be a no-op (Python returned None)
-		isNone  bool
+		sid    string
+		depth  int
+		want   string // empty want means HAAppendEntry should be a no-op (Python returned None)
+		isNone bool
 	}
 	steps := []step{
 		{"8ee27a115b6fa625", 0, "8ee27a115b6fa62500", false},
@@ -82,8 +82,8 @@ func TestHAAppendEntry(t *testing.T) {
 
 func TestPackCGPBBR(t *testing.T) {
 	cases := []struct {
-		depth         int
-		bloom, ha, x  string
+		depth        int
+		bloom, ha, x string
 	}{
 		{0, "", "", "00"},
 		{1, "61616262", "", "0161616262"},

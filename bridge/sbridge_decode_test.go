@@ -16,9 +16,9 @@ func TestDecodeSBridgeBRRoundTrip(t *testing.T) {
 	// Span at depth 3, window root at depth 0 → chain levels at depths 1,2,3.
 	// hasFp must equal (levelDepth-1)%cpd != 0: depth1→false, depth2→true, depth3→true.
 	chain := []bcEntry{
-		{ord: 2},                                            // depth 1, parent = ckpt root
-		{ord: 1, fp: 0xabcd, hasFp: true},                   // depth 2
-		{ord: 3, fp: 0xdef0, hasFp: true, ee: []int{5, 6}},  // depth 3, has EE
+		{ord: 2},                          // depth 1, parent = ckpt root
+		{ord: 1, fp: 0xabcd, hasFp: true}, // depth 2
+		{ord: 3, fp: 0xdef0, hasFp: true, ee: []int{5, 6}}, // depth 3, has EE
 	}
 
 	// DEE owners are emitted at the same fp width as the payload (fpBits=16 here
@@ -71,9 +71,9 @@ func TestDecodeSBridgeBRRoundTrip(t *testing.T) {
 		}
 		fp1, fp2 := uint64(0xABCDEF0123456789)&mask, uint64(0x123456789ABCDEF0)&mask
 		ch := []bcEntry{
-			{ord: 1},                            // depth1, no fp
-			{ord: 2, fp: fp1, hasFp: true},      // depth2
-			{ord: 3, fp: fp2, hasFp: true},      // depth3
+			{ord: 1},                       // depth1, no fp
+			{ord: 2, fp: fp1, hasFp: true}, // depth2
+			{ord: 3, fp: fp2, hasFp: true}, // depth3
 		}
 		p := PackSBridgeBR(3, ckpt, 4, ch, nil, w)
 		d, err := DecodeSBridgeBR(p, cpd, w, 4)
